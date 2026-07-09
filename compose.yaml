@@ -1,0 +1,24 @@
+services:
+  bible:
+    build: .
+    image: ghcr.io/bearboss/wn-bible-01:latest
+    container_name: wn-bible-01
+    restart: unless-stopped
+    volumes:
+      - bible-notes:/app/notes
+    networks:
+      witty_vlan30:
+        ipv4_address: ${APP_IP:-10.10.30.246}
+    labels:
+      - homepage.group=Christ Pillar
+      - homepage.name=Bible Study
+      - homepage.description=KJV + Strong's concordance + personal notes
+      - homepage.icon=https://cdn.jsdelivr.net/npm/simple-icons@latest/icons/read-dot-cv.svg
+
+volumes:
+  bible-notes:
+    driver: local
+
+networks:
+  witty_vlan30:
+    external: true
