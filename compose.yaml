@@ -3,6 +3,8 @@ services:
     build: .
     image: ghcr.io/bearboss/wn-bible-01:latest
     container_name: wn-bible-01
+    mem_limit: 256m
+    memswap_limit: 256m
     restart: unless-stopped
     volumes:
       - bible-notes:/app/notes
