@@ -8,6 +8,7 @@ services:
     restart: unless-stopped
     volumes:
       - bible-notes:/app/notes
+      - bible-data:/app/data
     networks:
       witty_vlan30:
         ipv4_address: ${APP_IP:-10.10.30.246}
@@ -19,6 +20,8 @@ services:
 
 volumes:
   bible-notes:
+    driver: local
+  bible-data:
     driver: local
 
 networks:
