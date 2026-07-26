@@ -1091,6 +1091,180 @@ def build_commentary() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 7 — bible_multi (all translations → bible_multi.db)
+# ---------------------------------------------------------------------------
+
+# Every entry: (display_name, scrollmapper_filename)
+# All sourced from https://raw.githubusercontent.com/scrollmapper/bible_databases/master/formats/sqlite/
+TRANSLATION_SOURCES = [
+    # Core English public-domain
+    ("KJV",          "KJV.db"),
+    ("KJVA",         "KJVA.db"),         # KJV with Apocrypha
+    ("KJVPCE",       "KJVPCE.db"),       # Pure Cambridge Edition
+    ("AKJV",         "AKJV.db"),         # Authorized KJV
+    ("ASV",          "ASV.db"),          # American Standard Version (1901)
+    ("YLT",          "YLT.db"),          # Young's Literal Translation (1898)
+    ("Darby",        "Darby.db"),        # Darby Bible (1890)
+    ("Geneva1599",   "Geneva1599.db"),   # Geneva Bible (1599)
+    ("Webster",      "Webster.db"),      # Webster Bible (1833)
+    ("BBE",          "BBE.db"),          # Bible in Basic English
+    ("BSB",          "BSB.db"),          # Berean Standard Bible
+    ("Jubilee2000",  "Jubilee2000.db"),  # Jubilee Bible 2000
+    ("ACV",          "ACV.db"),          # A Conservative Version
+    ("DRC",          "DRC.db"),          # Douay-Rheims Catholic (1899)
+    ("CPDV",         "CPDV.db"),         # Catholic Public Domain Version
+    ("Tyndale",      "Tyndale.db"),      # Tyndale Bible (1526)
+    ("Wycliffe",     "Wycliffe.db"),     # Wycliffe Bible (1382)
+    ("OEB",          "OEB.db"),          # Open English Bible
+    ("LITV",         "LITV.db"),         # Literal Translation (Green)
+    ("MKJV",         "MKJV.db"),         # Modern KJV (Green)
+    ("RNKJV",        "RNKJV.db"),        # Restored Name KJV
+    ("UKJV",         "UKJV.db"),         # Updated KJV
+    ("RWebster",     "RWebster.db"),     # Revised Webster
+    ("Rotherham",    "Rotherham.db"),    # Rotherham Emphasized Bible
+    ("NHEB",         "NHEB.db"),         # New Heart English Bible
+    ("LEB",          "LEB.db"),          # Lexham English Bible
+    ("Anderson",     "Anderson.db"),     # Anderson NT
+    ("Noyes",        "Noyes.db"),        # Noyes NT
+    ("Haweis",       "Haweis.db"),       # Haweis NT
+    ("Twenty",       "Twenty.db"),       # 20th Century NT
+    # Scholarly originals
+    ("JPS",          "JPS.db"),          # Jewish Publication Society (Hebrew OT)
+    ("HebModern",    "HebModern.db"),    # Modern Hebrew Bible
+    ("Vulgate",      "Vulgate.db"),      # Latin Vulgate (Jerome)
+    ("VulgClementine", "VulgClementine.db"),
+    ("Peshitta",     "Peshitta.db"),     # Aramaic Peshitta
+    ("TR",           "TR.db"),           # Greek Textus Receptus
+    ("Byz",          "Byz.db"),          # Greek Byzantine Majority Text
+    # Other languages useful for research
+    ("FreSynodale",  "FreSynodale1921.db"),  # French Synodale
+    ("FreGeneve",    "FreGeneve1669.db"),     # French Geneva 1669
+]
+
+SCROLLMAPPER_BASE = (
+    "https://raw.githubusercontent.com/scrollmapper/bible_databases/master/formats/sqlite/"
+)
+
+
+def _detect_verses_table(conn: sqlite3.Connection) -> tuple:
+    """Return (table, book_col, chap_col, verse_col, text_col) or all-None on failure."""
+    tables = [
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    ]
+    for table in tables:
+        try:
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            book_col  = next((c for c in ("book_id", "b", "book", "bk")   if c in cols), None)
+            chap_col  = next((c for c in ("chapter",  "c", "chap", "ch")  if c in cols), None)
+            verse_col = next((c for c in ("verse",    "v", "vs",   "ver") if c in cols), None)
+            text_col  = next((c for c in ("text",     "t", "verse_text", "vtext", "content") if c in cols), None)
+            if book_col and chap_col and verse_col and text_col:
+                return table, book_col, chap_col, verse_col, text_col
+        except Exception:
+            pass
+    return None, None, None, None, None
+
+
+def build_multi_translation() -> None:
+    """Download all translations and merge into bible_multi.db verses(translation,b,c,v,t)."""
+    out_path = DATA / "bible_multi.db"
+
+    con = sqlite3.connect(str(out_path))
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS verses (
+            translation TEXT NOT NULL,
+            b           INTEGER NOT NULL,
+            c           INTEGER NOT NULL,
+            v           INTEGER NOT NULL,
+            t           TEXT NOT NULL,
+            PRIMARY KEY (translation, b, c, v)
+        )
+    """)
+    con.commit()
+
+    done = set(
+        r[0] for r in con.execute("SELECT DISTINCT translation FROM verses").fetchall()
+    )
+    print(f"  multi: already have {len(done)} translations: {sorted(done)}", flush=True)
+
+    imported = 0
+    skipped  = 0
+    failed   = []
+
+    for display_name, filename in TRANSLATION_SOURCES:
+        if display_name in done:
+            print(f"  multi: {display_name} already present — skip", flush=True)
+            skipped += 1
+            continue
+
+        tmp = DATA / f"_dl_{filename}"
+        url = SCROLLMAPPER_BASE + filename
+        try:
+            print(f"  multi: downloading {display_name} ({filename}) …", flush=True)
+            resp = requests.get(url, timeout=60, stream=True)
+            if resp.status_code != 200:
+                print(f"  multi: HTTP {resp.status_code} for {filename} — skip", flush=True)
+                failed.append(display_name)
+                continue
+            with open(tmp, "wb") as fh:
+                for chunk in resp.iter_content(65536):
+                    fh.write(chunk)
+        except Exception as exc:
+            print(f"  multi: download error {display_name}: {exc}", flush=True)
+            failed.append(display_name)
+            if tmp.exists():
+                tmp.unlink()
+            continue
+
+        try:
+            src = sqlite3.connect(str(tmp))
+            table, bc, cc, vc, tc = _detect_verses_table(src)
+            if not table:
+                print(f"  multi: no recognisable verses table in {filename} — skip", flush=True)
+                src.close()
+                tmp.unlink()
+                failed.append(display_name)
+                continue
+
+            rows = src.execute(
+                f"SELECT {bc}, {cc}, {vc}, {tc} FROM {table} ORDER BY {bc},{cc},{vc}"
+            ).fetchall()
+            src.close()
+
+            con.executemany(
+                "INSERT OR IGNORE INTO verses(translation,b,c,v,t) VALUES(?,?,?,?,?)",
+                [(display_name, r[0], r[1], r[2], r[3]) for r in rows],
+            )
+            con.commit()
+            count = con.execute(
+                "SELECT COUNT(*) FROM verses WHERE translation=?", (display_name,)
+            ).fetchone()[0]
+            print(f"  multi: {display_name}: {count:,} verses imported", flush=True)
+            imported += 1
+        except Exception as exc:
+            print(f"  multi: import error {display_name}: {exc}", flush=True)
+            failed.append(display_name)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    total = con.execute("SELECT COUNT(*) FROM verses").fetchone()[0]
+    trans_count = con.execute("SELECT COUNT(DISTINCT translation) FROM verses").fetchone()[0]
+    con.close()
+
+    print(
+        f"  multi: done — {trans_count} translations, {total:,} total verses "
+        f"(imported {imported} new, skipped {skipped}, failed {len(failed)})",
+        flush=True,
+    )
+    if failed:
+        print(f"  multi: failed translations: {failed}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1103,12 +1277,13 @@ def main() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
 
     steps = [
-        ("kjv",           build_kjv),
-        ("word_strongs",  build_word_strongs),
-        ("cross_refs",    build_cross_refs),
-        ("strongs",       build_strongs),
-        ("interlinear",   build_interlinear),
-        ("commentary",    build_commentary),
+        ("kjv",               build_kjv),
+        ("word_strongs",      build_word_strongs),
+        ("cross_refs",        build_cross_refs),
+        ("strongs",           build_strongs),
+        ("interlinear",       build_interlinear),
+        ("commentary",        build_commentary),
+        ("multi_translation", build_multi_translation),
     ]
 
     results: dict[str, str] = {}

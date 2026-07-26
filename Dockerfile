@@ -31,8 +31,10 @@ COPY app.py /app/
 
 # /app/notes preserved for legacy note migration at startup
 VOLUME ["/app/notes"]
-# /app/data persisted as a named volume so users.db and runtime data survive recreations
-VOLUME ["/app/data"]
+# /app/userdata is the ONLY volume-mounted path — users.db, sessions, bookmarks live here
+# /app/data is NOT volume-mounted so the baked-in Bible DBs are always visible in the container
+RUN mkdir -p /app/userdata
+VOLUME ["/app/userdata"]
 
 EXPOSE 8000
 

@@ -13,7 +13,8 @@ import aiofiles
 
 app = FastAPI(title="Christ Pillar — Bible Study", docs_url=None)
 
-DATA = Path("/app/data")
+DATA      = Path("/app/data")      # Bible text DBs — baked into image, never volume-mounted
+USERDATA  = Path("/app/userdata")  # User accounts, sessions, bookmarks — persisted on named volume
 NOTES = Path("/app/notes")
 NOTES.mkdir(exist_ok=True)
 
@@ -45,7 +46,17 @@ BOOK_ABBR.update({
     "phm":57,"heb":58,"jas":59,"1pe":60,"2pe":61,"rev":66,
 })
 
-TRANSLATIONS = ['KJV', 'ASV', 'YLT', 'Darby', 'Geneva1599', 'Webster', 'BBE', 'BSB', 'Jubilee2000']
+TRANSLATIONS = [
+    # English public-domain
+    'KJV', 'KJVA', 'KJVPCE', 'AKJV', 'ASV', 'YLT', 'Darby', 'Geneva1599',
+    'Webster', 'BBE', 'BSB', 'Jubilee2000', 'ACV', 'DRC', 'CPDV',
+    'Tyndale', 'Wycliffe', 'OEB', 'LITV', 'MKJV', 'RNKJV', 'UKJV',
+    'RWebster', 'Rotherham', 'NHEB', 'LEB', 'Anderson', 'Noyes', 'Haweis', 'Twenty',
+    # Scholarly originals
+    'JPS', 'HebModern', 'Vulgate', 'VulgClementine', 'Peshitta', 'TR', 'Byz',
+    # Other languages
+    'FreSynodale', 'FreGeneve',
+]
 
 # Biblical places with coordinates (WGS84) and short descriptions
 # Used for map tab: passage text is scanned for place name matches
@@ -209,8 +220,9 @@ def get_strongs_db():
 
 
 def get_users_db() -> sqlite3.Connection:
-    """Return an open connection to /app/data/users.db (WAL mode, FK on)."""
-    db_path = DATA / "users.db"
+    """Return an open connection to /app/userdata/users.db (WAL mode, FK on)."""
+    USERDATA.mkdir(parents=True, exist_ok=True)
+    db_path = USERDATA / "users.db"
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -761,7 +773,7 @@ async def health():
     crossrefs_ok = (DATA / "cross_references.db").exists()
     interlinear_ok = (DATA / "interlinear.db").exists()
     commentary_ok = (DATA / "commentary.db").exists()
-    users_ok = (DATA / "users.db").exists()
+    users_ok = (USERDATA / "users.db").exists()
     return {
         "db": db_ok,
         "multi_translation": multi,
