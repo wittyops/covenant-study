@@ -2,14 +2,18 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir fastapi uvicorn[standard] aiofiles jinja2
+RUN pip install --no-cache-dir fastapi uvicorn[standard] aiofiles jinja2 bcrypt lxml requests
 
 # Download public domain Bible data at build time
 RUN apt-get update && apt-get install -y wget unzip sqlite3 && rm -rf /var/lib/apt/lists/*
 
-# scrollmapper/bible_databases — KJV with Strong's cross-reference numbers (public domain)
-RUN wget -q https://github.com/scrollmapper/bible_databases/raw/master/sqlite/t_kjv.db \
-      -O /app/data/kjv.db 2>/dev/null || true
+# Ensure /app/data exists before downloading
+RUN mkdir -p /app/data
+
+# scrollmapper/bible_databases — KJV (repo reorganised; new path formats/sqlite/KJV.db)
+# The new DB has 7 duplicate rows per verse; build_data.py deduplicates into t_kjv schema.
+RUN wget -q https://raw.githubusercontent.com/scrollmapper/bible_databases/master/formats/sqlite/KJV.db \
+      -O /app/data/KJV_raw.db 2>/dev/null || true
 RUN wget -q https://github.com/scrollmapper/bible_databases/raw/master/sqlite/cross_references.db \
       -O /app/data/cross_references.db 2>/dev/null || true
 # openscriptures/strongs — Hebrew and Greek lexicons (public domain)
@@ -18,9 +22,17 @@ RUN wget -q https://github.com/openscriptures/strongs/raw/master/hebrew/StrongsH
 RUN wget -q https://github.com/openscriptures/strongs/raw/master/greek/StrongsGreekDictionary.xml \
       -O /app/data/strongs_greek.xml 2>/dev/null || true
 
+# Run the data pipeline (idempotent — skips steps already complete)
+COPY build_data.py /app/build_data.py
+RUN python3 /app/build_data.py
+
+# Copy application last so code changes don't invalidate the data build cache
 COPY app.py /app/
 
+# /app/notes preserved for legacy note migration at startup
 VOLUME ["/app/notes"]
+# /app/data persisted as a named volume so users.db and runtime data survive recreations
+VOLUME ["/app/data"]
 
 EXPOSE 8000
 

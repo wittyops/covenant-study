@@ -1,9 +1,14 @@
 import sqlite3
-from pathlib import Path
+import secrets
+import time
 import re
+from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+import bcrypt
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 import aiofiles
 
 app = FastAPI(title="Christ Pillar — Bible Study", docs_url=None)
@@ -98,7 +103,6 @@ PLACES = {
     "Dead Sea": {"lat": 31.5590, "lon": 35.4732, "notes": "Saltiest lake on earth; cities of Sodom and Gomorrah were near here"},
     "Galilee": {"lat": 32.8000, "lon": 35.5000, "notes": "Northern region of Israel; Jesus' primary ministry area"},
     "Judea": {"lat": 31.5000, "lon": 35.0000, "notes": "Southern region; tribe of Judah; home of Jerusalem"},
-    "Samaria": {"lat": 32.2748, "lon": 35.1980, "notes": "Middle region; despised by Jews; but loved by Jesus (Good Samaritan)"},
     "Decapolis": {"lat": 32.6000, "lon": 35.9000, "notes": "League of ten Gentile cities east of Jordan; Jesus ministered here"},
     "Perea": {"lat": 31.8000, "lon": 35.7000, "notes": "Region east of Jordan; 'beyond Jordan' in Scripture"},
     # === MOUNTAINS ===
@@ -141,7 +145,6 @@ PLACES = {
     # === NEW TESTAMENT — PAUL'S JOURNEYS ===
     "Damascus": {"lat": 33.5102, "lon": 36.2913, "notes": "Paul's conversion on the road here; blinded by light; Ananias restored his sight"},
     "Tarsus": {"lat": 36.9145, "lon": 34.8952, "notes": "Paul's birthplace; 'no mean city'"},
-    "Antioch": {"lat": 36.2021, "lon": 36.1607, "notes": "Disciples first called Christians here; Paul's base for missionary journeys"},
     "Cyprus": {"lat": 35.1264, "lon": 33.4299, "notes": "Barnabas' homeland; first stop on Paul's first journey; Sergius Paulus converted"},
     "Paphos": {"lat": 34.7751, "lon": 32.4228, "notes": "Capital of Cyprus; Paul blinded Elymas the sorcerer here"},
     "Perga": {"lat": 36.9611, "lon": 30.8570, "notes": "Coastal city; John Mark left Paul here on first journey"},
@@ -183,6 +186,11 @@ PLACES = {
     "Marah": {"lat": 29.5000, "lon": 33.0000, "notes": "Bitter water made sweet; Israel murmured against Moses here"},
 }
 
+
+# ---------------------------------------------------------------------------
+# DB HELPERS
+# ---------------------------------------------------------------------------
+
 def get_db():
     multi = DATA / "bible_multi.db"
     single = DATA / "kjv.db"
@@ -192,12 +200,57 @@ def get_db():
         return sqlite3.connect(str(single)), False
     return None, False
 
+
 def get_strongs_db():
     db_path = DATA / "strongs.db"
     if not db_path.exists():
         return None
     return sqlite3.connect(str(db_path))
 
+
+def get_users_db() -> sqlite3.Connection:
+    """Return an open connection to /app/data/users.db (WAL mode, FK on)."""
+    db_path = DATA / "users.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_crossrefs_db() -> Optional[sqlite3.Connection]:
+    """Return an open connection to /app/data/cross_references.db, or None."""
+    db_path = DATA / "cross_references.db"
+    if not db_path.exists():
+        return None
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_interlinear_db() -> Optional[sqlite3.Connection]:
+    """Return an open connection to /app/data/interlinear.db, or None."""
+    db_path = DATA / "interlinear.db"
+    if not db_path.exists():
+        return None
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_commentary_db() -> Optional[sqlite3.Connection]:
+    """Return an open connection to /app/data/commentary.db, or None."""
+    db_path = DATA / "commentary.db"
+    if not db_path.exists():
+        return None
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# UTILITIES
+# ---------------------------------------------------------------------------
 
 def parse_reference(ref: str):
     ref = ref.strip()
@@ -215,6 +268,301 @@ def parse_reference(ref: str):
                 break
     return book_num, chapter, verse
 
+
+# ---------------------------------------------------------------------------
+# STARTUP: users.db schema + default admin + legacy note migration
+# ---------------------------------------------------------------------------
+
+def init_users_db() -> None:
+    """Create users.db tables if absent; seed admin account if table is empty."""
+    DATA.mkdir(parents=True, exist_ok=True)
+    conn = get_users_db()
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                username      TEXT    NOT NULL UNIQUE,
+                password_hash TEXT    NOT NULL,
+                display_name  TEXT,
+                role          TEXT    NOT NULL DEFAULT 'user',
+                created_at    INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token       TEXT    NOT NULL UNIQUE,
+                created_at  INTEGER NOT NULL,
+                expires_at  INTEGER NOT NULL,
+                last_active INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_token ON user_sessions(token);
+            CREATE INDEX IF NOT EXISTS idx_sessions_user  ON user_sessions(user_id);
+
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                ref        TEXT    NOT NULL,
+                label      TEXT,
+                color      TEXT    NOT NULL DEFAULT '#b8962e',
+                created_at INTEGER NOT NULL,
+                UNIQUE (user_id, ref)
+            );
+            CREATE INDEX IF NOT EXISTS idx_bookmarks_user ON bookmarks(user_id);
+
+            CREATE TABLE IF NOT EXISTS study_sessions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name       TEXT    NOT NULL,
+                state_json TEXT    NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_study_sessions_user
+                ON study_sessions(user_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS notes (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                ref        TEXT    NOT NULL,
+                body       TEXT    NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL,
+                UNIQUE (user_id, ref)
+            );
+            CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id);
+            CREATE INDEX IF NOT EXISTS idx_notes_ref  ON notes(ref);
+
+            CREATE TABLE IF NOT EXISTS reading_history (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                ref        TEXT    NOT NULL,
+                visited_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_history_user
+                ON reading_history(user_id, visited_at DESC);
+        """)
+
+        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if count == 0:
+            password = secrets.token_hex(12)
+            hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode()
+            conn.execute(
+                "INSERT INTO users(username, password_hash, display_name, role, created_at)"
+                " VALUES('admin', ?, 'Administrator', 'admin', ?)",
+                (hashed, int(time.time()))
+            )
+            conn.commit()
+            print(f"[INIT] Admin account created. Username: admin  Password: {password}", flush=True)
+            print("[INIT] Change this password immediately via POST /api/auth/register", flush=True)
+
+        now = int(time.time())
+        conn.execute(
+            "DELETE FROM user_sessions WHERE expires_at < ? AND last_active < ?",
+            (now, now - 604800)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_file_notes() -> None:
+    """
+    One-time migration: import legacy /app/notes/*.md files as the admin user's notes.
+    Runs only if the notes table is empty.
+    """
+    notes_dir = NOTES
+    if not notes_dir.exists():
+        return
+    conn = get_users_db()
+    try:
+        existing_count = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        if existing_count > 0:
+            return
+
+        admin = conn.execute(
+            "SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if not admin:
+            return
+        admin_id = admin[0]
+
+        migrated = 0
+        for note_file in notes_dir.glob("*.md"):
+            stem = note_file.stem
+            parts = stem.split("_")
+            if len(parts) >= 3:
+                verse_part = parts[-1]
+                chap_part = parts[-2]
+                book_parts = parts[:-2]
+                if verse_part.isdigit() and chap_part.isdigit():
+                    ref = " ".join(book_parts) + f" {chap_part}:{verse_part}"
+                else:
+                    ref = stem.replace("_", " ")
+            else:
+                ref = stem.replace("_", " ")
+
+            try:
+                body = note_file.read_text(encoding="utf-8")
+            except Exception:
+                continue
+
+            if body.strip():
+                conn.execute(
+                    "INSERT OR IGNORE INTO notes(user_id, ref, body, updated_at) VALUES(?,?,?,?)",
+                    (admin_id, ref, body, int(time.time()))
+                )
+                migrated += 1
+
+        if migrated > 0:
+            conn.commit()
+            print(f"[INIT] Migrated {migrated} legacy note(s) to admin user.", flush=True)
+    finally:
+        conn.close()
+
+
+@app.on_event("startup")
+async def startup_event():
+    init_users_db()
+    migrate_file_notes()
+
+
+# ---------------------------------------------------------------------------
+# AUTH HELPERS
+# ---------------------------------------------------------------------------
+
+class UserRow:
+    """Thin wrapper around a users row tuple."""
+    def __init__(self, id: int, username: str, display_name: Optional[str], role: str):
+        self.id = id
+        self.username = username
+        self.display_name = display_name
+        self.role = role
+
+
+def _resolve_token(request: Request, authorization: Optional[str]) -> Optional[str]:
+    """Extract raw token from Authorization header or __session cookie."""
+    if authorization and authorization.startswith("Bearer "):
+        return authorization.removeprefix("Bearer ").strip()
+    return request.cookies.get("__session")
+
+
+def get_current_user(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+) -> Optional[UserRow]:
+    """Returns authenticated UserRow or None."""
+    token = _resolve_token(request, authorization)
+    if not token:
+        return None
+    now = int(time.time())
+    conn = get_users_db()
+    try:
+        row = conn.execute(
+            "SELECT u.id, u.username, u.display_name, u.role "
+            "FROM user_sessions s "
+            "JOIN users u ON u.id = s.user_id "
+            "WHERE s.token = ? AND (s.expires_at > ? OR s.last_active > ?)",
+            (token, now, now - 604800)
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE user_sessions SET last_active = ? WHERE token = ?",
+            (now, token)
+        )
+        conn.commit()
+        return UserRow(row[0], row[1], row[2], row[3])
+    finally:
+        conn.close()
+
+
+def require_user(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+) -> UserRow:
+    """Returns authenticated UserRow or raises HTTP 401."""
+    user = get_current_user(request, authorization)
+    if user is None:
+        raise HTTPException(401, detail="Authentication required")
+    return user
+
+
+def _create_session(conn: sqlite3.Connection, user_id: int) -> str:
+    """Insert a new session token and return the raw token string."""
+    token = secrets.token_hex(32)
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO user_sessions(user_id, token, created_at, expires_at, last_active)"
+        " VALUES(?, ?, ?, ?, ?)",
+        (user_id, token, now, now + 2592000, now)
+    )
+    return token
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key="__session",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=2592000,
+        path="/"
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.set_cookie(
+        key="__session",
+        value="",
+        httponly=True,
+        samesite="lax",
+        max_age=0,
+        path="/"
+    )
+
+
+# ---------------------------------------------------------------------------
+# PYDANTIC MODELS
+# ---------------------------------------------------------------------------
+
+class RegisterBody(BaseModel):
+    username: str = Field(..., min_length=3, max_length=32, pattern=r"^[a-zA-Z0-9_]+$")
+    password: str = Field(..., min_length=8)
+    display_name: Optional[str] = None
+
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+class SessionCreateBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    state_json: str
+
+
+class SessionUpdateBody(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    state_json: Optional[str] = None
+
+
+class BookmarkCreateBody(BaseModel):
+    ref: str = Field(..., min_length=1)
+    label: Optional[str] = None
+    color: str = "#b8962e"
+
+
+class HistoryBody(BaseModel):
+    ref: str = Field(..., min_length=1)
+
+
+class NoteBody(BaseModel):
+    body: str = ""
+
+
+# ---------------------------------------------------------------------------
+# BIBLE DATA ENDPOINTS (existing)
+# ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -367,7 +715,6 @@ async def get_places(ref: str = Query(None)):
         if not book_num:
             return {"reference": ref, "places": []}
         cur = conn.cursor()
-        # Always scan KJV text for place name matching
         if multi:
             if verse:
                 rows = cur.execute(
@@ -401,25 +748,6 @@ async def get_places(ref: str = Query(None)):
         conn.close()
 
 
-@app.get("/api/note/{ref}")
-async def get_note(ref: str):
-    safe = re.sub(r'[^\w\s\-:]', '', ref).strip().replace(' ', '_')
-    note_file = NOTES / f"{safe}.md"
-    if not note_file.exists():
-        return {"ref": ref, "content": ""}
-    async with aiofiles.open(note_file) as f:
-        return {"ref": ref, "content": await f.read()}
-
-
-@app.post("/api/note/{ref}")
-async def save_note(ref: str, body: dict):
-    safe = re.sub(r'[^\w\s\-:]', '', ref).strip().replace(' ', '_')
-    note_file = NOTES / f"{safe}.md"
-    async with aiofiles.open(note_file, 'w') as f:
-        await f.write(body.get("content", ""))
-    return {"status": "saved", "ref": ref}
-
-
 @app.get("/api/books")
 async def list_books():
     return {"books": [{"num": k, "name": v} for k, v in BOOKS.items()]}
@@ -430,14 +758,667 @@ async def health():
     multi = (DATA / "bible_multi.db").exists()
     db_ok = multi or (DATA / "kjv.db").exists()
     strongs_ok = (DATA / "strongs.db").exists()
+    crossrefs_ok = (DATA / "cross_references.db").exists()
+    interlinear_ok = (DATA / "interlinear.db").exists()
+    commentary_ok = (DATA / "commentary.db").exists()
+    users_ok = (DATA / "users.db").exists()
     return {
         "db": db_ok,
         "multi_translation": multi,
         "strongs": strongs_ok,
+        "crossrefs": crossrefs_ok,
+        "interlinear": interlinear_ok,
+        "commentary": commentary_ok,
+        "users_db": users_ok,
         "notes_dir": str(NOTES),
         "places_count": len(PLACES)
     }
 
+
+# ---------------------------------------------------------------------------
+# BIBLE DATA: NEW CONTENT ENDPOINTS
+# ---------------------------------------------------------------------------
+
+@app.get("/api/verse/tagged")
+async def get_tagged_verse(ref: str = Query(...)):
+    """Return KJV verse text with per-word Strong's numbers from the word_strongs table."""
+    book_num, chapter, verse = parse_reference(ref)
+    if not book_num or not verse:
+        raise HTTPException(400, f"Tagged verse requires a specific verse reference: {ref}")
+
+    kjv_path = DATA / "kjv.db"
+    multi_path = DATA / "bible_multi.db"
+    db_path = multi_path if multi_path.exists() else kjv_path
+    if not db_path.exists():
+        raise HTTPException(503, "Bible database not loaded")
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        has_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='word_strongs'"
+        ).fetchone()
+        if not has_table:
+            raise HTTPException(503, "word_strongs table not populated yet")
+
+        rows = conn.execute(
+            """
+            SELECT ws.word_position, ws.phrase_text, ws.strong_number,
+                   ws.extra_strongs, ws.morph,
+                   s.original, s.definition
+            FROM word_strongs ws
+            LEFT JOIN (
+                SELECT number, original, definition FROM strongs
+            ) s ON s.number = ws.strong_number
+            WHERE ws.book_id = ? AND ws.chapter = ? AND ws.verse = ?
+            ORDER BY ws.word_position
+            """,
+            (book_num, chapter, verse)
+        ).fetchall()
+
+        if not rows:
+            raise HTTPException(404, f"No tagged data found for {ref}")
+
+        words = [
+            {
+                "pos": r["word_position"],
+                "text": r["phrase_text"],
+                "strongs": r["strong_number"],
+                "extra_strongs": r["extra_strongs"],
+                "morph": r["morph"],
+                "original": r["original"],
+                "definition": r["definition"],
+            }
+            for r in rows
+        ]
+        return {"reference": ref, "words": words}
+    finally:
+        conn.close()
+
+
+@app.get("/api/crossrefs")
+async def get_crossrefs(
+    ref: str = Query(...),
+    min_votes: int = Query(0),
+    limit: int = Query(25, ge=1, le=200),
+):
+    """Return cross-references for a verse from the cross_references.db."""
+    ref = ref.strip()
+    m = re.match(r'^(.*?)\s+(\d+):(\d+)$', ref)
+    if not m:
+        raise HTTPException(400, f"Could not parse reference: {ref}")
+    book_name = m.group(1).strip()
+    chapter = int(m.group(2))
+    verse = int(m.group(3))
+
+    db = get_crossrefs_db()
+    if not db:
+        raise HTTPException(503, "Cross-references database not loaded")
+    try:
+        rows = db.execute(
+            """
+            SELECT to_book, to_chapter, to_verse_start, to_verse_end, votes
+            FROM cross_refs
+            WHERE from_book = ? AND from_chapter = ? AND from_verse = ?
+              AND votes >= ?
+            ORDER BY votes DESC
+            LIMIT ?
+            """,
+            (book_name, chapter, verse, min_votes, limit)
+        ).fetchall()
+
+        cross_refs = [
+            {
+                "book": r["to_book"],
+                "chapter": r["to_chapter"],
+                "verse_start": r["to_verse_start"],
+                "verse_end": r["to_verse_end"],
+                "votes": r["votes"],
+            }
+            for r in rows
+        ]
+        return {"ref": ref, "cross_references": cross_refs}
+    finally:
+        db.close()
+
+
+@app.get("/api/interlinear")
+async def get_interlinear(ref: str = Query(...)):
+    """Return word-level Hebrew/Greek interlinear data for a single verse."""
+    book_num, chapter, verse = parse_reference(ref)
+    if not book_num or not verse:
+        raise HTTPException(400, f"Interlinear requires a specific verse reference: {ref}")
+
+    db = get_interlinear_db()
+    if not db:
+        raise HTTPException(503, "Interlinear database not loaded")
+    try:
+        rows = db.execute(
+            """
+            SELECT word_num, testament, original_word, transliteration,
+                   strongs_num, morphology, english_gloss
+            FROM interlinear
+            WHERE book = ? AND chapter = ? AND verse = ?
+            ORDER BY word_num
+            """,
+            (book_num, chapter, verse)
+        ).fetchall()
+
+        if not rows:
+            raise HTTPException(404, f"No interlinear data found for {ref}")
+
+        testament = rows[0]["testament"]
+
+        strongs_db = None
+        strongs_path = DATA / "strongs.db"
+        if strongs_path.exists():
+            strongs_db = sqlite3.connect(str(strongs_path))
+            strongs_db.row_factory = sqlite3.Row
+
+        words = []
+        for r in rows:
+            entry = {
+                "num": r["word_num"],
+                "original": r["original_word"],
+                "translit": r["transliteration"],
+                "strongs": r["strongs_num"],
+                "morph": r["morphology"],
+                "gloss": r["english_gloss"],
+                "definition": None,
+            }
+            if strongs_db and r["strongs_num"]:
+                s_row = strongs_db.execute(
+                    "SELECT definition FROM strongs WHERE number = ?",
+                    (r["strongs_num"],)
+                ).fetchone()
+                if s_row:
+                    entry["definition"] = s_row["definition"]
+            words.append(entry)
+
+        if strongs_db:
+            strongs_db.close()
+
+        return {"ref": ref, "testament": testament, "words": words}
+    finally:
+        db.close()
+
+
+@app.get("/api/commentary")
+async def get_commentary(ref: str = Query(...)):
+    """Return Matthew Henry commentary section(s) that cover the requested verse."""
+    book_num, chapter, verse = parse_reference(ref)
+    if not book_num or not verse:
+        raise HTTPException(400, f"Commentary requires a specific verse reference: {ref}")
+
+    db = get_commentary_db()
+    if not db:
+        raise HTTPException(503, "Commentary database not loaded")
+    try:
+        rows = db.execute(
+            """
+            SELECT verse_start, verse_end, author, text
+            FROM commentary
+            WHERE book = ? AND chapter = ?
+              AND (verse_start IS NULL OR verse_start <= ?)
+              AND (verse_end   IS NULL OR verse_end   >= ?)
+            ORDER BY verse_start NULLS FIRST
+            """,
+            (book_num, chapter, verse, verse)
+        ).fetchall()
+
+        sections = [
+            {
+                "verse_start": r["verse_start"],
+                "verse_end": r["verse_end"],
+                "author": r["author"],
+                "text": r["text"],
+            }
+            for r in rows
+        ]
+        return {"ref": ref, "commentary": sections}
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# AUTH ENDPOINTS
+# ---------------------------------------------------------------------------
+
+@app.post("/api/auth/register", status_code=201)
+async def auth_register(body: RegisterBody, response: Response):
+    """Register a new user account; returns session token + user object."""
+    hashed = bcrypt.hashpw(body.password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode()
+    conn = get_users_db()
+    try:
+        now = int(time.time())
+        try:
+            conn.execute(
+                "INSERT INTO users(username, password_hash, display_name, role, created_at)"
+                " VALUES(?, ?, ?, 'user', ?)",
+                (body.username, hashed, body.display_name, now)
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, detail="Username already taken")
+
+        user_row = conn.execute(
+            "SELECT id, display_name, role FROM users WHERE username = ?",
+            (body.username,)
+        ).fetchone()
+        uid, display_name, role = user_row[0], user_row[1], user_row[2]
+
+        token = _create_session(conn, uid)
+        conn.commit()
+        _set_session_cookie(response, token)
+        return {
+            "token": token,
+            "user": {
+                "id": uid,
+                "username": body.username,
+                "display_name": display_name,
+                "role": role,
+            }
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: LoginBody, response: Response):
+    """Authenticate with username + password; returns session token + user object."""
+    conn = get_users_db()
+    try:
+        row = conn.execute(
+            "SELECT id, password_hash, display_name, role FROM users WHERE username = ?",
+            (body.username,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(401, detail="Invalid credentials")
+
+        uid, stored_hash, display_name, role = row[0], row[1], row[2], row[3]
+        if not bcrypt.checkpw(body.password.encode("utf-8"), stored_hash.encode("utf-8")):
+            raise HTTPException(401, detail="Invalid credentials")
+
+        token = _create_session(conn, uid)
+        conn.commit()
+        _set_session_cookie(response, token)
+        return {
+            "token": token,
+            "user": {
+                "id": uid,
+                "username": body.username,
+                "display_name": display_name,
+                "role": role,
+            }
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request, response: Response,
+                      authorization: Optional[str] = Header(None)):
+    """Delete the current session (idempotent)."""
+    token = _resolve_token(request, authorization)
+    if token:
+        conn = get_users_db()
+        try:
+            conn.execute("DELETE FROM user_sessions WHERE token = ?", (token,))
+            conn.commit()
+        finally:
+            conn.close()
+    _clear_session_cookie(response)
+    return {"status": "ok"}
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request, authorization: Optional[str] = Header(None)):
+    """Return the currently authenticated user's profile."""
+    user = get_current_user(request, authorization)
+    if user is None:
+        raise HTTPException(401, detail="Authentication required")
+    return {
+        "id": user.id,
+        "username": user.username,
+        "display_name": user.display_name,
+        "role": user.role,
+    }
+
+
+# ---------------------------------------------------------------------------
+# STUDY SESSIONS
+# ---------------------------------------------------------------------------
+
+@app.get("/api/sessions")
+async def list_sessions(request: Request, authorization: Optional[str] = Header(None)):
+    user = require_user(request, authorization)
+    conn = get_users_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, name, updated_at FROM study_sessions"
+            " WHERE user_id = ? ORDER BY updated_at DESC",
+            (user.id,)
+        ).fetchall()
+        return [{"id": r[0], "name": r[1], "updated_at": r[2]} for r in rows]
+    finally:
+        conn.close()
+
+
+@app.post("/api/sessions", status_code=201)
+async def create_session(
+    body: SessionCreateBody,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(request, authorization)
+    now = int(time.time())
+    conn = get_users_db()
+    try:
+        cur = conn.execute(
+            "INSERT INTO study_sessions(user_id, name, state_json, created_at, updated_at)"
+            " VALUES(?, ?, ?, ?, ?)",
+            (user.id, body.name, body.state_json, now, now)
+        )
+        conn.commit()
+        return {"id": cur.lastrowid, "name": body.name, "updated_at": now}
+    finally:
+        conn.close()
+
+
+@app.get("/api/sessions/{sid}")
+async def get_session(
+    sid: int,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(request, authorization)
+    conn = get_users_db()
+    try:
+        row = conn.execute(
+            "SELECT id, name, state_json, created_at, updated_at"
+            " FROM study_sessions WHERE id = ? AND user_id = ?",
+            (sid, user.id)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Session not found")
+        return {
+            "id": row[0],
+            "name": row[1],
+            "state_json": row[2],
+            "created_at": row[3],
+            "updated_at": row[4],
+        }
+    finally:
+        conn.close()
+
+
+@app.put("/api/sessions/{sid}")
+async def update_session(
+    sid: int,
+    body: SessionUpdateBody,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(request, authorization)
+    now = int(time.time())
+    conn = get_users_db()
+    try:
+        result = conn.execute(
+            """
+            UPDATE study_sessions
+            SET name       = COALESCE(?, name),
+                state_json = COALESCE(?, state_json),
+                updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (body.name, body.state_json, now, sid, user.id)
+        )
+        if result.rowcount == 0:
+            raise HTTPException(404, "Session not found")
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, name, state_json, created_at, updated_at"
+            " FROM study_sessions WHERE id = ?",
+            (sid,)
+        ).fetchone()
+        return {
+            "id": row[0],
+            "name": row[1],
+            "state_json": row[2],
+            "created_at": row[3],
+            "updated_at": row[4],
+        }
+    finally:
+        conn.close()
+
+
+@app.delete("/api/sessions/{sid}", status_code=204)
+async def delete_session(
+    sid: int,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(request, authorization)
+    conn = get_users_db()
+    try:
+        result = conn.execute(
+            "DELETE FROM study_sessions WHERE id = ? AND user_id = ?",
+            (sid, user.id)
+        )
+        if result.rowcount == 0:
+            raise HTTPException(404, "Session not found")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# BOOKMARKS
+# NOTE: /api/bookmarks/check MUST be registered before /api/bookmarks/{bid}
+# ---------------------------------------------------------------------------
+
+@app.get("/api/bookmarks/check")
+async def check_bookmark(
+    ref: str = Query(...),
+    request: Request = None,
+    authorization: Optional[str] = Header(None),
+):
+    if request is None:
+        return {"bookmarked": False}
+    user = get_current_user(request, authorization)
+    if user is None:
+        return {"bookmarked": False}
+    conn = get_users_db()
+    try:
+        row = conn.execute(
+            "SELECT id FROM bookmarks WHERE user_id = ? AND ref = ?",
+            (user.id, ref)
+        ).fetchone()
+        if row:
+            return {"bookmarked": True, "id": row[0]}
+        return {"bookmarked": False}
+    finally:
+        conn.close()
+
+
+@app.get("/api/bookmarks")
+async def list_bookmarks(request: Request, authorization: Optional[str] = Header(None)):
+    user = get_current_user(request, authorization)
+    if user is None:
+        return []
+    conn = get_users_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, ref, label, color, created_at"
+            " FROM bookmarks WHERE user_id = ? ORDER BY created_at DESC",
+            (user.id,)
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "ref": r[1], "label": r[2],
+                "color": r[3], "created_at": r[4]
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+@app.post("/api/bookmarks", status_code=201)
+async def create_bookmark(
+    body: BookmarkCreateBody,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(request, authorization)
+    now = int(time.time())
+    conn = get_users_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO bookmarks(user_id, ref, label, color, created_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, ref)
+            DO UPDATE SET label = excluded.label, color = excluded.color
+            """,
+            (user.id, body.ref, body.label, body.color, now)
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, ref, label, color, created_at"
+            " FROM bookmarks WHERE user_id = ? AND ref = ?",
+            (user.id, body.ref)
+        ).fetchone()
+        return {"id": row[0], "ref": row[1], "label": row[2], "color": row[3], "created_at": row[4]}
+    finally:
+        conn.close()
+
+
+@app.delete("/api/bookmarks/{bid}", status_code=204)
+async def delete_bookmark(
+    bid: int,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(request, authorization)
+    conn = get_users_db()
+    try:
+        result = conn.execute(
+            "DELETE FROM bookmarks WHERE id = ? AND user_id = ?",
+            (bid, user.id)
+        )
+        if result.rowcount == 0:
+            raise HTTPException(404, "Bookmark not found")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# READING HISTORY
+# ---------------------------------------------------------------------------
+
+@app.post("/api/history", status_code=201)
+async def add_history(
+    body: HistoryBody,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(request, authorization)
+    now = int(time.time())
+    conn = get_users_db()
+    try:
+        conn.execute(
+            "INSERT INTO reading_history(user_id, ref, visited_at) VALUES(?, ?, ?)",
+            (user.id, body.ref, now)
+        )
+        conn.execute(
+            """
+            DELETE FROM reading_history
+            WHERE user_id = ?
+              AND id NOT IN (
+                SELECT id FROM reading_history
+                WHERE user_id = ?
+                ORDER BY visited_at DESC
+                LIMIT 100
+              )
+            """,
+            (user.id, user.id)
+        )
+        conn.commit()
+        return {"ref": body.ref, "visited_at": now}
+    finally:
+        conn.close()
+
+
+@app.get("/api/history")
+async def get_history(request: Request, authorization: Optional[str] = Header(None)):
+    user = require_user(request, authorization)
+    conn = get_users_db()
+    try:
+        rows = conn.execute(
+            "SELECT ref, visited_at FROM reading_history"
+            " WHERE user_id = ? ORDER BY visited_at DESC LIMIT 20",
+            (user.id,)
+        ).fetchall()
+        return [{"ref": r[0], "visited_at": r[1]} for r in rows]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# NOTES — User-scoped (replaces legacy file-based /api/note/{ref} endpoints)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/note/{ref:path}")
+async def get_note_user(
+    ref: str,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Return the authenticated user's note for this reference."""
+    user = require_user(request, authorization)
+    conn = get_users_db()
+    try:
+        row = conn.execute(
+            "SELECT body, updated_at FROM notes WHERE user_id = ? AND ref = ?",
+            (user.id, ref)
+        ).fetchone()
+        if row:
+            return {"ref": ref, "body": row[0], "updated_at": row[1]}
+        return {"ref": ref, "body": "", "updated_at": None}
+    finally:
+        conn.close()
+
+
+@app.post("/api/note/{ref:path}")
+async def save_note_user(
+    ref: str,
+    body: NoteBody,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Insert or update the authenticated user's note for this reference."""
+    user = require_user(request, authorization)
+    now = int(time.time())
+    conn = get_users_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO notes(user_id, ref, body, updated_at) VALUES(?, ?, ?, ?)
+            ON CONFLICT(user_id, ref)
+            DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at
+            """,
+            (user.id, ref, body.body, now)
+        )
+        conn.commit()
+        return {"status": "ok", "ref": ref, "updated_at": now}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# FRONTEND
+# ---------------------------------------------------------------------------
 
 INLINE_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -674,7 +1655,6 @@ async function initMap() {
     maxZoom: 18
   }).addTo(map);
 
-  // Load all places and add subtle background markers
   const resp = await fetch('/api/places');
   const data = await resp.json();
   allPlaces = {};
@@ -699,7 +1679,6 @@ async function mapPassage(ref) {
   setTab('maps');
   document.getElementById('map-title').textContent = 'Places in ' + ref;
 
-  // Clear previous passage highlights
   for (const m of passageMarkers) map.removeLayer(m);
   passageMarkers = [];
   document.getElementById('place-chips').innerHTML = '';
@@ -719,7 +1698,6 @@ async function mapPassage(ref) {
   chips.innerHTML = '<span class="place-count">'+data.places.length+' places found in this passage:</span>';
 
   for (const p of data.places) {
-    // Highlighted marker
     const marker = L.marker([p.lat, p.lon], {
       icon: L.divIcon({
         className: '',
@@ -731,7 +1709,6 @@ async function mapPassage(ref) {
     passageMarkers.push(marker);
     bounds.push([p.lat, p.lon]);
 
-    // Chip
     const chip = document.createElement('span');
     chip.className = 'place-chip';
     chip.textContent = p.name;
@@ -776,18 +1753,19 @@ function noteSection(ref) {
 async function loadNote(ref) {
   try {
     const r = await fetch('/api/note/'+encodeURIComponent(ref));
+    if (!r.ok) return;
     const d = await r.json();
     const el = document.getElementById('note-content');
-    if (el) el.value = d.content;
+    if (el) el.value = d.body || d.content || '';
   } catch(e) {}
 }
 
 async function saveNote(ref) {
-  const content = document.getElementById('note-content').value;
+  const body = document.getElementById('note-content').value;
   await fetch('/api/note/'+encodeURIComponent(ref), {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({content})
+    body: JSON.stringify({body})
   });
   const s = document.getElementById('save-status');
   if (s) { s.textContent = 'Saved ✓'; setTimeout(() => s.textContent = '', 2000); }
@@ -802,7 +1780,6 @@ document.getElementById('place-search').addEventListener('keydown', e => {
   if (e.key === 'Enter') searchPlace();
 });
 
-// Default load — show the Cross verse
 window.addEventListener('load', () => {
   document.getElementById('query').value = 'John 3:16';
   lookupVerse('John 3:16');
