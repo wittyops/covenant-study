@@ -1,5 +1,5 @@
 {
-  "venvPath": ".",
+  "venvPath": "/home/bearboss/wittycomp-lab/apps/wn-bible-01",
   "venv": ".venv",
   "pythonVersion": "3.12"
 }

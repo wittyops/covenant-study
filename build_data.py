@@ -1125,20 +1125,16 @@ def build_commentary() -> None:
                 chapters_done += 1
                 continue
 
-            # The HelloAO commentary format nests inside a "commentary" key
-            # which contains groups of verses.  Fall back to top-level list.
-            content = chapter_data
-            if isinstance(chapter_data, dict):
-                content = (
-                    chapter_data.get("commentary")
-                    or chapter_data.get("verses")
-                    or chapter_data.get("content")
-                    or []
-                )
+            # HelloAO chapter response: {chapter: {number, content: [{type, number, content}]}}
+            # data["commentary"] is metadata (not the text); data["chapter"]["content"] is
+            # the list of verse groups.
+            chapter_obj = chapter_data.get("chapter", {}) if isinstance(chapter_data, dict) else {}
+            content = chapter_obj.get("content") or []
+            if not isinstance(content, list):
+                content = []
 
             groups = [v for v in content if isinstance(v, dict) and v.get("type") == "verse"]
             if not groups:
-                # Some chapters return a flat list of content dicts without "type"
                 groups = [v for v in content if isinstance(v, dict) and "number" in v]
 
             for i, grp in enumerate(groups):
