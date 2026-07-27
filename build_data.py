@@ -15,7 +15,6 @@ Errors are caught per-step; build exits 0 regardless.
 """
 
 import json
-import os
 import re
 import sqlite3
 import sys
@@ -759,34 +758,73 @@ def build_strongs() -> None:
             ns_match = re.match(r'\{([^}]+)\}', root.tag)
             ns = f"{{{ns_match.group(1)}}}" if ns_match else ""
 
-            for entry in root.findall(f".//{ns}entry"):
-                raw_num = entry.get("strongs") or entry.get("id") or ""
-                if not raw_num:
-                    continue
-                number = normalize_strongs(raw_num)
+            # Try classic DTD schema first: <entry strongs="NNN">
+            entries = root.findall(f".//{ns}entry")
+            if entries:
+                for entry in entries:
+                    raw_num = entry.get("strongs") or entry.get("id") or ""
+                    if not raw_num:
+                        continue
+                    number = normalize_strongs(raw_num)
 
-                w_el = entry.find(f"{ns}w")
-                original = w_el.text.strip() if w_el is not None and w_el.text else ""
-                xlit  = (w_el.get("xlit", "") or "") if w_el is not None else ""
-                pron  = (w_el.get("pron", "") or "") if w_el is not None else ""
+                    w_el = entry.find(f"{ns}w")
+                    original = w_el.text.strip() if w_el is not None and w_el.text else ""
+                    xlit  = (w_el.get("xlit", "") or "") if w_el is not None else ""
+                    pron  = (w_el.get("pron", "") or "") if w_el is not None else ""
 
-                # Collect all <strongs_def> or <def> children text
-                def_parts = []
-                for tag in (f"{ns}strongs_def", f"{ns}def"):
-                    for el in entry.findall(f".//{tag}"):
-                        if el.text:
-                            def_parts.append(el.text.strip())
-                definition = " ".join(def_parts).strip()
+                    def_parts = []
+                    for tag in (f"{ns}strongs_def", f"{ns}def"):
+                        for el in entry.findall(f".//{tag}"):
+                            if el.text:
+                                def_parts.append(el.text.strip())
+                    definition = " ".join(def_parts).strip()
 
-                usage_el = entry.find(f".//{ns}kjv_def")
-                if usage_el is None:
-                    usage_el = entry.find(f".//{ns}usage")
-                kjv_usage = (usage_el.text or "").strip() if usage_el is not None else ""
+                    usage_el = entry.find(f".//{ns}kjv_def")
+                    if usage_el is None:
+                        usage_el = entry.find(f".//{ns}usage")
+                    kjv_usage = (usage_el.text or "").strip() if usage_el is not None else ""
 
-                con.execute(insert_sql, (number, language, original, xlit, pron, definition, kjv_usage))
-                count += 1
-                if count % 1000 == 0:
-                    con.commit()
+                    con.execute(insert_sql, (number, language, original, xlit, pron, definition, kjv_usage))
+                    count += 1
+                    if count % 1000 == 0:
+                        con.commit()
+            else:
+                # OSIS schema (StrongHebrewG.xml): <div type="entry" n="NNN">
+                #   <w ID="H1" xlit="..." POS="...">word</w>
+                #   <note type="exegesis">definition</note>
+                #   <note type="translation">KJV usage</note>
+                osis_entries = [
+                    d for d in root.findall(f".//{ns}div")
+                    if d.get("type") == "entry"
+                ]
+                print(f"    (OSIS schema detected — {len(osis_entries)} entries)", flush=True)
+                for div in osis_entries:
+                    w_el = div.find(f"{ns}w")
+                    if w_el is None:
+                        continue
+                    raw_num = w_el.get("ID") or div.get("n", "")
+                    if not raw_num:
+                        continue
+                    number = normalize_strongs(raw_num)
+                    original = (w_el.text or "").strip()
+                    xlit = w_el.get("xlit", "") or ""
+                    pron = w_el.get("POS", "") or ""
+
+                    def_parts: list[str] = []
+                    kjv_usage = ""
+                    for note in div.findall(f"{ns}note"):
+                        ntype = note.get("type", "")
+                        txt = (note.text or "").strip()
+                        if ntype == "exegesis" and txt:
+                            def_parts.append(txt)
+                        elif ntype == "translation" and txt:
+                            kjv_usage = txt
+                    definition = " ".join(def_parts).strip()
+
+                    con.execute(insert_sql, (number, language, original, xlit, pron, definition, kjv_usage))
+                    count += 1
+                    if count % 1000 == 0:
+                        con.commit()
         except Exception:
             print(f"  ERROR parsing {xml_path.name}: {traceback.format_exc().splitlines()[-1]}", flush=True)
         con.commit()
@@ -1021,22 +1059,59 @@ def build_commentary() -> None:
     try:
         resp = requests.get(f"{BASE_URL}/books.json", timeout=30)
         resp.raise_for_status()
-        books_list = resp.json()
+        raw = resp.json()
     except Exception:
         print(f"  ERROR fetching book list: {traceback.format_exc().splitlines()[-1]}", flush=True)
         con.close()
         return
 
+    # Normalise the book list regardless of API shape.
+    # Old format: list of dicts with "id", "numberOfChapters", ...
+    # New format: list of strings (book abbreviations) or dict wrapping a list.
+    if isinstance(raw, dict):
+        # Try common wrapper keys
+        inner = raw.get("books") or raw.get("data") or []
+        books_raw = inner if isinstance(inner, list) else list(raw.values())
+    elif isinstance(raw, list):
+        books_raw = raw
+    else:
+        books_raw = []
+
+    # Build a uniform list of (abbr, num_chapters) tuples
+    book_entries: list[tuple[str, int]] = []
+    for item in books_raw:
+        if isinstance(item, dict):
+            abbr = (item.get("id") or item.get("abbreviation") or "").upper()
+            chaps = int(item.get("numberOfChapters") or item.get("chapters") or 0)
+        elif isinstance(item, str):
+            abbr = item.upper()
+            chaps = 0  # derive from our own verse-count table
+        else:
+            continue
+        if not abbr:
+            continue
+        # Derive chapter count from KJV_VERSE_COUNTS if not provided
+        if chaps == 0:
+            book_int_tmp = HELLOAO_MAP.get(abbr)
+            if book_int_tmp:
+                chaps = max(c for (b, c) in KJV_VERSE_COUNTS if b == book_int_tmp) if book_int_tmp else 0
+        book_entries.append((abbr, chaps))
+
+    # Fall back: if the API gave us nothing, iterate all 66 books ourselves
+    if not book_entries:
+        print("  WARNING: books.json returned no usable entries — iterating all 66 books.", flush=True)
+        for abbr, book_int in HELLOAO_MAP.items():
+            chaps = max((c for (b, c) in KJV_VERSE_COUNTS if b == book_int), default=0)
+            book_entries.append((abbr, chaps))
+
     total_rows = 0
-    total_chapters = sum(b.get("numberOfChapters", 0) for b in books_list)
+    total_chapters = sum(c for _, c in book_entries)
     chapters_done = 0
 
-    for book_obj in books_list:
-        book_abbr = (book_obj.get("id") or "").upper()
+    for book_abbr, num_chaps in book_entries:
         book_int  = HELLOAO_MAP.get(book_abbr)
         if not book_int:
             continue
-        num_chaps = book_obj.get("numberOfChapters", 0)
 
         for chap in range(1, num_chaps + 1):
             url = f"{BASE_URL}/{book_abbr}/{chap}.json"
