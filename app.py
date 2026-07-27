@@ -6650,7 +6650,7 @@ async function loadCrossRefs(ref) {
     const data = await apiFetch(`/api/crossrefs?ref=${encodeURIComponent(ref)}`);
     container.innerHTML = '';
 
-    const refs = data.crossrefs || data.refs || data || [];
+    const refs = data.cross_references || data.crossrefs || data.refs || [];
     if (refs.length === 0) {
       container.innerHTML = '<p class="empty-state">No cross-references found.</p>';
       return;
