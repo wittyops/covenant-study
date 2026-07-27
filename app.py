@@ -792,57 +792,84 @@ async def health():
 
 @app.get("/api/verse/tagged")
 async def get_tagged_verse(ref: str = Query(...)):
-    """Return KJV verse text with per-word Strong's numbers from the word_strongs table."""
+    """Return KJV verse(s) with per-word Strong's numbers from word_strongs in kjv.db.
+
+    Chapter ref ('John 3')  → {"reference", "verses": [{"num", "words"}, ...]}
+    Verse ref ('John 3:16') → {"reference", "verses": [{"num": 16, "words": [...]}]}
+    word_strongs lives in kjv.db; strongs definitions ATTACHed from strongs.db.
+    """
     book_num, chapter, verse = parse_reference(ref)
-    if not book_num or not verse:
-        raise HTTPException(400, f"Tagged verse requires a specific verse reference: {ref}")
+    if not book_num:
+        raise HTTPException(400, f"Could not parse reference: {ref}")
 
     kjv_path = DATA / "kjv.db"
-    multi_path = DATA / "bible_multi.db"
-    db_path = multi_path if multi_path.exists() else kjv_path
-    if not db_path.exists():
-        raise HTTPException(503, "Bible database not loaded")
+    if not kjv_path.exists():
+        raise HTTPException(503, "KJV database not loaded")
 
-    conn = sqlite3.connect(str(db_path))
+    strongs_path = DATA / "strongs.db"
+
+    conn = sqlite3.connect(str(kjv_path))
     conn.row_factory = sqlite3.Row
     try:
+        if strongs_path.exists():
+            conn.execute("ATTACH DATABASE ? AS sdb", (str(strongs_path),))
+            strongs_join = "LEFT JOIN (SELECT number, original, definition FROM sdb.strongs) s ON s.number = ws.strong_number"
+            strongs_sel  = "s.original, s.definition"
+        else:
+            strongs_join = ""
+            strongs_sel  = "NULL as original, NULL as definition"
+
         has_table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='word_strongs'"
         ).fetchone()
         if not has_table:
             raise HTTPException(503, "word_strongs table not populated yet")
 
-        rows = conn.execute(
-            """
-            SELECT ws.word_position, ws.phrase_text, ws.strong_number,
-                   ws.extra_strongs, ws.morph,
-                   s.original, s.definition
-            FROM word_strongs ws
-            LEFT JOIN (
-                SELECT number, original, definition FROM strongs
-            ) s ON s.number = ws.strong_number
-            WHERE ws.book_id = ? AND ws.chapter = ? AND ws.verse = ?
-            ORDER BY ws.word_position
-            """,
-            (book_num, chapter, verse)
-        ).fetchall()
+        def fetch_verse_words(v_num: int) -> list:
+            rows = conn.execute(
+                f"""
+                SELECT ws.word_position, ws.phrase_text, ws.strong_number,
+                       ws.extra_strongs, ws.morph,
+                       {strongs_sel}
+                FROM word_strongs ws
+                {strongs_join}
+                WHERE ws.book_id = ? AND ws.chapter = ? AND ws.verse = ?
+                ORDER BY ws.word_position
+                """,
+                (book_num, chapter, v_num),
+            ).fetchall()
+            return [
+                {
+                    "pos": r["word_position"],
+                    "text": r["phrase_text"],
+                    "strongs": r["strong_number"],
+                    "extra_strongs": r["extra_strongs"],
+                    "morph": r["morph"],
+                    "original": r["original"],
+                    "definition": r["definition"],
+                }
+                for r in rows
+            ]
 
-        if not rows:
-            raise HTTPException(404, f"No tagged data found for {ref}")
-
-        words = [
-            {
-                "pos": r["word_position"],
-                "text": r["phrase_text"],
-                "strongs": r["strong_number"],
-                "extra_strongs": r["extra_strongs"],
-                "morph": r["morph"],
-                "original": r["original"],
-                "definition": r["definition"],
-            }
-            for r in rows
-        ]
-        return {"reference": ref, "words": words}
+        if verse is None:
+            # Chapter-level: collect all tagged verses
+            verse_nums = [
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT verse FROM word_strongs WHERE book_id=? AND chapter=? ORDER BY verse",
+                    (book_num, chapter),
+                ).fetchall()
+            ]
+            verses = []
+            for v_num in verse_nums:
+                words = fetch_verse_words(v_num)
+                if words:
+                    verses.append({"num": v_num, "words": words})
+            return {"reference": ref, "verses": verses}
+        else:
+            words = fetch_verse_words(verse)
+            if not words:
+                raise HTTPException(404, f"No tagged data found for {ref}")
+            return {"reference": ref, "verses": [{"num": verse, "words": words}]}
     finally:
         conn.close()
 

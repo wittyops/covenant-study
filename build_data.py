@@ -686,6 +686,26 @@ def build_cross_refs() -> None:
         except Exception:
             print(f"  shard {i}: ERROR — {traceback.format_exc().splitlines()[-1]}", flush=True)
 
+    # Fallback: scrollmapper distributes a single cross_references.db (not shards).
+    # If it was downloaded to /app/data/cross_references.db it will already be open
+    # as our output DB — read from its embedded cross_references table directly.
+    if grand_total == 0:
+        try:
+            rows = con.execute(
+                "SELECT from_book, from_chapter, from_verse,"
+                "       to_book, to_chapter, to_verse_start, to_verse_end, votes"
+                " FROM cross_references"
+            ).fetchall()
+            if rows:
+                con.executemany(insert_sql, rows)
+                con.commit()
+                grand_total = len(rows)
+                print(f"  cross_refs: {grand_total:,} rows loaded from embedded cross_references table", flush=True)
+            else:
+                print("  cross_refs: no cross-reference data found in any source.", flush=True)
+        except sqlite3.OperationalError:
+            print("  cross_refs: cross_references table not present in downloaded DB.", flush=True)
+
     total = con.execute("SELECT COUNT(*) FROM cross_refs").fetchone()[0]
     print(f"  cross_refs: {total:,} unique rows (expected ~432,949)", flush=True)
     con.close()
