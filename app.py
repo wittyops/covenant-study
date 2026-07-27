@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import secrets
 import time
@@ -218,6 +219,37 @@ def get_strongs_db():
     return sqlite3.connect(str(db_path))
 
 
+def normalize_strongs(number: str) -> list[str]:
+    """Return candidate lookup keys for a Strong's number.
+
+    strongs.db uses 'H1'/'H2' for Hebrew and '00001'/'00025' (5-digit, no prefix) for Greek.
+    Interlinear uses 'G25', 'H1', 'G3588_A', 'H1004B', 'H7225G', etc.
+
+    Returns a list of candidates to try in order.
+    """
+    import re
+    n = number.upper().split("_")[0]  # strip _ disambiguation suffix (e.g. G3588_A → G3588)
+    candidates = [n]
+
+    # Strip trailing letter annotation used by STEPBible (e.g. H7225G → H7225, H1004A → H1004)
+    base = re.sub(r"[A-Z]+$", "", n)
+    if base and base != n:
+        candidates.append(base)
+
+    # For Greek G-prefixed numbers: convert to zero-padded 5-digit format
+    for candidate in [n, base]:
+        if candidate.startswith("G"):
+            try:
+                digits = int(re.sub(r"[A-Z]+$", "", candidate[1:]))
+                zero_padded = f"{digits:05d}"
+                if zero_padded not in candidates:
+                    candidates.append(zero_padded)
+            except ValueError:
+                pass
+
+    return candidates
+
+
 def get_users_db() -> sqlite3.Connection:
     """Return an open connection to /app/userdata/users.db (WAL mode, FK on)."""
     USERDATA.mkdir(parents=True, exist_ok=True)
@@ -355,16 +387,20 @@ def init_users_db() -> None:
 
         count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if count == 0:
-            password = secrets.token_hex(12)
+            username = os.environ.get("ADMIN_USERNAME", "admin")
+            password = os.environ.get("ADMIN_PASSWORD") or secrets.token_hex(12)
             hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode()
             conn.execute(
                 "INSERT INTO users(username, password_hash, display_name, role, created_at)"
-                " VALUES('admin', ?, 'Administrator', 'admin', ?)",
-                (hashed, int(time.time()))
+                " VALUES(?, ?, 'Administrator', 'admin', ?)",
+                (username, hashed, int(time.time()))
             )
             conn.commit()
-            print(f"[INIT] Admin account created. Username: admin  Password: {password}", flush=True)
-            print("[INIT] Change this password immediately via POST /api/auth/register", flush=True)
+            if os.environ.get("ADMIN_PASSWORD"):
+                print(f"[INIT] Admin account created: {username}", flush=True)
+            else:
+                print(f"[INIT] Admin account created. Username: {username}  Password: {password}", flush=True)
+                print("[INIT] Set ADMIN_PASSWORD env var to control this on next fresh deploy.", flush=True)
 
         now = int(time.time())
         conn.execute(
@@ -692,11 +728,14 @@ async def strongs_lookup(number: str):
     if not db:
         raise HTTPException(503, "Strong's database not loaded")
     try:
-        key = number.upper()
-        row = db.execute(
-            "SELECT number,language,original,transliteration,pronunciation,definition,kjv_usage FROM strongs WHERE number=?",
-            (key,)
-        ).fetchone()
+        row = None
+        for key in normalize_strongs(number):
+            row = db.execute(
+                "SELECT number,language,original,transliteration,pronunciation,definition,kjv_usage FROM strongs WHERE number=?",
+                (key,)
+            ).fetchone()
+            if row:
+                break
         if not row:
             raise HTTPException(404, f"Strong's {number} not found")
         return {
@@ -714,7 +753,7 @@ async def get_places(ref: Optional[str] = Query(default=None)):
     if ref is None:
         return {
             "places": [
-                {"name": name, "lat": data["lat"], "lon": data["lon"], "notes": data.get("notes", "")}
+                {"name": name, "lat": data["lat"], "lng": data["lon"], "notes": data.get("notes", "")}
                 for name, data in PLACES.items()
             ]
         }
@@ -751,7 +790,7 @@ async def get_places(ref: Optional[str] = Query(default=None)):
                 found.append({
                     "name": name,
                     "lat": data["lat"],
-                    "lon": data["lon"],
+                    "lng": data["lon"],
                     "notes": data.get("notes", "")
                 })
         return {"reference": ref, "passage_length": len(rows), "places": found}
@@ -792,84 +831,156 @@ async def health():
 
 @app.get("/api/verse/tagged")
 async def get_tagged_verse(ref: str = Query(...)):
-    """Return KJV verse(s) with per-word Strong's numbers from word_strongs in kjv.db.
+    """Return verse(s) with per-word Strong's numbers.
 
     Chapter ref ('John 3')  → {"reference", "verses": [{"num", "words"}, ...]}
     Verse ref ('John 3:16') → {"reference", "verses": [{"num": 16, "words": [...]}]}
-    word_strongs lives in kjv.db; strongs definitions ATTACHed from strongs.db.
+    Uses word_strongs table if populated; falls back to interlinear.db (always populated).
     """
     book_num, chapter, verse = parse_reference(ref)
     if not book_num:
         raise HTTPException(400, f"Could not parse reference: {ref}")
 
-    kjv_path = DATA / "kjv.db"
-    if not kjv_path.exists():
-        raise HTTPException(503, "KJV database not loaded")
-
     strongs_path = DATA / "strongs.db"
 
-    conn = sqlite3.connect(str(kjv_path))
+    # --- Prefer word_strongs in kjv.db when available ---
+    kjv_path = DATA / "kjv.db"
+    if kjv_path.exists():
+        conn = sqlite3.connect(str(kjv_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            has_table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='word_strongs'"
+            ).fetchone()
+            has_data = has_table and conn.execute(
+                "SELECT 1 FROM word_strongs LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+    else:
+        has_data = False
+
+    if has_data:
+        conn = sqlite3.connect(str(kjv_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            if strongs_path.exists():
+                conn.execute("ATTACH DATABASE ? AS sdb", (str(strongs_path),))
+                strongs_join = "LEFT JOIN (SELECT number, original, definition FROM sdb.strongs) s ON s.number = ws.strong_number"
+                strongs_sel  = "s.original, s.definition"
+            else:
+                strongs_join = ""
+                strongs_sel  = "NULL as original, NULL as definition"
+
+            def fetch_verse_words(v_num: int) -> list:
+                rows = conn.execute(
+                    f"""
+                    SELECT ws.word_position, ws.phrase_text, ws.strong_number,
+                           ws.extra_strongs, ws.morph,
+                           {strongs_sel}
+                    FROM word_strongs ws
+                    {strongs_join}
+                    WHERE ws.book_id = ? AND ws.chapter = ? AND ws.verse = ?
+                    ORDER BY ws.word_position
+                    """,
+                    (book_num, chapter, v_num),
+                ).fetchall()
+                return [
+                    {
+                        "pos": r["word_position"],
+                        "text": r["phrase_text"],
+                        "strongs": r["strong_number"],
+                        "extra_strongs": r["extra_strongs"],
+                        "morph": r["morph"],
+                        "original": r["original"],
+                        "definition": r["definition"],
+                    }
+                    for r in rows
+                ]
+
+            if verse is None:
+                verse_nums = [
+                    r[0] for r in conn.execute(
+                        "SELECT DISTINCT verse FROM word_strongs WHERE book_id=? AND chapter=? ORDER BY verse",
+                        (book_num, chapter),
+                    ).fetchall()
+                ]
+                verses = []
+                for v_num in verse_nums:
+                    words = fetch_verse_words(v_num)
+                    if words:
+                        verses.append({"num": v_num, "words": words})
+                return {"reference": ref, "verses": verses, "source": "word_strongs"}
+            else:
+                words = fetch_verse_words(verse)
+                if not words:
+                    raise HTTPException(404, f"No tagged data found for {ref}")
+                return {"reference": ref, "verses": [{"num": verse, "words": words}], "source": "word_strongs"}
+        finally:
+            conn.close()
+
+    # --- Fallback: interlinear.db (Hebrew/Greek with English glosses) ---
+    interlinear_path = DATA / "interlinear.db"
+    if not interlinear_path.exists():
+        raise HTTPException(503, "No word-level Strong's data available")
+
+    conn = sqlite3.connect(str(interlinear_path))
     conn.row_factory = sqlite3.Row
     try:
         if strongs_path.exists():
             conn.execute("ATTACH DATABASE ? AS sdb", (str(strongs_path),))
-            strongs_join = "LEFT JOIN (SELECT number, original, definition FROM sdb.strongs) s ON s.number = ws.strong_number"
-            strongs_sel  = "s.original, s.definition"
+            strongs_join = "LEFT JOIN (SELECT number, original, definition FROM sdb.strongs) s ON s.number = i.strongs_num"
+            strongs_sel  = "s.original AS str_orig, s.definition"
         else:
             strongs_join = ""
-            strongs_sel  = "NULL as original, NULL as definition"
+            strongs_sel  = "NULL as str_orig, NULL as definition"
 
-        has_table = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='word_strongs'"
-        ).fetchone()
-        if not has_table:
-            raise HTTPException(503, "word_strongs table not populated yet")
-
-        def fetch_verse_words(v_num: int) -> list:
+        def fetch_interlinear_words(v_num: int) -> list:
             rows = conn.execute(
                 f"""
-                SELECT ws.word_position, ws.phrase_text, ws.strong_number,
-                       ws.extra_strongs, ws.morph,
+                SELECT i.word_num, i.english_gloss, i.strongs_num,
+                       i.original_word, i.transliteration, i.morphology,
                        {strongs_sel}
-                FROM word_strongs ws
+                FROM interlinear i
                 {strongs_join}
-                WHERE ws.book_id = ? AND ws.chapter = ? AND ws.verse = ?
-                ORDER BY ws.word_position
+                WHERE i.book = ? AND i.chapter = ? AND i.verse = ?
+                ORDER BY i.word_num
                 """,
                 (book_num, chapter, v_num),
             ).fetchall()
             return [
                 {
-                    "pos": r["word_position"],
-                    "text": r["phrase_text"],
-                    "strongs": r["strong_number"],
-                    "extra_strongs": r["extra_strongs"],
-                    "morph": r["morph"],
-                    "original": r["original"],
+                    "pos": r["word_num"],
+                    "text": r["english_gloss"] or r["original_word"] or "",
+                    "strongs": r["strongs_num"],
+                    "extra_strongs": None,
+                    "morph": r["morphology"],
+                    "original": r["original_word"],
                     "definition": r["definition"],
                 }
                 for r in rows
             ]
 
         if verse is None:
-            # Chapter-level: collect all tagged verses
             verse_nums = [
                 r[0] for r in conn.execute(
-                    "SELECT DISTINCT verse FROM word_strongs WHERE book_id=? AND chapter=? ORDER BY verse",
+                    "SELECT DISTINCT verse FROM interlinear WHERE book=? AND chapter=? ORDER BY verse",
                     (book_num, chapter),
                 ).fetchall()
             ]
             verses = []
             for v_num in verse_nums:
-                words = fetch_verse_words(v_num)
+                words = fetch_interlinear_words(v_num)
                 if words:
                     verses.append({"num": v_num, "words": words})
-            return {"reference": ref, "verses": verses}
+            if not verses:
+                raise HTTPException(404, f"No word data found for {ref}")
+            return {"reference": ref, "verses": verses, "source": "interlinear"}
         else:
-            words = fetch_verse_words(verse)
+            words = fetch_interlinear_words(verse)
             if not words:
-                raise HTTPException(404, f"No tagged data found for {ref}")
-            return {"reference": ref, "verses": [{"num": verse, "words": words}]}
+                raise HTTPException(404, f"No word data found for {ref}")
+            return {"reference": ref, "verses": [{"num": verse, "words": words}], "source": "interlinear"}
     finally:
         conn.close()
 
@@ -2817,6 +2928,17 @@ img, svg {
 }
 
 /* Maps tab */
+#tab-maps {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 360px;
+  overflow: hidden;
+}
+#leaflet-map {
+  flex: 1;
+  min-height: 360px;
+}
 #tab-maps .map-placeholder {
   flex: 1;
   background: var(--dark);
@@ -3808,8 +3930,1119 @@ img, svg {
   scrollbar-color: var(--border) transparent;
 }
   </style>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV/XN/WLs=" crossorigin=""></script>
+  <style>
+/* required styles */
+
+.leaflet-pane,
+.leaflet-tile,
+.leaflet-marker-icon,
+.leaflet-marker-shadow,
+.leaflet-tile-container,
+.leaflet-pane > svg,
+.leaflet-pane > canvas,
+.leaflet-zoom-box,
+.leaflet-image-layer,
+.leaflet-layer {
+	position: absolute;
+	left: 0;
+	top: 0;
+	}
+.leaflet-container {
+	overflow: hidden;
+	}
+.leaflet-tile,
+.leaflet-marker-icon,
+.leaflet-marker-shadow {
+	-webkit-user-select: none;
+	   -moz-user-select: none;
+	        user-select: none;
+	  -webkit-user-drag: none;
+	}
+/* Prevents IE11 from highlighting tiles in blue */
+.leaflet-tile::selection {
+	background: transparent;
+}
+/* Safari renders non-retina tile on retina better with this, but Chrome is worse */
+.leaflet-safari .leaflet-tile {
+	image-rendering: -webkit-optimize-contrast;
+	}
+/* hack that prevents hw layers "stretching" when loading new tiles */
+.leaflet-safari .leaflet-tile-container {
+	width: 1600px;
+	height: 1600px;
+	-webkit-transform-origin: 0 0;
+	}
+.leaflet-marker-icon,
+.leaflet-marker-shadow {
+	display: block;
+	}
+/* .leaflet-container svg: reset svg max-width decleration shipped in Joomla! (joomla.org) 3.x */
+/* .leaflet-container img: map is broken in FF if you have max-width: 100% on tiles */
+.leaflet-container .leaflet-overlay-pane svg {
+	max-width: none !important;
+	max-height: none !important;
+	}
+.leaflet-container .leaflet-marker-pane img,
+.leaflet-container .leaflet-shadow-pane img,
+.leaflet-container .leaflet-tile-pane img,
+.leaflet-container img.leaflet-image-layer,
+.leaflet-container .leaflet-tile {
+	max-width: none !important;
+	max-height: none !important;
+	width: auto;
+	padding: 0;
+	}
+
+.leaflet-container img.leaflet-tile {
+	/* See: https://bugs.chromium.org/p/chromium/issues/detail?id=600120 */
+	mix-blend-mode: plus-lighter;
+}
+
+.leaflet-container.leaflet-touch-zoom {
+	-ms-touch-action: pan-x pan-y;
+	touch-action: pan-x pan-y;
+	}
+.leaflet-container.leaflet-touch-drag {
+	-ms-touch-action: pinch-zoom;
+	/* Fallback for FF which doesn't support pinch-zoom */
+	touch-action: none;
+	touch-action: pinch-zoom;
+}
+.leaflet-container.leaflet-touch-drag.leaflet-touch-zoom {
+	-ms-touch-action: none;
+	touch-action: none;
+}
+.leaflet-container {
+	-webkit-tap-highlight-color: transparent;
+}
+.leaflet-container a {
+	-webkit-tap-highlight-color: rgba(51, 181, 229, 0.4);
+}
+.leaflet-tile {
+	filter: inherit;
+	visibility: hidden;
+	}
+.leaflet-tile-loaded {
+	visibility: inherit;
+	}
+.leaflet-zoom-box {
+	width: 0;
+	height: 0;
+	-moz-box-sizing: border-box;
+	     box-sizing: border-box;
+	z-index: 800;
+	}
+/* workaround for https://bugzilla.mozilla.org/show_bug.cgi?id=888319 */
+.leaflet-overlay-pane svg {
+	-moz-user-select: none;
+	}
+
+.leaflet-pane         { z-index: 400; }
+
+.leaflet-tile-pane    { z-index: 200; }
+.leaflet-overlay-pane { z-index: 400; }
+.leaflet-shadow-pane  { z-index: 500; }
+.leaflet-marker-pane  { z-index: 600; }
+.leaflet-tooltip-pane   { z-index: 650; }
+.leaflet-popup-pane   { z-index: 700; }
+
+.leaflet-map-pane canvas { z-index: 100; }
+.leaflet-map-pane svg    { z-index: 200; }
+
+.leaflet-vml-shape {
+	width: 1px;
+	height: 1px;
+	}
+.lvml {
+	behavior: url(#default#VML);
+	display: inline-block;
+	position: absolute;
+	}
+
+
+/* control positioning */
+
+.leaflet-control {
+	position: relative;
+	z-index: 800;
+	pointer-events: visiblePainted; /* IE 9-10 doesn't have auto */
+	pointer-events: auto;
+	}
+.leaflet-top,
+.leaflet-bottom {
+	position: absolute;
+	z-index: 1000;
+	pointer-events: none;
+	}
+.leaflet-top {
+	top: 0;
+	}
+.leaflet-right {
+	right: 0;
+	}
+.leaflet-bottom {
+	bottom: 0;
+	}
+.leaflet-left {
+	left: 0;
+	}
+.leaflet-control {
+	float: left;
+	clear: both;
+	}
+.leaflet-right .leaflet-control {
+	float: right;
+	}
+.leaflet-top .leaflet-control {
+	margin-top: 10px;
+	}
+.leaflet-bottom .leaflet-control {
+	margin-bottom: 10px;
+	}
+.leaflet-left .leaflet-control {
+	margin-left: 10px;
+	}
+.leaflet-right .leaflet-control {
+	margin-right: 10px;
+	}
+
+
+/* zoom and fade animations */
+
+.leaflet-fade-anim .leaflet-popup {
+	opacity: 0;
+	-webkit-transition: opacity 0.2s linear;
+	   -moz-transition: opacity 0.2s linear;
+	        transition: opacity 0.2s linear;
+	}
+.leaflet-fade-anim .leaflet-map-pane .leaflet-popup {
+	opacity: 1;
+	}
+.leaflet-zoom-animated {
+	-webkit-transform-origin: 0 0;
+	    -ms-transform-origin: 0 0;
+	        transform-origin: 0 0;
+	}
+svg.leaflet-zoom-animated {
+	will-change: transform;
+}
+
+.leaflet-zoom-anim .leaflet-zoom-animated {
+	-webkit-transition: -webkit-transform 0.25s cubic-bezier(0,0,0.25,1);
+	   -moz-transition:    -moz-transform 0.25s cubic-bezier(0,0,0.25,1);
+	        transition:         transform 0.25s cubic-bezier(0,0,0.25,1);
+	}
+.leaflet-zoom-anim .leaflet-tile,
+.leaflet-pan-anim .leaflet-tile {
+	-webkit-transition: none;
+	   -moz-transition: none;
+	        transition: none;
+	}
+
+.leaflet-zoom-anim .leaflet-zoom-hide {
+	visibility: hidden;
+	}
+
+
+/* cursors */
+
+.leaflet-interactive {
+	cursor: pointer;
+	}
+.leaflet-grab {
+	cursor: -webkit-grab;
+	cursor:    -moz-grab;
+	cursor:         grab;
+	}
+.leaflet-crosshair,
+.leaflet-crosshair .leaflet-interactive {
+	cursor: crosshair;
+	}
+.leaflet-popup-pane,
+.leaflet-control {
+	cursor: auto;
+	}
+.leaflet-dragging .leaflet-grab,
+.leaflet-dragging .leaflet-grab .leaflet-interactive,
+.leaflet-dragging .leaflet-marker-draggable {
+	cursor: move;
+	cursor: -webkit-grabbing;
+	cursor:    -moz-grabbing;
+	cursor:         grabbing;
+	}
+
+/* marker & overlays interactivity */
+.leaflet-marker-icon,
+.leaflet-marker-shadow,
+.leaflet-image-layer,
+.leaflet-pane > svg path,
+.leaflet-tile-container {
+	pointer-events: none;
+	}
+
+.leaflet-marker-icon.leaflet-interactive,
+.leaflet-image-layer.leaflet-interactive,
+.leaflet-pane > svg path.leaflet-interactive,
+svg.leaflet-image-layer.leaflet-interactive path {
+	pointer-events: visiblePainted; /* IE 9-10 doesn't have auto */
+	pointer-events: auto;
+	}
+
+/* visual tweaks */
+
+.leaflet-container {
+	background: #ddd;
+	outline-offset: 1px;
+	}
+.leaflet-container a {
+	color: #0078A8;
+	}
+.leaflet-zoom-box {
+	border: 2px dotted #38f;
+	background: rgba(255,255,255,0.5);
+	}
+
+
+/* general typography */
+.leaflet-container {
+	font-family: "Helvetica Neue", Arial, Helvetica, sans-serif;
+	font-size: 12px;
+	font-size: 0.75rem;
+	line-height: 1.5;
+	}
+
+
+/* general toolbar styles */
+
+.leaflet-bar {
+	box-shadow: 0 1px 5px rgba(0,0,0,0.65);
+	border-radius: 4px;
+	}
+.leaflet-bar a {
+	background-color: #fff;
+	border-bottom: 1px solid #ccc;
+	width: 26px;
+	height: 26px;
+	line-height: 26px;
+	display: block;
+	text-align: center;
+	text-decoration: none;
+	color: black;
+	}
+.leaflet-bar a,
+.leaflet-control-layers-toggle {
+	background-position: 50% 50%;
+	background-repeat: no-repeat;
+	display: block;
+	}
+.leaflet-bar a:hover,
+.leaflet-bar a:focus {
+	background-color: #f4f4f4;
+	}
+.leaflet-bar a:first-child {
+	border-top-left-radius: 4px;
+	border-top-right-radius: 4px;
+	}
+.leaflet-bar a:last-child {
+	border-bottom-left-radius: 4px;
+	border-bottom-right-radius: 4px;
+	border-bottom: none;
+	}
+.leaflet-bar a.leaflet-disabled {
+	cursor: default;
+	background-color: #f4f4f4;
+	color: #bbb;
+	}
+
+.leaflet-touch .leaflet-bar a {
+	width: 30px;
+	height: 30px;
+	line-height: 30px;
+	}
+.leaflet-touch .leaflet-bar a:first-child {
+	border-top-left-radius: 2px;
+	border-top-right-radius: 2px;
+	}
+.leaflet-touch .leaflet-bar a:last-child {
+	border-bottom-left-radius: 2px;
+	border-bottom-right-radius: 2px;
+	}
+
+/* zoom control */
+
+.leaflet-control-zoom-in,
+.leaflet-control-zoom-out {
+	font: bold 18px 'Lucida Console', Monaco, monospace;
+	text-indent: 1px;
+	}
+
+.leaflet-touch .leaflet-control-zoom-in, .leaflet-touch .leaflet-control-zoom-out  {
+	font-size: 22px;
+	}
+
+
+/* layers control */
+
+.leaflet-control-layers {
+	box-shadow: 0 1px 5px rgba(0,0,0,0.4);
+	background: #fff;
+	border-radius: 5px;
+	}
+.leaflet-control-layers-toggle {
+	background-image: url(images/layers.png);
+	width: 36px;
+	height: 36px;
+	}
+.leaflet-retina .leaflet-control-layers-toggle {
+	background-image: url(images/layers-2x.png);
+	background-size: 26px 26px;
+	}
+.leaflet-touch .leaflet-control-layers-toggle {
+	width: 44px;
+	height: 44px;
+	}
+.leaflet-control-layers .leaflet-control-layers-list,
+.leaflet-control-layers-expanded .leaflet-control-layers-toggle {
+	display: none;
+	}
+.leaflet-control-layers-expanded .leaflet-control-layers-list {
+	display: block;
+	position: relative;
+	}
+.leaflet-control-layers-expanded {
+	padding: 6px 10px 6px 6px;
+	color: #333;
+	background: #fff;
+	}
+.leaflet-control-layers-scrollbar {
+	overflow-y: scroll;
+	overflow-x: hidden;
+	padding-right: 5px;
+	}
+.leaflet-control-layers-selector {
+	margin-top: 2px;
+	position: relative;
+	top: 1px;
+	}
+.leaflet-control-layers label {
+	display: block;
+	font-size: 13px;
+	font-size: 1.08333em;
+	}
+.leaflet-control-layers-separator {
+	height: 0;
+	border-top: 1px solid #ddd;
+	margin: 5px -10px 5px -6px;
+	}
+
+/* Default icon URLs */
+.leaflet-default-icon-path { /* used only in path-guessing heuristic, see L.Icon.Default */
+	background-image: url(images/marker-icon.png);
+	}
+
+
+/* attribution and scale controls */
+
+.leaflet-container .leaflet-control-attribution {
+	background: #fff;
+	background: rgba(255, 255, 255, 0.8);
+	margin: 0;
+	}
+.leaflet-control-attribution,
+.leaflet-control-scale-line {
+	padding: 0 5px;
+	color: #333;
+	line-height: 1.4;
+	}
+.leaflet-control-attribution a {
+	text-decoration: none;
+	}
+.leaflet-control-attribution a:hover,
+.leaflet-control-attribution a:focus {
+	text-decoration: underline;
+	}
+.leaflet-attribution-flag {
+	display: inline !important;
+	vertical-align: baseline !important;
+	width: 1em;
+	height: 0.6669em;
+	}
+.leaflet-left .leaflet-control-scale {
+	margin-left: 5px;
+	}
+.leaflet-bottom .leaflet-control-scale {
+	margin-bottom: 5px;
+	}
+.leaflet-control-scale-line {
+	border: 2px solid #777;
+	border-top: none;
+	line-height: 1.1;
+	padding: 2px 5px 1px;
+	white-space: nowrap;
+	-moz-box-sizing: border-box;
+	     box-sizing: border-box;
+	background: rgba(255, 255, 255, 0.8);
+	text-shadow: 1px 1px #fff;
+	}
+.leaflet-control-scale-line:not(:first-child) {
+	border-top: 2px solid #777;
+	border-bottom: none;
+	margin-top: -2px;
+	}
+.leaflet-control-scale-line:not(:first-child):not(:last-child) {
+	border-bottom: 2px solid #777;
+	}
+
+.leaflet-touch .leaflet-control-attribution,
+.leaflet-touch .leaflet-control-layers,
+.leaflet-touch .leaflet-bar {
+	box-shadow: none;
+	}
+.leaflet-touch .leaflet-control-layers,
+.leaflet-touch .leaflet-bar {
+	border: 2px solid rgba(0,0,0,0.2);
+	background-clip: padding-box;
+	}
+
+
+/* popup */
+
+.leaflet-popup {
+	position: absolute;
+	text-align: center;
+	margin-bottom: 20px;
+	}
+.leaflet-popup-content-wrapper {
+	padding: 1px;
+	text-align: left;
+	border-radius: 12px;
+	}
+.leaflet-popup-content {
+	margin: 13px 24px 13px 20px;
+	line-height: 1.3;
+	font-size: 13px;
+	font-size: 1.08333em;
+	min-height: 1px;
+	}
+.leaflet-popup-content p {
+	margin: 17px 0;
+	margin: 1.3em 0;
+	}
+.leaflet-popup-tip-container {
+	width: 40px;
+	height: 20px;
+	position: absolute;
+	left: 50%;
+	margin-top: -1px;
+	margin-left: -20px;
+	overflow: hidden;
+	pointer-events: none;
+	}
+.leaflet-popup-tip {
+	width: 17px;
+	height: 17px;
+	padding: 1px;
+
+	margin: -10px auto 0;
+	pointer-events: auto;
+
+	-webkit-transform: rotate(45deg);
+	   -moz-transform: rotate(45deg);
+	    -ms-transform: rotate(45deg);
+	        transform: rotate(45deg);
+	}
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+	background: white;
+	color: #333;
+	box-shadow: 0 3px 14px rgba(0,0,0,0.4);
+	}
+.leaflet-container a.leaflet-popup-close-button {
+	position: absolute;
+	top: 0;
+	right: 0;
+	border: none;
+	text-align: center;
+	width: 24px;
+	height: 24px;
+	font: 16px/24px Tahoma, Verdana, sans-serif;
+	color: #757575;
+	text-decoration: none;
+	background: transparent;
+	}
+.leaflet-container a.leaflet-popup-close-button:hover,
+.leaflet-container a.leaflet-popup-close-button:focus {
+	color: #585858;
+	}
+.leaflet-popup-scrolled {
+	overflow: auto;
+	}
+
+.leaflet-oldie .leaflet-popup-content-wrapper {
+	-ms-zoom: 1;
+	}
+.leaflet-oldie .leaflet-popup-tip {
+	width: 24px;
+	margin: 0 auto;
+
+	-ms-filter: "progid:DXImageTransform.Microsoft.Matrix(M11=0.70710678, M12=0.70710678, M21=-0.70710678, M22=0.70710678)";
+	filter: progid:DXImageTransform.Microsoft.Matrix(M11=0.70710678, M12=0.70710678, M21=-0.70710678, M22=0.70710678);
+	}
+
+.leaflet-oldie .leaflet-control-zoom,
+.leaflet-oldie .leaflet-control-layers,
+.leaflet-oldie .leaflet-popup-content-wrapper,
+.leaflet-oldie .leaflet-popup-tip {
+	border: 1px solid #999;
+	}
+
+
+/* div icon */
+
+.leaflet-div-icon {
+	background: #fff;
+	border: 1px solid #666;
+	}
+
+
+/* Tooltip */
+/* Base styles for the element that has a tooltip */
+.leaflet-tooltip {
+	position: absolute;
+	padding: 6px;
+	background-color: #fff;
+	border: 1px solid #fff;
+	border-radius: 3px;
+	color: #222;
+	white-space: nowrap;
+	-webkit-user-select: none;
+	-moz-user-select: none;
+	-ms-user-select: none;
+	user-select: none;
+	pointer-events: none;
+	box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+	}
+.leaflet-tooltip.leaflet-interactive {
+	cursor: pointer;
+	pointer-events: auto;
+	}
+.leaflet-tooltip-top:before,
+.leaflet-tooltip-bottom:before,
+.leaflet-tooltip-left:before,
+.leaflet-tooltip-right:before {
+	position: absolute;
+	pointer-events: none;
+	border: 6px solid transparent;
+	background: transparent;
+	content: "";
+	}
+
+/* Directions */
+
+.leaflet-tooltip-bottom {
+	margin-top: 6px;
+}
+.leaflet-tooltip-top {
+	margin-top: -6px;
+}
+.leaflet-tooltip-bottom:before,
+.leaflet-tooltip-top:before {
+	left: 50%;
+	margin-left: -6px;
+	}
+.leaflet-tooltip-top:before {
+	bottom: 0;
+	margin-bottom: -12px;
+	border-top-color: #fff;
+	}
+.leaflet-tooltip-bottom:before {
+	top: 0;
+	margin-top: -12px;
+	margin-left: -6px;
+	border-bottom-color: #fff;
+	}
+.leaflet-tooltip-left {
+	margin-left: -6px;
+}
+.leaflet-tooltip-right {
+	margin-left: 6px;
+}
+.leaflet-tooltip-left:before,
+.leaflet-tooltip-right:before {
+	top: 50%;
+	margin-top: -6px;
+	}
+.leaflet-tooltip-left:before {
+	right: 0;
+	margin-right: -12px;
+	border-left-color: #fff;
+	}
+.leaflet-tooltip-right:before {
+	left: 0;
+	margin-left: -12px;
+	border-right-color: #fff;
+	}
+
+/* Printing */
+
+@media print {
+	/* Prevent printers from removing background-images of controls. */
+	.leaflet-control {
+		-webkit-print-color-adjust: exact;
+		print-color-adjust: exact;
+		}
+	}
+
+  </style>
+  <script>
+/* @preserve
+ * Leaflet 1.9.4, a JS library for interactive maps. https://leafletjs.com
+ * (c) 2010-2023 Vladimir Agafonkin, (c) 2010-2011 CloudMade
+ */
+!function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"function"==typeof define&&define.amd?define(["exports"],e):e((t="undefined"!=typeof globalThis?globalThis:t||self).leaflet={})}(this,function(t){"use strict";function l(t){for(var e,i,n=1,o=arguments.length;n<o;n++)for(e in i=arguments[n])t[e]=i[e];return t}var R=Object.create||function(t){return N.prototype=t,new N};function N(){}function a(t,e){var i,n=Array.prototype.slice;return t.bind?t.bind.apply(t,n.call(arguments,1)):(i=n.call(arguments,2),function(){return t.apply(e,i.length?i.concat(n.call(arguments)):arguments)})}var D=0;function h(t){return"_leaflet_id"in t||(t._leaflet_id=++D),t._leaflet_id}function j(t,e,i){var n,o,s=function(){n=!1,o&&(r.apply(i,o),o=!1)},r=function(){n?o=arguments:(t.apply(i,arguments),setTimeout(s,e),n=!0)};return r}function H(t,e,i){var n=e[1],e=e[0],o=n-e;return t===n&&i?t:((t-e)%o+o)%o+e}function u(){return!1}function i(t,e){return!1===e?t:(e=Math.pow(10,void 0===e?6:e),Math.round(t*e)/e)}function W(t){return t.trim?t.trim():t.replace(/^\s+|\s+$/g,"")}function F(t){return W(t).split(/\s+/)}function c(t,e){for(var i in Object.prototype.hasOwnProperty.call(t,"options")||(t.options=t.options?R(t.options):{}),e)t.options[i]=e[i];return t.options}function U(t,e,i){var n,o=[];for(n in t)o.push(encodeURIComponent(i?n.toUpperCase():n)+"="+encodeURIComponent(t[n]));return(e&&-1!==e.indexOf("?")?"&":"?")+o.join("&")}var V=/\{ *([\w_ -]+) *\}/g;function q(t,i){return t.replace(V,function(t,e){e=i[e];if(void 0===e)throw new Error("No value provided for variable "+t);return e="function"==typeof e?e(i):e})}var d=Array.isArray||function(t){return"[object Array]"===Object.prototype.toString.call(t)};function G(t,e){for(var i=0;i<t.length;i++)if(t[i]===e)return i;return-1}var K="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=";function Y(t){return window["webkit"+t]||window["moz"+t]||window["ms"+t]}var X=0;function J(t){var e=+new Date,i=Math.max(0,16-(e-X));return X=e+i,window.setTimeout(t,i)}var $=window.requestAnimationFrame||Y("RequestAnimationFrame")||J,Q=window.cancelAnimationFrame||Y("CancelAnimationFrame")||Y("CancelRequestAnimationFrame")||function(t){window.clearTimeout(t)};function x(t,e,i){if(!i||$!==J)return $.call(window,a(t,e));t.call(e)}function r(t){t&&Q.call(window,t)}var tt={__proto__:null,extend:l,create:R,bind:a,get lastId(){return D},stamp:h,throttle:j,wrapNum:H,falseFn:u,formatNum:i,trim:W,splitWords:F,setOptions:c,getParamString:U,template:q,isArray:d,indexOf:G,emptyImageUrl:K,requestFn:$,cancelFn:Q,requestAnimFrame:x,cancelAnimFrame:r};function et(){}et.extend=function(t){function e(){c(this),this.initialize&&this.initialize.apply(this,arguments),this.callInitHooks()}var i,n=e.__super__=this.prototype,o=R(n);for(i in(o.constructor=e).prototype=o,this)Object.prototype.hasOwnProperty.call(this,i)&&"prototype"!==i&&"__super__"!==i&&(e[i]=this[i]);if(t.statics&&l(e,t.statics),t.includes){var s=t.includes;if("undefined"!=typeof L&&L&&L.Mixin){s=d(s)?s:[s];for(var r=0;r<s.length;r++)s[r]===L.Mixin.Events&&console.warn("Deprecated include of L.Mixin.Events: this property will be removed in future releases, please inherit from L.Evented instead.",(new Error).stack)}l.apply(null,[o].concat(t.includes))}return l(o,t),delete o.statics,delete o.includes,o.options&&(o.options=n.options?R(n.options):{},l(o.options,t.options)),o._initHooks=[],o.callInitHooks=function(){if(!this._initHooksCalled){n.callInitHooks&&n.callInitHooks.call(this),this._initHooksCalled=!0;for(var t=0,e=o._initHooks.length;t<e;t++)o._initHooks[t].call(this)}},e},et.include=function(t){var e=this.prototype.options;return l(this.prototype,t),t.options&&(this.prototype.options=e,this.mergeOptions(t.options)),this},et.mergeOptions=function(t){return l(this.prototype.options,t),this},et.addInitHook=function(t){var e=Array.prototype.slice.call(arguments,1),i="function"==typeof t?t:function(){this[t].apply(this,e)};return this.prototype._initHooks=this.prototype._initHooks||[],this.prototype._initHooks.push(i),this};var e={on:function(t,e,i){if("object"==typeof t)for(var n in t)this._on(n,t[n],e);else for(var o=0,s=(t=F(t)).length;o<s;o++)this._on(t[o],e,i);return this},off:function(t,e,i){if(arguments.length)if("object"==typeof t)for(var n in t)this._off(n,t[n],e);else{t=F(t);for(var o=1===arguments.length,s=0,r=t.length;s<r;s++)o?this._off(t[s]):this._off(t[s],e,i)}else delete this._events;return this},_on:function(t,e,i,n){"function"!=typeof e?console.warn("wrong listener type: "+typeof e):!1===this._listens(t,e,i)&&(e={fn:e,ctx:i=i===this?void 0:i},n&&(e.once=!0),this._events=this._events||{},this._events[t]=this._events[t]||[],this._events[t].push(e))},_off:function(t,e,i){var n,o,s;if(this._events&&(n=this._events[t]))if(1===arguments.length){if(this._firingCount)for(o=0,s=n.length;o<s;o++)n[o].fn=u;delete this._events[t]}else"function"!=typeof e?console.warn("wrong listener type: "+typeof e):!1!==(e=this._listens(t,e,i))&&(i=n[e],this._firingCount&&(i.fn=u,this._events[t]=n=n.slice()),n.splice(e,1))},fire:function(t,e,i){if(this.listens(t,i)){var n=l({},e,{type:t,target:this,sourceTarget:e&&e.sourceTarget||this});if(this._events){var o=this._events[t];if(o){this._firingCount=this._firingCount+1||1;for(var s=0,r=o.length;s<r;s++){var a=o[s],h=a.fn;a.once&&this.off(t,h,a.ctx),h.call(a.ctx||this,n)}this._firingCount--}}i&&this._propagateEvent(n)}return this},listens:function(t,e,i,n){"string"!=typeof t&&console.warn('"string" type argument expected');var o=e,s=("function"!=typeof e&&(n=!!e,i=o=void 0),this._events&&this._events[t]);if(s&&s.length&&!1!==this._listens(t,o,i))return!0;if(n)for(var r in this._eventParents)if(this._eventParents[r].listens(t,e,i,n))return!0;return!1},_listens:function(t,e,i){if(this._events){var n=this._events[t]||[];if(!e)return!!n.length;i===this&&(i=void 0);for(var o=0,s=n.length;o<s;o++)if(n[o].fn===e&&n[o].ctx===i)return o}return!1},once:function(t,e,i){if("object"==typeof t)for(var n in t)this._on(n,t[n],e,!0);else for(var o=0,s=(t=F(t)).length;o<s;o++)this._on(t[o],e,i,!0);return this},addEventParent:function(t){return this._eventParents=this._eventParents||{},this._eventParents[h(t)]=t,this},removeEventParent:function(t){return this._eventParents&&delete this._eventParents[h(t)],this},_propagateEvent:function(t){for(var e in this._eventParents)this._eventParents[e].fire(t.type,l({layer:t.target,propagatedFrom:t.target},t),!0)}},it=(e.addEventListener=e.on,e.removeEventListener=e.clearAllEventListeners=e.off,e.addOneTimeEventListener=e.once,e.fireEvent=e.fire,e.hasEventListeners=e.listens,et.extend(e));function p(t,e,i){this.x=i?Math.round(t):t,this.y=i?Math.round(e):e}var nt=Math.trunc||function(t){return 0<t?Math.floor(t):Math.ceil(t)};function m(t,e,i){return t instanceof p?t:d(t)?new p(t[0],t[1]):null==t?t:"object"==typeof t&&"x"in t&&"y"in t?new p(t.x,t.y):new p(t,e,i)}function f(t,e){if(t)for(var i=e?[t,e]:t,n=0,o=i.length;n<o;n++)this.extend(i[n])}function _(t,e){return!t||t instanceof f?t:new f(t,e)}function s(t,e){if(t)for(var i=e?[t,e]:t,n=0,o=i.length;n<o;n++)this.extend(i[n])}function g(t,e){return t instanceof s?t:new s(t,e)}function v(t,e,i){if(isNaN(t)||isNaN(e))throw new Error("Invalid LatLng object: ("+t+", "+e+")");this.lat=+t,this.lng=+e,void 0!==i&&(this.alt=+i)}function w(t,e,i){return t instanceof v?t:d(t)&&"object"!=typeof t[0]?3===t.length?new v(t[0],t[1],t[2]):2===t.length?new v(t[0],t[1]):null:null==t?t:"object"==typeof t&&"lat"in t?new v(t.lat,"lng"in t?t.lng:t.lon,t.alt):void 0===e?null:new v(t,e,i)}p.prototype={clone:function(){return new p(this.x,this.y)},add:function(t){return this.clone()._add(m(t))},_add:function(t){return this.x+=t.x,this.y+=t.y,this},subtract:function(t){return this.clone()._subtract(m(t))},_subtract:function(t){return this.x-=t.x,this.y-=t.y,this},divideBy:function(t){return this.clone()._divideBy(t)},_divideBy:function(t){return this.x/=t,this.y/=t,this},multiplyBy:function(t){return this.clone()._multiplyBy(t)},_multiplyBy:function(t){return this.x*=t,this.y*=t,this},scaleBy:function(t){return new p(this.x*t.x,this.y*t.y)},unscaleBy:function(t){return new p(this.x/t.x,this.y/t.y)},round:function(){return this.clone()._round()},_round:function(){return this.x=Math.round(this.x),this.y=Math.round(this.y),this},floor:function(){return this.clone()._floor()},_floor:function(){return this.x=Math.floor(this.x),this.y=Math.floor(this.y),this},ceil:function(){return this.clone()._ceil()},_ceil:function(){return this.x=Math.ceil(this.x),this.y=Math.ceil(this.y),this},trunc:function(){return this.clone()._trunc()},_trunc:function(){return this.x=nt(this.x),this.y=nt(this.y),this},distanceTo:function(t){var e=(t=m(t)).x-this.x,t=t.y-this.y;return Math.sqrt(e*e+t*t)},equals:function(t){return(t=m(t)).x===this.x&&t.y===this.y},contains:function(t){return t=m(t),Math.abs(t.x)<=Math.abs(this.x)&&Math.abs(t.y)<=Math.abs(this.y)},toString:function(){return"Point("+i(this.x)+", "+i(this.y)+")"}},f.prototype={extend:function(t){var e,i;if(t){if(t instanceof p||"number"==typeof t[0]||"x"in t)e=i=m(t);else if(e=(t=_(t)).min,i=t.max,!e||!i)return this;this.min||this.max?(this.min.x=Math.min(e.x,this.min.x),this.max.x=Math.max(i.x,this.max.x),this.min.y=Math.min(e.y,this.min.y),this.max.y=Math.max(i.y,this.max.y)):(this.min=e.clone(),this.max=i.clone())}return this},getCenter:function(t){return m((this.min.x+this.max.x)/2,(this.min.y+this.max.y)/2,t)},getBottomLeft:function(){return m(this.min.x,this.max.y)},getTopRight:function(){return m(this.max.x,this.min.y)},getTopLeft:function(){return this.min},getBottomRight:function(){return this.max},getSize:function(){return this.max.subtract(this.min)},contains:function(t){var e,i;return(t=("number"==typeof t[0]||t instanceof p?m:_)(t))instanceof f?(e=t.min,i=t.max):e=i=t,e.x>=this.min.x&&i.x<=this.max.x&&e.y>=this.min.y&&i.y<=this.max.y},intersects:function(t){t=_(t);var e=this.min,i=this.max,n=t.min,t=t.max,o=t.x>=e.x&&n.x<=i.x,t=t.y>=e.y&&n.y<=i.y;return o&&t},overlaps:function(t){t=_(t);var e=this.min,i=this.max,n=t.min,t=t.max,o=t.x>e.x&&n.x<i.x,t=t.y>e.y&&n.y<i.y;return o&&t},isValid:function(){return!(!this.min||!this.max)},pad:function(t){var e=this.min,i=this.max,n=Math.abs(e.x-i.x)*t,t=Math.abs(e.y-i.y)*t;return _(m(e.x-n,e.y-t),m(i.x+n,i.y+t))},equals:function(t){return!!t&&(t=_(t),this.min.equals(t.getTopLeft())&&this.max.equals(t.getBottomRight()))}},s.prototype={extend:function(t){var e,i,n=this._southWest,o=this._northEast;if(t instanceof v)i=e=t;else{if(!(t instanceof s))return t?this.extend(w(t)||g(t)):this;if(e=t._southWest,i=t._northEast,!e||!i)return this}return n||o?(n.lat=Math.min(e.lat,n.lat),n.lng=Math.min(e.lng,n.lng),o.lat=Math.max(i.lat,o.lat),o.lng=Math.max(i.lng,o.lng)):(this._southWest=new v(e.lat,e.lng),this._northEast=new v(i.lat,i.lng)),this},pad:function(t){var e=this._southWest,i=this._northEast,n=Math.abs(e.lat-i.lat)*t,t=Math.abs(e.lng-i.lng)*t;return new s(new v(e.lat-n,e.lng-t),new v(i.lat+n,i.lng+t))},getCenter:function(){return new v((this._southWest.lat+this._northEast.lat)/2,(this._southWest.lng+this._northEast.lng)/2)},getSouthWest:function(){return this._southWest},getNorthEast:function(){return this._northEast},getNorthWest:function(){return new v(this.getNorth(),this.getWest())},getSouthEast:function(){return new v(this.getSouth(),this.getEast())},getWest:function(){return this._southWest.lng},getSouth:function(){return this._southWest.lat},getEast:function(){return this._northEast.lng},getNorth:function(){return this._northEast.lat},contains:function(t){t=("number"==typeof t[0]||t instanceof v||"lat"in t?w:g)(t);var e,i,n=this._southWest,o=this._northEast;return t instanceof s?(e=t.getSouthWest(),i=t.getNorthEast()):e=i=t,e.lat>=n.lat&&i.lat<=o.lat&&e.lng>=n.lng&&i.lng<=o.lng},intersects:function(t){t=g(t);var e=this._southWest,i=this._northEast,n=t.getSouthWest(),t=t.getNorthEast(),o=t.lat>=e.lat&&n.lat<=i.lat,t=t.lng>=e.lng&&n.lng<=i.lng;return o&&t},overlaps:function(t){t=g(t);var e=this._southWest,i=this._northEast,n=t.getSouthWest(),t=t.getNorthEast(),o=t.lat>e.lat&&n.lat<i.lat,t=t.lng>e.lng&&n.lng<i.lng;return o&&t},toBBoxString:function(){return[this.getWest(),this.getSouth(),this.getEast(),this.getNorth()].join(",")},equals:function(t,e){return!!t&&(t=g(t),this._southWest.equals(t.getSouthWest(),e)&&this._northEast.equals(t.getNorthEast(),e))},isValid:function(){return!(!this._southWest||!this._northEast)}};var ot={latLngToPoint:function(t,e){t=this.projection.project(t),e=this.scale(e);return this.transformation._transform(t,e)},pointToLatLng:function(t,e){e=this.scale(e),t=this.transformation.untransform(t,e);return this.projection.unproject(t)},project:function(t){return this.projection.project(t)},unproject:function(t){return this.projection.unproject(t)},scale:function(t){return 256*Math.pow(2,t)},zoom:function(t){return Math.log(t/256)/Math.LN2},getProjectedBounds:function(t){var e;return this.infinite?null:(e=this.projection.bounds,t=this.scale(t),new f(this.transformation.transform(e.min,t),this.transformation.transform(e.max,t)))},infinite:!(v.prototype={equals:function(t,e){return!!t&&(t=w(t),Math.max(Math.abs(this.lat-t.lat),Math.abs(this.lng-t.lng))<=(void 0===e?1e-9:e))},toString:function(t){return"LatLng("+i(this.lat,t)+", "+i(this.lng,t)+")"},distanceTo:function(t){return st.distance(this,w(t))},wrap:function(){return st.wrapLatLng(this)},toBounds:function(t){var t=180*t/40075017,e=t/Math.cos(Math.PI/180*this.lat);return g([this.lat-t,this.lng-e],[this.lat+t,this.lng+e])},clone:function(){return new v(this.lat,this.lng,this.alt)}}),wrapLatLng:function(t){var e=this.wrapLng?H(t.lng,this.wrapLng,!0):t.lng;return new v(this.wrapLat?H(t.lat,this.wrapLat,!0):t.lat,e,t.alt)},wrapLatLngBounds:function(t){var e=t.getCenter(),i=this.wrapLatLng(e),n=e.lat-i.lat,e=e.lng-i.lng;return 0==n&&0==e?t:(i=t.getSouthWest(),t=t.getNorthEast(),new s(new v(i.lat-n,i.lng-e),new v(t.lat-n,t.lng-e)))}},st=l({},ot,{wrapLng:[-180,180],R:6371e3,distance:function(t,e){var i=Math.PI/180,n=t.lat*i,o=e.lat*i,s=Math.sin((e.lat-t.lat)*i/2),e=Math.sin((e.lng-t.lng)*i/2),t=s*s+Math.cos(n)*Math.cos(o)*e*e,i=2*Math.atan2(Math.sqrt(t),Math.sqrt(1-t));return this.R*i}}),rt=6378137,rt={R:rt,MAX_LATITUDE:85.0511287798,project:function(t){var e=Math.PI/180,i=this.MAX_LATITUDE,i=Math.max(Math.min(i,t.lat),-i),i=Math.sin(i*e);return new p(this.R*t.lng*e,this.R*Math.log((1+i)/(1-i))/2)},unproject:function(t){var e=180/Math.PI;return new v((2*Math.atan(Math.exp(t.y/this.R))-Math.PI/2)*e,t.x*e/this.R)},bounds:new f([-(rt=rt*Math.PI),-rt],[rt,rt])};function at(t,e,i,n){d(t)?(this._a=t[0],this._b=t[1],this._c=t[2],this._d=t[3]):(this._a=t,this._b=e,this._c=i,this._d=n)}function ht(t,e,i,n){return new at(t,e,i,n)}at.prototype={transform:function(t,e){return this._transform(t.clone(),e)},_transform:function(t,e){return t.x=(e=e||1)*(this._a*t.x+this._b),t.y=e*(this._c*t.y+this._d),t},untransform:function(t,e){return new p((t.x/(e=e||1)-this._b)/this._a,(t.y/e-this._d)/this._c)}};var lt=l({},st,{code:"EPSG:3857",projection:rt,transformation:ht(lt=.5/(Math.PI*rt.R),.5,-lt,.5)}),ut=l({},lt,{code:"EPSG:900913"});function ct(t){return document.createElementNS("http://www.w3.org/2000/svg",t)}function dt(t,e){for(var i,n,o,s,r="",a=0,h=t.length;a<h;a++){for(i=0,n=(o=t[a]).length;i<n;i++)r+=(i?"L":"M")+(s=o[i]).x+" "+s.y;r+=e?b.svg?"z":"x":""}return r||"M0 0"}var _t=document.documentElement.style,pt="ActiveXObject"in window,mt=pt&&!document.addEventListener,n="msLaunchUri"in navigator&&!("documentMode"in document),ft=y("webkit"),gt=y("android"),vt=y("android 2")||y("android 3"),yt=parseInt(/WebKit\/([0-9]+)|$/.exec(navigator.userAgent)[1],10),yt=gt&&y("Google")&&yt<537&&!("AudioNode"in window),xt=!!window.opera,wt=!n&&y("chrome"),bt=y("gecko")&&!ft&&!xt&&!pt,Pt=!wt&&y("safari"),Lt=y("phantom"),o="OTransition"in _t,Tt=0===navigator.platform.indexOf("Win"),Mt=pt&&"transition"in _t,zt="WebKitCSSMatrix"in window&&"m11"in new window.WebKitCSSMatrix&&!vt,_t="MozPerspective"in _t,Ct=!window.L_DISABLE_3D&&(Mt||zt||_t)&&!o&&!Lt,Zt="undefined"!=typeof orientation||y("mobile"),St=Zt&&ft,Et=Zt&&zt,kt=!window.PointerEvent&&window.MSPointerEvent,Ot=!(!window.PointerEvent&&!kt),At="ontouchstart"in window||!!window.TouchEvent,Bt=!window.L_NO_TOUCH&&(At||Ot),It=Zt&&xt,Rt=Zt&&bt,Nt=1<(window.devicePixelRatio||window.screen.deviceXDPI/window.screen.logicalXDPI),Dt=function(){var t=!1;try{var e=Object.defineProperty({},"passive",{get:function(){t=!0}});window.addEventListener("testPassiveEventSupport",u,e),window.removeEventListener("testPassiveEventSupport",u,e)}catch(t){}return t}(),jt=!!document.createElement("canvas").getContext,Ht=!(!document.createElementNS||!ct("svg").createSVGRect),Wt=!!Ht&&((Wt=document.createElement("div")).innerHTML="<svg/>","http://www.w3.org/2000/svg"===(Wt.firstChild&&Wt.firstChild.namespaceURI));function y(t){return 0<=navigator.userAgent.toLowerCase().indexOf(t)}var b={ie:pt,ielt9:mt,edge:n,webkit:ft,android:gt,android23:vt,androidStock:yt,opera:xt,chrome:wt,gecko:bt,safari:Pt,phantom:Lt,opera12:o,win:Tt,ie3d:Mt,webkit3d:zt,gecko3d:_t,any3d:Ct,mobile:Zt,mobileWebkit:St,mobileWebkit3d:Et,msPointer:kt,pointer:Ot,touch:Bt,touchNative:At,mobileOpera:It,mobileGecko:Rt,retina:Nt,passiveEvents:Dt,canvas:jt,svg:Ht,vml:!Ht&&function(){try{var t=document.createElement("div"),e=(t.innerHTML='<v:shape adj="1"/>',t.firstChild);return e.style.behavior="url(#default#VML)",e&&"object"==typeof e.adj}catch(t){return!1}}(),inlineSvg:Wt,mac:0===navigator.platform.indexOf("Mac"),linux:0===navigator.platform.indexOf("Linux")},Ft=b.msPointer?"MSPointerDown":"pointerdown",Ut=b.msPointer?"MSPointerMove":"pointermove",Vt=b.msPointer?"MSPointerUp":"pointerup",qt=b.msPointer?"MSPointerCancel":"pointercancel",Gt={touchstart:Ft,touchmove:Ut,touchend:Vt,touchcancel:qt},Kt={touchstart:function(t,e){e.MSPOINTER_TYPE_TOUCH&&e.pointerType===e.MSPOINTER_TYPE_TOUCH&&O(e);ee(t,e)},touchmove:ee,touchend:ee,touchcancel:ee},Yt={},Xt=!1;function Jt(t,e,i){return"touchstart"!==e||Xt||(document.addEventListener(Ft,$t,!0),document.addEventListener(Ut,Qt,!0),document.addEventListener(Vt,te,!0),document.addEventListener(qt,te,!0),Xt=!0),Kt[e]?(i=Kt[e].bind(this,i),t.addEventListener(Gt[e],i,!1),i):(console.warn("wrong event specified:",e),u)}function $t(t){Yt[t.pointerId]=t}function Qt(t){Yt[t.pointerId]&&(Yt[t.pointerId]=t)}function te(t){delete Yt[t.pointerId]}function ee(t,e){if(e.pointerType!==(e.MSPOINTER_TYPE_MOUSE||"mouse")){for(var i in e.touches=[],Yt)e.touches.push(Yt[i]);e.changedTouches=[e],t(e)}}var ie=200;function ne(t,i){t.addEventListener("dblclick",i);var n,o=0;function e(t){var e;1!==t.detail?n=t.detail:"mouse"===t.pointerType||t.sourceCapabilities&&!t.sourceCapabilities.firesTouchEvents||((e=Ne(t)).some(function(t){return t instanceof HTMLLabelElement&&t.attributes.for})&&!e.some(function(t){return t instanceof HTMLInputElement||t instanceof HTMLSelectElement})||((e=Date.now())-o<=ie?2===++n&&i(function(t){var e,i,n={};for(i in t)e=t[i],n[i]=e&&e.bind?e.bind(t):e;return(t=n).type="dblclick",n.detail=2,n.isTrusted=!1,n._simulated=!0,n}(t)):n=1,o=e))}return t.addEventListener("click",e),{dblclick:i,simDblclick:e}}var oe,se,re,ae,he,le,ue=we(["transform","webkitTransform","OTransform","MozTransform","msTransform"]),ce=we(["webkitTransition","transition","OTransition","MozTransition","msTransition"]),de="webkitTransition"===ce||"OTransition"===ce?ce+"End":"transitionend";function _e(t){return"string"==typeof t?document.getElementById(t):t}function pe(t,e){var i=t.style[e]||t.currentStyle&&t.currentStyle[e];return"auto"===(i=i&&"auto"!==i||!document.defaultView?i:(t=document.defaultView.getComputedStyle(t,null))?t[e]:null)?null:i}function P(t,e,i){t=document.createElement(t);return t.className=e||"",i&&i.appendChild(t),t}function T(t){var e=t.parentNode;e&&e.removeChild(t)}function me(t){for(;t.firstChild;)t.removeChild(t.firstChild)}function fe(t){var e=t.parentNode;e&&e.lastChild!==t&&e.appendChild(t)}function ge(t){var e=t.parentNode;e&&e.firstChild!==t&&e.insertBefore(t,e.firstChild)}function ve(t,e){return void 0!==t.classList?t.classList.contains(e):0<(t=xe(t)).length&&new RegExp("(^|\\s)"+e+"(\\s|$)").test(t)}function M(t,e){var i;if(void 0!==t.classList)for(var n=F(e),o=0,s=n.length;o<s;o++)t.classList.add(n[o]);else ve(t,e)||ye(t,((i=xe(t))?i+" ":"")+e)}function z(t,e){void 0!==t.classList?t.classList.remove(e):ye(t,W((" "+xe(t)+" ").replace(" "+e+" "," ")))}function ye(t,e){void 0===t.className.baseVal?t.className=e:t.className.baseVal=e}function xe(t){return void 0===(t=t.correspondingElement?t.correspondingElement:t).className.baseVal?t.className:t.className.baseVal}function C(t,e){if("opacity"in t.style)t.style.opacity=e;else if("filter"in t.style){var i=!1,n="DXImageTransform.Microsoft.Alpha";try{i=t.filters.item(n)}catch(t){if(1===e)return}e=Math.round(100*e),i?(i.Enabled=100!==e,i.Opacity=e):t.style.filter+=" progid:"+n+"(opacity="+e+")"}}function we(t){for(var e=document.documentElement.style,i=0;i<t.length;i++)if(t[i]in e)return t[i];return!1}function be(t,e,i){e=e||new p(0,0);t.style[ue]=(b.ie3d?"translate("+e.x+"px,"+e.y+"px)":"translate3d("+e.x+"px,"+e.y+"px,0)")+(i?" scale("+i+")":"")}function Z(t,e){t._leaflet_pos=e,b.any3d?be(t,e):(t.style.left=e.x+"px",t.style.top=e.y+"px")}function Pe(t){return t._leaflet_pos||new p(0,0)}function Le(){S(window,"dragstart",O)}function Te(){k(window,"dragstart",O)}function Me(t){for(;-1===t.tabIndex;)t=t.parentNode;t.style&&(ze(),le=(he=t).style.outlineStyle,t.style.outlineStyle="none",S(window,"keydown",ze))}function ze(){he&&(he.style.outlineStyle=le,le=he=void 0,k(window,"keydown",ze))}function Ce(t){for(;!((t=t.parentNode).offsetWidth&&t.offsetHeight||t===document.body););return t}function Ze(t){var e=t.getBoundingClientRect();return{x:e.width/t.offsetWidth||1,y:e.height/t.offsetHeight||1,boundingClientRect:e}}ae="onselectstart"in document?(re=function(){S(window,"selectstart",O)},function(){k(window,"selectstart",O)}):(se=we(["userSelect","WebkitUserSelect","OUserSelect","MozUserSelect","msUserSelect"]),re=function(){var t;se&&(t=document.documentElement.style,oe=t[se],t[se]="none")},function(){se&&(document.documentElement.style[se]=oe,oe=void 0)});pt={__proto__:null,TRANSFORM:ue,TRANSITION:ce,TRANSITION_END:de,get:_e,getStyle:pe,create:P,remove:T,empty:me,toFront:fe,toBack:ge,hasClass:ve,addClass:M,removeClass:z,setClass:ye,getClass:xe,setOpacity:C,testProp:we,setTransform:be,setPosition:Z,getPosition:Pe,get disableTextSelection(){return re},get enableTextSelection(){return ae},disableImageDrag:Le,enableImageDrag:Te,preventOutline:Me,restoreOutline:ze,getSizedParentNode:Ce,getScale:Ze};function S(t,e,i,n){if(e&&"object"==typeof e)for(var o in e)ke(t,o,e[o],i);else for(var s=0,r=(e=F(e)).length;s<r;s++)ke(t,e[s],i,n);return this}var E="_leaflet_events";function k(t,e,i,n){if(1===arguments.length)Se(t),delete t[E];else if(e&&"object"==typeof e)for(var o in e)Oe(t,o,e[o],i);else if(e=F(e),2===arguments.length)Se(t,function(t){return-1!==G(e,t)});else for(var s=0,r=e.length;s<r;s++)Oe(t,e[s],i,n);return this}function Se(t,e){for(var i in t[E]){var n=i.split(/\d/)[0];e&&!e(n)||Oe(t,n,null,null,i)}}var Ee={mouseenter:"mouseover",mouseleave:"mouseout",wheel:!("onwheel"in window)&&"mousewheel"};function ke(e,t,i,n){var o,s,r=t+h(i)+(n?"_"+h(n):"");e[E]&&e[E][r]||(s=o=function(t){return i.call(n||e,t||window.event)},!b.touchNative&&b.pointer&&0===t.indexOf("touch")?o=Jt(e,t,o):b.touch&&"dblclick"===t?o=ne(e,o):"addEventListener"in e?"touchstart"===t||"touchmove"===t||"wheel"===t||"mousewheel"===t?e.addEventListener(Ee[t]||t,o,!!b.passiveEvents&&{passive:!1}):"mouseenter"===t||"mouseleave"===t?e.addEventListener(Ee[t],o=function(t){t=t||window.event,We(e,t)&&s(t)},!1):e.addEventListener(t,s,!1):e.attachEvent("on"+t,o),e[E]=e[E]||{},e[E][r]=o)}function Oe(t,e,i,n,o){o=o||e+h(i)+(n?"_"+h(n):"");var s,r,i=t[E]&&t[E][o];i&&(!b.touchNative&&b.pointer&&0===e.indexOf("touch")?(n=t,r=i,Gt[s=e]?n.removeEventListener(Gt[s],r,!1):console.warn("wrong event specified:",s)):b.touch&&"dblclick"===e?(n=i,(r=t).removeEventListener("dblclick",n.dblclick),r.removeEventListener("click",n.simDblclick)):"removeEventListener"in t?t.removeEventListener(Ee[e]||e,i,!1):t.detachEvent("on"+e,i),t[E][o]=null)}function Ae(t){return t.stopPropagation?t.stopPropagation():t.originalEvent?t.originalEvent._stopped=!0:t.cancelBubble=!0,this}function Be(t){return ke(t,"wheel",Ae),this}function Ie(t){return S(t,"mousedown touchstart dblclick contextmenu",Ae),t._leaflet_disable_click=!0,this}function O(t){return t.preventDefault?t.preventDefault():t.returnValue=!1,this}function Re(t){return O(t),Ae(t),this}function Ne(t){if(t.composedPath)return t.composedPath();for(var e=[],i=t.target;i;)e.push(i),i=i.parentNode;return e}function De(t,e){var i,n;return e?(n=(i=Ze(e)).boundingClientRect,new p((t.clientX-n.left)/i.x-e.clientLeft,(t.clientY-n.top)/i.y-e.clientTop)):new p(t.clientX,t.clientY)}var je=b.linux&&b.chrome?window.devicePixelRatio:b.mac?3*window.devicePixelRatio:0<window.devicePixelRatio?2*window.devicePixelRatio:1;function He(t){return b.edge?t.wheelDeltaY/2:t.deltaY&&0===t.deltaMode?-t.deltaY/je:t.deltaY&&1===t.deltaMode?20*-t.deltaY:t.deltaY&&2===t.deltaMode?60*-t.deltaY:t.deltaX||t.deltaZ?0:t.wheelDelta?(t.wheelDeltaY||t.wheelDelta)/2:t.detail&&Math.abs(t.detail)<32765?20*-t.detail:t.detail?t.detail/-32765*60:0}function We(t,e){var i=e.relatedTarget;if(!i)return!0;try{for(;i&&i!==t;)i=i.parentNode}catch(t){return!1}return i!==t}var mt={__proto__:null,on:S,off:k,stopPropagation:Ae,disableScrollPropagation:Be,disableClickPropagation:Ie,preventDefault:O,stop:Re,getPropagationPath:Ne,getMousePosition:De,getWheelDelta:He,isExternalTarget:We,addListener:S,removeListener:k},Fe=it.extend({run:function(t,e,i,n){this.stop(),this._el=t,this._inProgress=!0,this._duration=i||.25,this._easeOutPower=1/Math.max(n||.5,.2),this._startPos=Pe(t),this._offset=e.subtract(this._startPos),this._startTime=+new Date,this.fire("start"),this._animate()},stop:function(){this._inProgress&&(this._step(!0),this._complete())},_animate:function(){this._animId=x(this._animate,this),this._step()},_step:function(t){var e=+new Date-this._startTime,i=1e3*this._duration;e<i?this._runFrame(this._easeOut(e/i),t):(this._runFrame(1),this._complete())},_runFrame:function(t,e){t=this._startPos.add(this._offset.multiplyBy(t));e&&t._round(),Z(this._el,t),this.fire("step")},_complete:function(){r(this._animId),this._inProgress=!1,this.fire("end")},_easeOut:function(t){return 1-Math.pow(1-t,this._easeOutPower)}}),A=it.extend({options:{crs:lt,center:void 0,zoom:void 0,minZoom:void 0,maxZoom:void 0,layers:[],maxBounds:void 0,renderer:void 0,zoomAnimation:!0,zoomAnimationThreshold:4,fadeAnimation:!0,markerZoomAnimation:!0,transform3DLimit:8388608,zoomSnap:1,zoomDelta:1,trackResize:!0},initialize:function(t,e){e=c(this,e),this._handlers=[],this._layers={},this._zoomBoundLayers={},this._sizeChanged=!0,this._initContainer(t),this._initLayout(),this._onResize=a(this._onResize,this),this._initEvents(),e.maxBounds&&this.setMaxBounds(e.maxBounds),void 0!==e.zoom&&(this._zoom=this._limitZoom(e.zoom)),e.center&&void 0!==e.zoom&&this.setView(w(e.center),e.zoom,{reset:!0}),this.callInitHooks(),this._zoomAnimated=ce&&b.any3d&&!b.mobileOpera&&this.options.zoomAnimation,this._zoomAnimated&&(this._createAnimProxy(),S(this._proxy,de,this._catchTransitionEnd,this)),this._addLayers(this.options.layers)},setView:function(t,e,i){if((e=void 0===e?this._zoom:this._limitZoom(e),t=this._limitCenter(w(t),e,this.options.maxBounds),i=i||{},this._stop(),this._loaded&&!i.reset&&!0!==i)&&(void 0!==i.animate&&(i.zoom=l({animate:i.animate},i.zoom),i.pan=l({animate:i.animate,duration:i.duration},i.pan)),this._zoom!==e?this._tryAnimatedZoom&&this._tryAnimatedZoom(t,e,i.zoom):this._tryAnimatedPan(t,i.pan)))return clearTimeout(this._sizeTimer),this;return this._resetView(t,e,i.pan&&i.pan.noMoveStart),this},setZoom:function(t,e){return this._loaded?this.setView(this.getCenter(),t,{zoom:e}):(this._zoom=t,this)},zoomIn:function(t,e){return t=t||(b.any3d?this.options.zoomDelta:1),this.setZoom(this._zoom+t,e)},zoomOut:function(t,e){return t=t||(b.any3d?this.options.zoomDelta:1),this.setZoom(this._zoom-t,e)},setZoomAround:function(t,e,i){var n=this.getZoomScale(e),o=this.getSize().divideBy(2),t=(t instanceof p?t:this.latLngToContainerPoint(t)).subtract(o).multiplyBy(1-1/n),n=this.containerPointToLatLng(o.add(t));return this.setView(n,e,{zoom:i})},_getBoundsCenterZoom:function(t,e){e=e||{},t=t.getBounds?t.getBounds():g(t);var i=m(e.paddingTopLeft||e.padding||[0,0]),n=m(e.paddingBottomRight||e.padding||[0,0]),o=this.getBoundsZoom(t,!1,i.add(n));return(o="number"==typeof e.maxZoom?Math.min(e.maxZoom,o):o)===1/0?{center:t.getCenter(),zoom:o}:(e=n.subtract(i).divideBy(2),n=this.project(t.getSouthWest(),o),i=this.project(t.getNorthEast(),o),{center:this.unproject(n.add(i).divideBy(2).add(e),o),zoom:o})},fitBounds:function(t,e){if((t=g(t)).isValid())return t=this._getBoundsCenterZoom(t,e),this.setView(t.center,t.zoom,e);throw new Error("Bounds are not valid.")},fitWorld:function(t){return this.fitBounds([[-90,-180],[90,180]],t)},panTo:function(t,e){return this.setView(t,this._zoom,{pan:e})},panBy:function(t,e){var i;return e=e||{},(t=m(t).round()).x||t.y?(!0===e.animate||this.getSize().contains(t)?(this._panAnim||(this._panAnim=new Fe,this._panAnim.on({step:this._onPanTransitionStep,end:this._onPanTransitionEnd},this)),e.noMoveStart||this.fire("movestart"),!1!==e.animate?(M(this._mapPane,"leaflet-pan-anim"),i=this._getMapPanePos().subtract(t).round(),this._panAnim.run(this._mapPane,i,e.duration||.25,e.easeLinearity)):(this._rawPanBy(t),this.fire("move").fire("moveend"))):this._resetView(this.unproject(this.project(this.getCenter()).add(t)),this.getZoom()),this):this.fire("moveend")},flyTo:function(n,o,t){if(!1===(t=t||{}).animate||!b.any3d)return this.setView(n,o,t);this._stop();var s=this.project(this.getCenter()),r=this.project(n),e=this.getSize(),a=this._zoom,h=(n=w(n),o=void 0===o?a:o,Math.max(e.x,e.y)),i=h*this.getZoomScale(a,o),l=r.distanceTo(s)||1,u=1.42,c=u*u;function d(t){t=(i*i-h*h+(t?-1:1)*c*c*l*l)/(2*(t?i:h)*c*l),t=Math.sqrt(t*t+1)-t;return t<1e-9?-18:Math.log(t)}function _(t){return(Math.exp(t)-Math.exp(-t))/2}function p(t){return(Math.exp(t)+Math.exp(-t))/2}var m=d(0);function f(t){return h*(p(m)*(_(t=m+u*t)/p(t))-_(m))/c}var g=Date.now(),v=(d(1)-m)/u,y=t.duration?1e3*t.duration:1e3*v*.8;return this._moveStart(!0,t.noMoveStart),function t(){var e=(Date.now()-g)/y,i=(1-Math.pow(1-e,1.5))*v;e<=1?(this._flyToFrame=x(t,this),this._move(this.unproject(s.add(r.subtract(s).multiplyBy(f(i)/l)),a),this.getScaleZoom(h/(e=i,h*(p(m)/p(m+u*e))),a),{flyTo:!0})):this._move(n,o)._moveEnd(!0)}.call(this),this},flyToBounds:function(t,e){t=this._getBoundsCenterZoom(t,e);return this.flyTo(t.center,t.zoom,e)},setMaxBounds:function(t){return t=g(t),this.listens("moveend",this._panInsideMaxBounds)&&this.off("moveend",this._panInsideMaxBounds),t.isValid()?(this.options.maxBounds=t,this._loaded&&this._panInsideMaxBounds(),this.on("moveend",this._panInsideMaxBounds)):(this.options.maxBounds=null,this)},setMinZoom:function(t){var e=this.options.minZoom;return this.options.minZoom=t,this._loaded&&e!==t&&(this.fire("zoomlevelschange"),this.getZoom()<this.options.minZoom)?this.setZoom(t):this},setMaxZoom:function(t){var e=this.options.maxZoom;return this.options.maxZoom=t,this._loaded&&e!==t&&(this.fire("zoomlevelschange"),this.getZoom()>this.options.maxZoom)?this.setZoom(t):this},panInsideBounds:function(t,e){this._enforcingBounds=!0;var i=this.getCenter(),t=this._limitCenter(i,this._zoom,g(t));return i.equals(t)||this.panTo(t,e),this._enforcingBounds=!1,this},panInside:function(t,e){var i=m((e=e||{}).paddingTopLeft||e.padding||[0,0]),n=m(e.paddingBottomRight||e.padding||[0,0]),o=this.project(this.getCenter()),t=this.project(t),s=this.getPixelBounds(),i=_([s.min.add(i),s.max.subtract(n)]),s=i.getSize();return i.contains(t)||(this._enforcingBounds=!0,n=t.subtract(i.getCenter()),i=i.extend(t).getSize().subtract(s),o.x+=n.x<0?-i.x:i.x,o.y+=n.y<0?-i.y:i.y,this.panTo(this.unproject(o),e),this._enforcingBounds=!1),this},invalidateSize:function(t){if(!this._loaded)return this;t=l({animate:!1,pan:!0},!0===t?{animate:!0}:t);var e=this.getSize(),i=(this._sizeChanged=!0,this._lastCenter=null,this.getSize()),n=e.divideBy(2).round(),o=i.divideBy(2).round(),n=n.subtract(o);return n.x||n.y?(t.animate&&t.pan?this.panBy(n):(t.pan&&this._rawPanBy(n),this.fire("move"),t.debounceMoveend?(clearTimeout(this._sizeTimer),this._sizeTimer=setTimeout(a(this.fire,this,"moveend"),200)):this.fire("moveend")),this.fire("resize",{oldSize:e,newSize:i})):this},stop:function(){return this.setZoom(this._limitZoom(this._zoom)),this.options.zoomSnap||this.fire("viewreset"),this._stop()},locate:function(t){var e,i;return t=this._locateOptions=l({timeout:1e4,watch:!1},t),"geolocation"in navigator?(e=a(this._handleGeolocationResponse,this),i=a(this._handleGeolocationError,this),t.watch?this._locationWatchId=navigator.geolocation.watchPosition(e,i,t):navigator.geolocation.getCurrentPosition(e,i,t)):this._handleGeolocationError({code:0,message:"Geolocation not supported."}),this},stopLocate:function(){return navigator.geolocation&&navigator.geolocation.clearWatch&&navigator.geolocation.clearWatch(this._locationWatchId),this._locateOptions&&(this._locateOptions.setView=!1),this},_handleGeolocationError:function(t){var e;this._container._leaflet_id&&(e=t.code,t=t.message||(1===e?"permission denied":2===e?"position unavailable":"timeout"),this._locateOptions.setView&&!this._loaded&&this.fitWorld(),this.fire("locationerror",{code:e,message:"Geolocation error: "+t+"."}))},_handleGeolocationResponse:function(t){if(this._container._leaflet_id){var e,i,n=new v(t.coords.latitude,t.coords.longitude),o=n.toBounds(2*t.coords.accuracy),s=this._locateOptions,r=(s.setView&&(e=this.getBoundsZoom(o),this.setView(n,s.maxZoom?Math.min(e,s.maxZoom):e)),{latlng:n,bounds:o,timestamp:t.timestamp});for(i in t.coords)"number"==typeof t.coords[i]&&(r[i]=t.coords[i]);this.fire("locationfound",r)}},addHandler:function(t,e){return e&&(e=this[t]=new e(this),this._handlers.push(e),this.options[t]&&e.enable()),this},remove:function(){if(this._initEvents(!0),this.options.maxBounds&&this.off("moveend",this._panInsideMaxBounds),this._containerId!==this._container._leaflet_id)throw new Error("Map container is being reused by another instance");try{delete this._container._leaflet_id,delete this._containerId}catch(t){this._container._leaflet_id=void 0,this._containerId=void 0}for(var t in void 0!==this._locationWatchId&&this.stopLocate(),this._stop(),T(this._mapPane),this._clearControlPos&&this._clearControlPos(),this._resizeRequest&&(r(this._resizeRequest),this._resizeRequest=null),this._clearHandlers(),this._loaded&&this.fire("unload"),this._layers)this._layers[t].remove();for(t in this._panes)T(this._panes[t]);return this._layers=[],this._panes=[],delete this._mapPane,delete this._renderer,this},createPane:function(t,e){e=P("div","leaflet-pane"+(t?" leaflet-"+t.replace("Pane","")+"-pane":""),e||this._mapPane);return t&&(this._panes[t]=e),e},getCenter:function(){return this._checkIfLoaded(),this._lastCenter&&!this._moved()?this._lastCenter.clone():this.layerPointToLatLng(this._getCenterLayerPoint())},getZoom:function(){return this._zoom},getBounds:function(){var t=this.getPixelBounds();return new s(this.unproject(t.getBottomLeft()),this.unproject(t.getTopRight()))},getMinZoom:function(){return void 0===this.options.minZoom?this._layersMinZoom||0:this.options.minZoom},getMaxZoom:function(){return void 0===this.options.maxZoom?void 0===this._layersMaxZoom?1/0:this._layersMaxZoom:this.options.maxZoom},getBoundsZoom:function(t,e,i){t=g(t),i=m(i||[0,0]);var n=this.getZoom()||0,o=this.getMinZoom(),s=this.getMaxZoom(),r=t.getNorthWest(),t=t.getSouthEast(),i=this.getSize().subtract(i),t=_(this.project(t,n),this.project(r,n)).getSize(),r=b.any3d?this.options.zoomSnap:1,a=i.x/t.x,i=i.y/t.y,t=e?Math.max(a,i):Math.min(a,i),n=this.getScaleZoom(t,n);return r&&(n=Math.round(n/(r/100))*(r/100),n=e?Math.ceil(n/r)*r:Math.floor(n/r)*r),Math.max(o,Math.min(s,n))},getSize:function(){return this._size&&!this._sizeChanged||(this._size=new p(this._container.clientWidth||0,this._container.clientHeight||0),this._sizeChanged=!1),this._size.clone()},getPixelBounds:function(t,e){t=this._getTopLeftPoint(t,e);return new f(t,t.add(this.getSize()))},getPixelOrigin:function(){return this._checkIfLoaded(),this._pixelOrigin},getPixelWorldBounds:function(t){return this.options.crs.getProjectedBounds(void 0===t?this.getZoom():t)},getPane:function(t){return"string"==typeof t?this._panes[t]:t},getPanes:function(){return this._panes},getContainer:function(){return this._container},getZoomScale:function(t,e){var i=this.options.crs;return e=void 0===e?this._zoom:e,i.scale(t)/i.scale(e)},getScaleZoom:function(t,e){var i=this.options.crs,t=(e=void 0===e?this._zoom:e,i.zoom(t*i.scale(e)));return isNaN(t)?1/0:t},project:function(t,e){return e=void 0===e?this._zoom:e,this.options.crs.latLngToPoint(w(t),e)},unproject:function(t,e){return e=void 0===e?this._zoom:e,this.options.crs.pointToLatLng(m(t),e)},layerPointToLatLng:function(t){t=m(t).add(this.getPixelOrigin());return this.unproject(t)},latLngToLayerPoint:function(t){return this.project(w(t))._round()._subtract(this.getPixelOrigin())},wrapLatLng:function(t){return this.options.crs.wrapLatLng(w(t))},wrapLatLngBounds:function(t){return this.options.crs.wrapLatLngBounds(g(t))},distance:function(t,e){return this.options.crs.distance(w(t),w(e))},containerPointToLayerPoint:function(t){return m(t).subtract(this._getMapPanePos())},layerPointToContainerPoint:function(t){return m(t).add(this._getMapPanePos())},containerPointToLatLng:function(t){t=this.containerPointToLayerPoint(m(t));return this.layerPointToLatLng(t)},latLngToContainerPoint:function(t){return this.layerPointToContainerPoint(this.latLngToLayerPoint(w(t)))},mouseEventToContainerPoint:function(t){return De(t,this._container)},mouseEventToLayerPoint:function(t){return this.containerPointToLayerPoint(this.mouseEventToContainerPoint(t))},mouseEventToLatLng:function(t){return this.layerPointToLatLng(this.mouseEventToLayerPoint(t))},_initContainer:function(t){t=this._container=_e(t);if(!t)throw new Error("Map container not found.");if(t._leaflet_id)throw new Error("Map container is already initialized.");S(t,"scroll",this._onScroll,this),this._containerId=h(t)},_initLayout:function(){var t=this._container,e=(this._fadeAnimated=this.options.fadeAnimation&&b.any3d,M(t,"leaflet-container"+(b.touch?" leaflet-touch":"")+(b.retina?" leaflet-retina":"")+(b.ielt9?" leaflet-oldie":"")+(b.safari?" leaflet-safari":"")+(this._fadeAnimated?" leaflet-fade-anim":"")),pe(t,"position"));"absolute"!==e&&"relative"!==e&&"fixed"!==e&&"sticky"!==e&&(t.style.position="relative"),this._initPanes(),this._initControlPos&&this._initControlPos()},_initPanes:function(){var t=this._panes={};this._paneRenderers={},this._mapPane=this.createPane("mapPane",this._container),Z(this._mapPane,new p(0,0)),this.createPane("tilePane"),this.createPane("overlayPane"),this.createPane("shadowPane"),this.createPane("markerPane"),this.createPane("tooltipPane"),this.createPane("popupPane"),this.options.markerZoomAnimation||(M(t.markerPane,"leaflet-zoom-hide"),M(t.shadowPane,"leaflet-zoom-hide"))},_resetView:function(t,e,i){Z(this._mapPane,new p(0,0));var n=!this._loaded,o=(this._loaded=!0,e=this._limitZoom(e),this.fire("viewprereset"),this._zoom!==e);this._moveStart(o,i)._move(t,e)._moveEnd(o),this.fire("viewreset"),n&&this.fire("load")},_moveStart:function(t,e){return t&&this.fire("zoomstart"),e||this.fire("movestart"),this},_move:function(t,e,i,n){void 0===e&&(e=this._zoom);var o=this._zoom!==e;return this._zoom=e,this._lastCenter=t,this._pixelOrigin=this._getNewPixelOrigin(t),n?i&&i.pinch&&this.fire("zoom",i):((o||i&&i.pinch)&&this.fire("zoom",i),this.fire("move",i)),this},_moveEnd:function(t){return t&&this.fire("zoomend"),this.fire("moveend")},_stop:function(){return r(this._flyToFrame),this._panAnim&&this._panAnim.stop(),this},_rawPanBy:function(t){Z(this._mapPane,this._getMapPanePos().subtract(t))},_getZoomSpan:function(){return this.getMaxZoom()-this.getMinZoom()},_panInsideMaxBounds:function(){this._enforcingBounds||this.panInsideBounds(this.options.maxBounds)},_checkIfLoaded:function(){if(!this._loaded)throw new Error("Set map center and zoom first.")},_initEvents:function(t){this._targets={};var e=t?k:S;e((this._targets[h(this._container)]=this)._container,"click dblclick mousedown mouseup mouseover mouseout mousemove contextmenu keypress keydown keyup",this._handleDOMEvent,this),this.options.trackResize&&e(window,"resize",this._onResize,this),b.any3d&&this.options.transform3DLimit&&(t?this.off:this.on).call(this,"moveend",this._onMoveEnd)},_onResize:function(){r(this._resizeRequest),this._resizeRequest=x(function(){this.invalidateSize({debounceMoveend:!0})},this)},_onScroll:function(){this._container.scrollTop=0,this._container.scrollLeft=0},_onMoveEnd:function(){var t=this._getMapPanePos();Math.max(Math.abs(t.x),Math.abs(t.y))>=this.options.transform3DLimit&&this._resetView(this.getCenter(),this.getZoom())},_findEventTargets:function(t,e){for(var i,n=[],o="mouseout"===e||"mouseover"===e,s=t.target||t.srcElement,r=!1;s;){if((i=this._targets[h(s)])&&("click"===e||"preclick"===e)&&this._draggableMoved(i)){r=!0;break}if(i&&i.listens(e,!0)){if(o&&!We(s,t))break;if(n.push(i),o)break}if(s===this._container)break;s=s.parentNode}return n=n.length||r||o||!this.listens(e,!0)?n:[this]},_isClickDisabled:function(t){for(;t&&t!==this._container;){if(t._leaflet_disable_click)return!0;t=t.parentNode}},_handleDOMEvent:function(t){var e,i=t.target||t.srcElement;!this._loaded||i._leaflet_disable_events||"click"===t.type&&this._isClickDisabled(i)||("mousedown"===(e=t.type)&&Me(i),this._fireDOMEvent(t,e))},_mouseEvents:["click","dblclick","mouseover","mouseout","contextmenu"],_fireDOMEvent:function(t,e,i){"click"===t.type&&((a=l({},t)).type="preclick",this._fireDOMEvent(a,a.type,i));var n=this._findEventTargets(t,e);if(i){for(var o=[],s=0;s<i.length;s++)i[s].listens(e,!0)&&o.push(i[s]);n=o.concat(n)}if(n.length){"contextmenu"===e&&O(t);var r,a=n[0],h={originalEvent:t};for("keypress"!==t.type&&"keydown"!==t.type&&"keyup"!==t.type&&(r=a.getLatLng&&(!a._radius||a._radius<=10),h.containerPoint=r?this.latLngToContainerPoint(a.getLatLng()):this.mouseEventToContainerPoint(t),h.layerPoint=this.containerPointToLayerPoint(h.containerPoint),h.latlng=r?a.getLatLng():this.layerPointToLatLng(h.layerPoint)),s=0;s<n.length;s++)if(n[s].fire(e,h,!0),h.originalEvent._stopped||!1===n[s].options.bubblingMouseEvents&&-1!==G(this._mouseEvents,e))return}},_draggableMoved:function(t){return(t=t.dragging&&t.dragging.enabled()?t:this).dragging&&t.dragging.moved()||this.boxZoom&&this.boxZoom.moved()},_clearHandlers:function(){for(var t=0,e=this._handlers.length;t<e;t++)this._handlers[t].disable()},whenReady:function(t,e){return this._loaded?t.call(e||this,{target:this}):this.on("load",t,e),this},_getMapPanePos:function(){return Pe(this._mapPane)||new p(0,0)},_moved:function(){var t=this._getMapPanePos();return t&&!t.equals([0,0])},_getTopLeftPoint:function(t,e){return(t&&void 0!==e?this._getNewPixelOrigin(t,e):this.getPixelOrigin()).subtract(this._getMapPanePos())},_getNewPixelOrigin:function(t,e){var i=this.getSize()._divideBy(2);return this.project(t,e)._subtract(i)._add(this._getMapPanePos())._round()},_latLngToNewLayerPoint:function(t,e,i){i=this._getNewPixelOrigin(i,e);return this.project(t,e)._subtract(i)},_latLngBoundsToNewLayerBounds:function(t,e,i){i=this._getNewPixelOrigin(i,e);return _([this.project(t.getSouthWest(),e)._subtract(i),this.project(t.getNorthWest(),e)._subtract(i),this.project(t.getSouthEast(),e)._subtract(i),this.project(t.getNorthEast(),e)._subtract(i)])},_getCenterLayerPoint:function(){return this.containerPointToLayerPoint(this.getSize()._divideBy(2))},_getCenterOffset:function(t){return this.latLngToLayerPoint(t).subtract(this._getCenterLayerPoint())},_limitCenter:function(t,e,i){var n,o;return!i||(n=this.project(t,e),o=this.getSize().divideBy(2),o=new f(n.subtract(o),n.add(o)),o=this._getBoundsOffset(o,i,e),Math.abs(o.x)<=1&&Math.abs(o.y)<=1)?t:this.unproject(n.add(o),e)},_limitOffset:function(t,e){var i;return e?(i=new f((i=this.getPixelBounds()).min.add(t),i.max.add(t)),t.add(this._getBoundsOffset(i,e))):t},_getBoundsOffset:function(t,e,i){e=_(this.project(e.getNorthEast(),i),this.project(e.getSouthWest(),i)),i=e.min.subtract(t.min),e=e.max.subtract(t.max);return new p(this._rebound(i.x,-e.x),this._rebound(i.y,-e.y))},_rebound:function(t,e){return 0<t+e?Math.round(t-e)/2:Math.max(0,Math.ceil(t))-Math.max(0,Math.floor(e))},_limitZoom:function(t){var e=this.getMinZoom(),i=this.getMaxZoom(),n=b.any3d?this.options.zoomSnap:1;return n&&(t=Math.round(t/n)*n),Math.max(e,Math.min(i,t))},_onPanTransitionStep:function(){this.fire("move")},_onPanTransitionEnd:function(){z(this._mapPane,"leaflet-pan-anim"),this.fire("moveend")},_tryAnimatedPan:function(t,e){t=this._getCenterOffset(t)._trunc();return!(!0!==(e&&e.animate)&&!this.getSize().contains(t))&&(this.panBy(t,e),!0)},_createAnimProxy:function(){var t=this._proxy=P("div","leaflet-proxy leaflet-zoom-animated");this._panes.mapPane.appendChild(t),this.on("zoomanim",function(t){var e=ue,i=this._proxy.style[e];be(this._proxy,this.project(t.center,t.zoom),this.getZoomScale(t.zoom,1)),i===this._proxy.style[e]&&this._animatingZoom&&this._onZoomTransitionEnd()},this),this.on("load moveend",this._animMoveEnd,this),this._on("unload",this._destroyAnimProxy,this)},_destroyAnimProxy:function(){T(this._proxy),this.off("load moveend",this._animMoveEnd,this),delete this._proxy},_animMoveEnd:function(){var t=this.getCenter(),e=this.getZoom();be(this._proxy,this.project(t,e),this.getZoomScale(e,1))},_catchTransitionEnd:function(t){this._animatingZoom&&0<=t.propertyName.indexOf("transform")&&this._onZoomTransitionEnd()},_nothingToAnimate:function(){return!this._container.getElementsByClassName("leaflet-zoom-animated").length},_tryAnimatedZoom:function(t,e,i){if(!this._animatingZoom){if(i=i||{},!this._zoomAnimated||!1===i.animate||this._nothingToAnimate()||Math.abs(e-this._zoom)>this.options.zoomAnimationThreshold)return!1;var n=this.getZoomScale(e),n=this._getCenterOffset(t)._divideBy(1-1/n);if(!0!==i.animate&&!this.getSize().contains(n))return!1;x(function(){this._moveStart(!0,i.noMoveStart||!1)._animateZoom(t,e,!0)},this)}return!0},_animateZoom:function(t,e,i,n){this._mapPane&&(i&&(this._animatingZoom=!0,this._animateToCenter=t,this._animateToZoom=e,M(this._mapPane,"leaflet-zoom-anim")),this.fire("zoomanim",{center:t,zoom:e,noUpdate:n}),this._tempFireZoomEvent||(this._tempFireZoomEvent=this._zoom!==this._animateToZoom),this._move(this._animateToCenter,this._animateToZoom,void 0,!0),setTimeout(a(this._onZoomTransitionEnd,this),250))},_onZoomTransitionEnd:function(){this._animatingZoom&&(this._mapPane&&z(this._mapPane,"leaflet-zoom-anim"),this._animatingZoom=!1,this._move(this._animateToCenter,this._animateToZoom,void 0,!0),this._tempFireZoomEvent&&this.fire("zoom"),delete this._tempFireZoomEvent,this.fire("move"),this._moveEnd(!0))}});function Ue(t){return new B(t)}var B=et.extend({options:{position:"topright"},initialize:function(t){c(this,t)},getPosition:function(){return this.options.position},setPosition:function(t){var e=this._map;return e&&e.removeControl(this),this.options.position=t,e&&e.addControl(this),this},getContainer:function(){return this._container},addTo:function(t){this.remove(),this._map=t;var e=this._container=this.onAdd(t),i=this.getPosition(),t=t._controlCorners[i];return M(e,"leaflet-control"),-1!==i.indexOf("bottom")?t.insertBefore(e,t.firstChild):t.appendChild(e),this._map.on("unload",this.remove,this),this},remove:function(){return this._map&&(T(this._container),this.onRemove&&this.onRemove(this._map),this._map.off("unload",this.remove,this),this._map=null),this},_refocusOnMap:function(t){this._map&&t&&0<t.screenX&&0<t.screenY&&this._map.getContainer().focus()}}),Ve=(A.include({addControl:function(t){return t.addTo(this),this},removeControl:function(t){return t.remove(),this},_initControlPos:function(){var i=this._controlCorners={},n="leaflet-",o=this._controlContainer=P("div",n+"control-container",this._container);function t(t,e){i[t+e]=P("div",n+t+" "+n+e,o)}t("top","left"),t("top","right"),t("bottom","left"),t("bottom","right")},_clearControlPos:function(){for(var t in this._controlCorners)T(this._controlCorners[t]);T(this._controlContainer),delete this._controlCorners,delete this._controlContainer}}),B.extend({options:{collapsed:!0,position:"topright",autoZIndex:!0,hideSingleBase:!1,sortLayers:!1,sortFunction:function(t,e,i,n){return i<n?-1:n<i?1:0}},initialize:function(t,e,i){for(var n in c(this,i),this._layerControlInputs=[],this._layers=[],this._lastZIndex=0,this._handlingClick=!1,this._preventClick=!1,t)this._addLayer(t[n],n);for(n in e)this._addLayer(e[n],n,!0)},onAdd:function(t){this._initLayout(),this._update(),(this._map=t).on("zoomend",this._checkDisabledLayers,this);for(var e=0;e<this._layers.length;e++)this._layers[e].layer.on("add remove",this._onLayerChange,this);return this._container},addTo:function(t){return B.prototype.addTo.call(this,t),this._expandIfNotCollapsed()},onRemove:function(){this._map.off("zoomend",this._checkDisabledLayers,this);for(var t=0;t<this._layers.length;t++)this._layers[t].layer.off("add remove",this._onLayerChange,this)},addBaseLayer:function(t,e){return this._addLayer(t,e),this._map?this._update():this},addOverlay:function(t,e){return this._addLayer(t,e,!0),this._map?this._update():this},removeLayer:function(t){t.off("add remove",this._onLayerChange,this);t=this._getLayer(h(t));return t&&this._layers.splice(this._layers.indexOf(t),1),this._map?this._update():this},expand:function(){M(this._container,"leaflet-control-layers-expanded"),this._section.style.height=null;var t=this._map.getSize().y-(this._container.offsetTop+50);return t<this._section.clientHeight?(M(this._section,"leaflet-control-layers-scrollbar"),this._section.style.height=t+"px"):z(this._section,"leaflet-control-layers-scrollbar"),this._checkDisabledLayers(),this},collapse:function(){return z(this._container,"leaflet-control-layers-expanded"),this},_initLayout:function(){var t="leaflet-control-layers",e=this._container=P("div",t),i=this.options.collapsed,n=(e.setAttribute("aria-haspopup",!0),Ie(e),Be(e),this._section=P("section",t+"-list")),o=(i&&(this._map.on("click",this.collapse,this),S(e,{mouseenter:this._expandSafely,mouseleave:this.collapse},this)),this._layersLink=P("a",t+"-toggle",e));o.href="#",o.title="Layers",o.setAttribute("role","button"),S(o,{keydown:function(t){13===t.keyCode&&this._expandSafely()},click:function(t){O(t),this._expandSafely()}},this),i||this.expand(),this._baseLayersList=P("div",t+"-base",n),this._separator=P("div",t+"-separator",n),this._overlaysList=P("div",t+"-overlays",n),e.appendChild(n)},_getLayer:function(t){for(var e=0;e<this._layers.length;e++)if(this._layers[e]&&h(this._layers[e].layer)===t)return this._layers[e]},_addLayer:function(t,e,i){this._map&&t.on("add remove",this._onLayerChange,this),this._layers.push({layer:t,name:e,overlay:i}),this.options.sortLayers&&this._layers.sort(a(function(t,e){return this.options.sortFunction(t.layer,e.layer,t.name,e.name)},this)),this.options.autoZIndex&&t.setZIndex&&(this._lastZIndex++,t.setZIndex(this._lastZIndex)),this._expandIfNotCollapsed()},_update:function(){if(this._container){me(this._baseLayersList),me(this._overlaysList),this._layerControlInputs=[];for(var t,e,i,n=0,o=0;o<this._layers.length;o++)i=this._layers[o],this._addItem(i),e=e||i.overlay,t=t||!i.overlay,n+=i.overlay?0:1;this.options.hideSingleBase&&(this._baseLayersList.style.display=(t=t&&1<n)?"":"none"),this._separator.style.display=e&&t?"":"none"}return this},_onLayerChange:function(t){this._handlingClick||this._update();var e=this._getLayer(h(t.target)),t=e.overlay?"add"===t.type?"overlayadd":"overlayremove":"add"===t.type?"baselayerchange":null;t&&this._map.fire(t,e)},_createRadioElement:function(t,e){t='<input type="radio" class="leaflet-control-layers-selector" name="'+t+'"'+(e?' checked="checked"':"")+"/>",e=document.createElement("div");return e.innerHTML=t,e.firstChild},_addItem:function(t){var e,i=document.createElement("label"),n=this._map.hasLayer(t.layer),n=(t.overlay?((e=document.createElement("input")).type="checkbox",e.className="leaflet-control-layers-selector",e.defaultChecked=n):e=this._createRadioElement("leaflet-base-layers_"+h(this),n),this._layerControlInputs.push(e),e.layerId=h(t.layer),S(e,"click",this._onInputClick,this),document.createElement("span")),o=(n.innerHTML=" "+t.name,document.createElement("span"));return i.appendChild(o),o.appendChild(e),o.appendChild(n),(t.overlay?this._overlaysList:this._baseLayersList).appendChild(i),this._checkDisabledLayers(),i},_onInputClick:function(){if(!this._preventClick){var t,e,i=this._layerControlInputs,n=[],o=[];this._handlingClick=!0;for(var s=i.length-1;0<=s;s--)t=i[s],e=this._getLayer(t.layerId).layer,t.checked?n.push(e):t.checked||o.push(e);for(s=0;s<o.length;s++)this._map.hasLayer(o[s])&&this._map.removeLayer(o[s]);for(s=0;s<n.length;s++)this._map.hasLayer(n[s])||this._map.addLayer(n[s]);this._handlingClick=!1,this._refocusOnMap()}},_checkDisabledLayers:function(){for(var t,e,i=this._layerControlInputs,n=this._map.getZoom(),o=i.length-1;0<=o;o--)t=i[o],e=this._getLayer(t.layerId).layer,t.disabled=void 0!==e.options.minZoom&&n<e.options.minZoom||void 0!==e.options.maxZoom&&n>e.options.maxZoom},_expandIfNotCollapsed:function(){return this._map&&!this.options.collapsed&&this.expand(),this},_expandSafely:function(){var t=this._section,e=(this._preventClick=!0,S(t,"click",O),this.expand(),this);setTimeout(function(){k(t,"click",O),e._preventClick=!1})}})),qe=B.extend({options:{position:"topleft",zoomInText:'<span aria-hidden="true">+</span>',zoomInTitle:"Zoom in",zoomOutText:'<span aria-hidden="true">&#x2212;</span>',zoomOutTitle:"Zoom out"},onAdd:function(t){var e="leaflet-control-zoom",i=P("div",e+" leaflet-bar"),n=this.options;return this._zoomInButton=this._createButton(n.zoomInText,n.zoomInTitle,e+"-in",i,this._zoomIn),this._zoomOutButton=this._createButton(n.zoomOutText,n.zoomOutTitle,e+"-out",i,this._zoomOut),this._updateDisabled(),t.on("zoomend zoomlevelschange",this._updateDisabled,this),i},onRemove:function(t){t.off("zoomend zoomlevelschange",this._updateDisabled,this)},disable:function(){return this._disabled=!0,this._updateDisabled(),this},enable:function(){return this._disabled=!1,this._updateDisabled(),this},_zoomIn:function(t){!this._disabled&&this._map._zoom<this._map.getMaxZoom()&&this._map.zoomIn(this._map.options.zoomDelta*(t.shiftKey?3:1))},_zoomOut:function(t){!this._disabled&&this._map._zoom>this._map.getMinZoom()&&this._map.zoomOut(this._map.options.zoomDelta*(t.shiftKey?3:1))},_createButton:function(t,e,i,n,o){i=P("a",i,n);return i.innerHTML=t,i.href="#",i.title=e,i.setAttribute("role","button"),i.setAttribute("aria-label",e),Ie(i),S(i,"click",Re),S(i,"click",o,this),S(i,"click",this._refocusOnMap,this),i},_updateDisabled:function(){var t=this._map,e="leaflet-disabled";z(this._zoomInButton,e),z(this._zoomOutButton,e),this._zoomInButton.setAttribute("aria-disabled","false"),this._zoomOutButton.setAttribute("aria-disabled","false"),!this._disabled&&t._zoom!==t.getMinZoom()||(M(this._zoomOutButton,e),this._zoomOutButton.setAttribute("aria-disabled","true")),!this._disabled&&t._zoom!==t.getMaxZoom()||(M(this._zoomInButton,e),this._zoomInButton.setAttribute("aria-disabled","true"))}}),Ge=(A.mergeOptions({zoomControl:!0}),A.addInitHook(function(){this.options.zoomControl&&(this.zoomControl=new qe,this.addControl(this.zoomControl))}),B.extend({options:{position:"bottomleft",maxWidth:100,metric:!0,imperial:!0},onAdd:function(t){var e="leaflet-control-scale",i=P("div",e),n=this.options;return this._addScales(n,e+"-line",i),t.on(n.updateWhenIdle?"moveend":"move",this._update,this),t.whenReady(this._update,this),i},onRemove:function(t){t.off(this.options.updateWhenIdle?"moveend":"move",this._update,this)},_addScales:function(t,e,i){t.metric&&(this._mScale=P("div",e,i)),t.imperial&&(this._iScale=P("div",e,i))},_update:function(){var t=this._map,e=t.getSize().y/2,t=t.distance(t.containerPointToLatLng([0,e]),t.containerPointToLatLng([this.options.maxWidth,e]));this._updateScales(t)},_updateScales:function(t){this.options.metric&&t&&this._updateMetric(t),this.options.imperial&&t&&this._updateImperial(t)},_updateMetric:function(t){var e=this._getRoundNum(t);this._updateScale(this._mScale,e<1e3?e+" m":e/1e3+" km",e/t)},_updateImperial:function(t){var e,i,t=3.2808399*t;5280<t?(i=this._getRoundNum(e=t/5280),this._updateScale(this._iScale,i+" mi",i/e)):(i=this._getRoundNum(t),this._updateScale(this._iScale,i+" ft",i/t))},_updateScale:function(t,e,i){t.style.width=Math.round(this.options.maxWidth*i)+"px",t.innerHTML=e},_getRoundNum:function(t){var e=Math.pow(10,(Math.floor(t)+"").length-1),t=t/e;return e*(t=10<=t?10:5<=t?5:3<=t?3:2<=t?2:1)}})),Ke=B.extend({options:{position:"bottomright",prefix:'<a href="https://leafletjs.com" title="A JavaScript library for interactive maps">'+(b.inlineSvg?'<svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="12" height="8" viewBox="0 0 12 8" class="leaflet-attribution-flag"><path fill="#4C7BE1" d="M0 0h12v4H0z"/><path fill="#FFD500" d="M0 4h12v3H0z"/><path fill="#E0BC00" d="M0 7h12v1H0z"/></svg> ':"")+"Leaflet</a>"},initialize:function(t){c(this,t),this._attributions={}},onAdd:function(t){for(var e in(t.attributionControl=this)._container=P("div","leaflet-control-attribution"),Ie(this._container),t._layers)t._layers[e].getAttribution&&this.addAttribution(t._layers[e].getAttribution());return this._update(),t.on("layeradd",this._addAttribution,this),this._container},onRemove:function(t){t.off("layeradd",this._addAttribution,this)},_addAttribution:function(t){t.layer.getAttribution&&(this.addAttribution(t.layer.getAttribution()),t.layer.once("remove",function(){this.removeAttribution(t.layer.getAttribution())},this))},setPrefix:function(t){return this.options.prefix=t,this._update(),this},addAttribution:function(t){return t&&(this._attributions[t]||(this._attributions[t]=0),this._attributions[t]++,this._update()),this},removeAttribution:function(t){return t&&this._attributions[t]&&(this._attributions[t]--,this._update()),this},_update:function(){if(this._map){var t,e=[];for(t in this._attributions)this._attributions[t]&&e.push(t);var i=[];this.options.prefix&&i.push(this.options.prefix),e.length&&i.push(e.join(", ")),this._container.innerHTML=i.join(' <span aria-hidden="true">|</span> ')}}}),n=(A.mergeOptions({attributionControl:!0}),A.addInitHook(function(){this.options.attributionControl&&(new Ke).addTo(this)}),B.Layers=Ve,B.Zoom=qe,B.Scale=Ge,B.Attribution=Ke,Ue.layers=function(t,e,i){return new Ve(t,e,i)},Ue.zoom=function(t){return new qe(t)},Ue.scale=function(t){return new Ge(t)},Ue.attribution=function(t){return new Ke(t)},et.extend({initialize:function(t){this._map=t},enable:function(){return this._enabled||(this._enabled=!0,this.addHooks()),this},disable:function(){return this._enabled&&(this._enabled=!1,this.removeHooks()),this},enabled:function(){return!!this._enabled}})),ft=(n.addTo=function(t,e){return t.addHandler(e,this),this},{Events:e}),Ye=b.touch?"touchstart mousedown":"mousedown",Xe=it.extend({options:{clickTolerance:3},initialize:function(t,e,i,n){c(this,n),this._element=t,this._dragStartTarget=e||t,this._preventOutline=i},enable:function(){this._enabled||(S(this._dragStartTarget,Ye,this._onDown,this),this._enabled=!0)},disable:function(){this._enabled&&(Xe._dragging===this&&this.finishDrag(!0),k(this._dragStartTarget,Ye,this._onDown,this),this._enabled=!1,this._moved=!1)},_onDown:function(t){var e,i;this._enabled&&(this._moved=!1,ve(this._element,"leaflet-zoom-anim")||(t.touches&&1!==t.touches.length?Xe._dragging===this&&this.finishDrag():Xe._dragging||t.shiftKey||1!==t.which&&1!==t.button&&!t.touches||((Xe._dragging=this)._preventOutline&&Me(this._element),Le(),re(),this._moving||(this.fire("down"),i=t.touches?t.touches[0]:t,e=Ce(this._element),this._startPoint=new p(i.clientX,i.clientY),this._startPos=Pe(this._element),this._parentScale=Ze(e),i="mousedown"===t.type,S(document,i?"mousemove":"touchmove",this._onMove,this),S(document,i?"mouseup":"touchend touchcancel",this._onUp,this)))))},_onMove:function(t){var e;this._enabled&&(t.touches&&1<t.touches.length?this._moved=!0:!(e=new p((e=t.touches&&1===t.touches.length?t.touches[0]:t).clientX,e.clientY)._subtract(this._startPoint)).x&&!e.y||Math.abs(e.x)+Math.abs(e.y)<this.options.clickTolerance||(e.x/=this._parentScale.x,e.y/=this._parentScale.y,O(t),this._moved||(this.fire("dragstart"),this._moved=!0,M(document.body,"leaflet-dragging"),this._lastTarget=t.target||t.srcElement,window.SVGElementInstance&&this._lastTarget instanceof window.SVGElementInstance&&(this._lastTarget=this._lastTarget.correspondingUseElement),M(this._lastTarget,"leaflet-drag-target")),this._newPos=this._startPos.add(e),this._moving=!0,this._lastEvent=t,this._updatePosition()))},_updatePosition:function(){var t={originalEvent:this._lastEvent};this.fire("predrag",t),Z(this._element,this._newPos),this.fire("drag",t)},_onUp:function(){this._enabled&&this.finishDrag()},finishDrag:function(t){z(document.body,"leaflet-dragging"),this._lastTarget&&(z(this._lastTarget,"leaflet-drag-target"),this._lastTarget=null),k(document,"mousemove touchmove",this._onMove,this),k(document,"mouseup touchend touchcancel",this._onUp,this),Te(),ae();var e=this._moved&&this._moving;this._moving=!1,Xe._dragging=!1,e&&this.fire("dragend",{noInertia:t,distance:this._newPos.distanceTo(this._startPos)})}});function Je(t,e,i){for(var n,o,s,r,a,h,l,u=[1,4,2,8],c=0,d=t.length;c<d;c++)t[c]._code=si(t[c],e);for(s=0;s<4;s++){for(h=u[s],n=[],c=0,o=(d=t.length)-1;c<d;o=c++)r=t[c],a=t[o],r._code&h?a._code&h||((l=oi(a,r,h,e,i))._code=si(l,e),n.push(l)):(a._code&h&&((l=oi(a,r,h,e,i))._code=si(l,e),n.push(l)),n.push(r));t=n}return t}function $e(t,e){var i,n,o,s,r,a,h;if(!t||0===t.length)throw new Error("latlngs not passed");I(t)||(console.warn("latlngs are not flat! Only the first ring will be used"),t=t[0]);for(var l=w([0,0]),u=g(t),c=(u.getNorthWest().distanceTo(u.getSouthWest())*u.getNorthEast().distanceTo(u.getNorthWest())<1700&&(l=Qe(t)),t.length),d=[],_=0;_<c;_++){var p=w(t[_]);d.push(e.project(w([p.lat-l.lat,p.lng-l.lng])))}for(_=r=a=h=0,i=c-1;_<c;i=_++)n=d[_],o=d[i],s=n.y*o.x-o.y*n.x,a+=(n.x+o.x)*s,h+=(n.y+o.y)*s,r+=3*s;u=0===r?d[0]:[a/r,h/r],u=e.unproject(m(u));return w([u.lat+l.lat,u.lng+l.lng])}function Qe(t){for(var e=0,i=0,n=0,o=0;o<t.length;o++){var s=w(t[o]);e+=s.lat,i+=s.lng,n++}return w([e/n,i/n])}var ti,gt={__proto__:null,clipPolygon:Je,polygonCenter:$e,centroid:Qe};function ei(t,e){if(e&&t.length){var i=t=function(t,e){for(var i=[t[0]],n=1,o=0,s=t.length;n<s;n++)(function(t,e){var i=e.x-t.x,e=e.y-t.y;return i*i+e*e})(t[n],t[o])>e&&(i.push(t[n]),o=n);o<s-1&&i.push(t[s-1]);return i}(t,e=e*e),n=i.length,o=new(typeof Uint8Array!=void 0+""?Uint8Array:Array)(n);o[0]=o[n-1]=1,function t(e,i,n,o,s){var r,a,h,l=0;for(a=o+1;a<=s-1;a++)h=ri(e[a],e[o],e[s],!0),l<h&&(r=a,l=h);n<l&&(i[r]=1,t(e,i,n,o,r),t(e,i,n,r,s))}(i,o,e,0,n-1);var s,r=[];for(s=0;s<n;s++)o[s]&&r.push(i[s]);return r}return t.slice()}function ii(t,e,i){return Math.sqrt(ri(t,e,i,!0))}function ni(t,e,i,n,o){var s,r,a,h=n?ti:si(t,i),l=si(e,i);for(ti=l;;){if(!(h|l))return[t,e];if(h&l)return!1;a=si(r=oi(t,e,s=h||l,i,o),i),s===h?(t=r,h=a):(e=r,l=a)}}function oi(t,e,i,n,o){var s,r,a=e.x-t.x,e=e.y-t.y,h=n.min,n=n.max;return 8&i?(s=t.x+a*(n.y-t.y)/e,r=n.y):4&i?(s=t.x+a*(h.y-t.y)/e,r=h.y):2&i?(s=n.x,r=t.y+e*(n.x-t.x)/a):1&i&&(s=h.x,r=t.y+e*(h.x-t.x)/a),new p(s,r,o)}function si(t,e){var i=0;return t.x<e.min.x?i|=1:t.x>e.max.x&&(i|=2),t.y<e.min.y?i|=4:t.y>e.max.y&&(i|=8),i}function ri(t,e,i,n){var o=e.x,e=e.y,s=i.x-o,r=i.y-e,a=s*s+r*r;return 0<a&&(1<(a=((t.x-o)*s+(t.y-e)*r)/a)?(o=i.x,e=i.y):0<a&&(o+=s*a,e+=r*a)),s=t.x-o,r=t.y-e,n?s*s+r*r:new p(o,e)}function I(t){return!d(t[0])||"object"!=typeof t[0][0]&&void 0!==t[0][0]}function ai(t){return console.warn("Deprecated use of _flat, please use L.LineUtil.isFlat instead."),I(t)}function hi(t,e){var i,n,o,s,r,a;if(!t||0===t.length)throw new Error("latlngs not passed");I(t)||(console.warn("latlngs are not flat! Only the first ring will be used"),t=t[0]);for(var h=w([0,0]),l=g(t),u=(l.getNorthWest().distanceTo(l.getSouthWest())*l.getNorthEast().distanceTo(l.getNorthWest())<1700&&(h=Qe(t)),t.length),c=[],d=0;d<u;d++){var _=w(t[d]);c.push(e.project(w([_.lat-h.lat,_.lng-h.lng])))}for(i=d=0;d<u-1;d++)i+=c[d].distanceTo(c[d+1])/2;if(0===i)a=c[0];else for(n=d=0;d<u-1;d++)if(o=c[d],s=c[d+1],i<(n+=r=o.distanceTo(s))){a=[s.x-(r=(n-i)/r)*(s.x-o.x),s.y-r*(s.y-o.y)];break}l=e.unproject(m(a));return w([l.lat+h.lat,l.lng+h.lng])}var vt={__proto__:null,simplify:ei,pointToSegmentDistance:ii,closestPointOnSegment:function(t,e,i){return ri(t,e,i)},clipSegment:ni,_getEdgeIntersection:oi,_getBitCode:si,_sqClosestPointOnSegment:ri,isFlat:I,_flat:ai,polylineCenter:hi},yt={project:function(t){return new p(t.lng,t.lat)},unproject:function(t){return new v(t.y,t.x)},bounds:new f([-180,-90],[180,90])},xt={R:6378137,R_MINOR:6356752.314245179,bounds:new f([-20037508.34279,-15496570.73972],[20037508.34279,18764656.23138]),project:function(t){var e=Math.PI/180,i=this.R,n=t.lat*e,o=this.R_MINOR/i,o=Math.sqrt(1-o*o),s=o*Math.sin(n),s=Math.tan(Math.PI/4-n/2)/Math.pow((1-s)/(1+s),o/2),n=-i*Math.log(Math.max(s,1e-10));return new p(t.lng*e*i,n)},unproject:function(t){for(var e,i=180/Math.PI,n=this.R,o=this.R_MINOR/n,s=Math.sqrt(1-o*o),r=Math.exp(-t.y/n),a=Math.PI/2-2*Math.atan(r),h=0,l=.1;h<15&&1e-7<Math.abs(l);h++)e=s*Math.sin(a),e=Math.pow((1-e)/(1+e),s/2),a+=l=Math.PI/2-2*Math.atan(r*e)-a;return new v(a*i,t.x*i/n)}},wt={__proto__:null,LonLat:yt,Mercator:xt,SphericalMercator:rt},Pt=l({},st,{code:"EPSG:3395",projection:xt,transformation:ht(bt=.5/(Math.PI*xt.R),.5,-bt,.5)}),li=l({},st,{code:"EPSG:4326",projection:yt,transformation:ht(1/180,1,-1/180,.5)}),Lt=l({},ot,{projection:yt,transformation:ht(1,0,-1,0),scale:function(t){return Math.pow(2,t)},zoom:function(t){return Math.log(t)/Math.LN2},distance:function(t,e){var i=e.lng-t.lng,e=e.lat-t.lat;return Math.sqrt(i*i+e*e)},infinite:!0}),o=(ot.Earth=st,ot.EPSG3395=Pt,ot.EPSG3857=lt,ot.EPSG900913=ut,ot.EPSG4326=li,ot.Simple=Lt,it.extend({options:{pane:"overlayPane",attribution:null,bubblingMouseEvents:!0},addTo:function(t){return t.addLayer(this),this},remove:function(){return this.removeFrom(this._map||this._mapToAdd)},removeFrom:function(t){return t&&t.removeLayer(this),this},getPane:function(t){return this._map.getPane(t?this.options[t]||t:this.options.pane)},addInteractiveTarget:function(t){return this._map._targets[h(t)]=this},removeInteractiveTarget:function(t){return delete this._map._targets[h(t)],this},getAttribution:function(){return this.options.attribution},_layerAdd:function(t){var e,i=t.target;i.hasLayer(this)&&(this._map=i,this._zoomAnimated=i._zoomAnimated,this.getEvents&&(e=this.getEvents(),i.on(e,this),this.once("remove",function(){i.off(e,this)},this)),this.onAdd(i),this.fire("add"),i.fire("layeradd",{layer:this}))}})),ui=(A.include({addLayer:function(t){var e;if(t._layerAdd)return e=h(t),this._layers[e]||((this._layers[e]=t)._mapToAdd=this,t.beforeAdd&&t.beforeAdd(this),this.whenReady(t._layerAdd,t)),this;throw new Error("The provided object is not a Layer.")},removeLayer:function(t){var e=h(t);return this._layers[e]&&(this._loaded&&t.onRemove(this),delete this._layers[e],this._loaded&&(this.fire("layerremove",{layer:t}),t.fire("remove")),t._map=t._mapToAdd=null),this},hasLayer:function(t){return h(t)in this._layers},eachLayer:function(t,e){for(var i in this._layers)t.call(e,this._layers[i]);return this},_addLayers:function(t){for(var e=0,i=(t=t?d(t)?t:[t]:[]).length;e<i;e++)this.addLayer(t[e])},_addZoomLimit:function(t){isNaN(t.options.maxZoom)&&isNaN(t.options.minZoom)||(this._zoomBoundLayers[h(t)]=t,this._updateZoomLevels())},_removeZoomLimit:function(t){t=h(t);this._zoomBoundLayers[t]&&(delete this._zoomBoundLayers[t],this._updateZoomLevels())},_updateZoomLevels:function(){var t,e=1/0,i=-1/0,n=this._getZoomSpan();for(t in this._zoomBoundLayers)var o=this._zoomBoundLayers[t].options,e=void 0===o.minZoom?e:Math.min(e,o.minZoom),i=void 0===o.maxZoom?i:Math.max(i,o.maxZoom);this._layersMaxZoom=i===-1/0?void 0:i,this._layersMinZoom=e===1/0?void 0:e,n!==this._getZoomSpan()&&this.fire("zoomlevelschange"),void 0===this.options.maxZoom&&this._layersMaxZoom&&this.getZoom()>this._layersMaxZoom&&this.setZoom(this._layersMaxZoom),void 0===this.options.minZoom&&this._layersMinZoom&&this.getZoom()<this._layersMinZoom&&this.setZoom(this._layersMinZoom)}}),o.extend({initialize:function(t,e){var i,n;if(c(this,e),this._layers={},t)for(i=0,n=t.length;i<n;i++)this.addLayer(t[i])},addLayer:function(t){var e=this.getLayerId(t);return this._layers[e]=t,this._map&&this._map.addLayer(t),this},removeLayer:function(t){t=t in this._layers?t:this.getLayerId(t);return this._map&&this._layers[t]&&this._map.removeLayer(this._layers[t]),delete this._layers[t],this},hasLayer:function(t){return("number"==typeof t?t:this.getLayerId(t))in this._layers},clearLayers:function(){return this.eachLayer(this.removeLayer,this)},invoke:function(t){var e,i,n=Array.prototype.slice.call(arguments,1);for(e in this._layers)(i=this._layers[e])[t]&&i[t].apply(i,n);return this},onAdd:function(t){this.eachLayer(t.addLayer,t)},onRemove:function(t){this.eachLayer(t.removeLayer,t)},eachLayer:function(t,e){for(var i in this._layers)t.call(e,this._layers[i]);return this},getLayer:function(t){return this._layers[t]},getLayers:function(){var t=[];return this.eachLayer(t.push,t),t},setZIndex:function(t){return this.invoke("setZIndex",t)},getLayerId:h})),ci=ui.extend({addLayer:function(t){return this.hasLayer(t)?this:(t.addEventParent(this),ui.prototype.addLayer.call(this,t),this.fire("layeradd",{layer:t}))},removeLayer:function(t){return this.hasLayer(t)?((t=t in this._layers?this._layers[t]:t).removeEventParent(this),ui.prototype.removeLayer.call(this,t),this.fire("layerremove",{layer:t})):this},setStyle:function(t){return this.invoke("setStyle",t)},bringToFront:function(){return this.invoke("bringToFront")},bringToBack:function(){return this.invoke("bringToBack")},getBounds:function(){var t,e=new s;for(t in this._layers){var i=this._layers[t];e.extend(i.getBounds?i.getBounds():i.getLatLng())}return e}}),di=et.extend({options:{popupAnchor:[0,0],tooltipAnchor:[0,0],crossOrigin:!1},initialize:function(t){c(this,t)},createIcon:function(t){return this._createIcon("icon",t)},createShadow:function(t){return this._createIcon("shadow",t)},_createIcon:function(t,e){var i=this._getIconUrl(t);if(i)return i=this._createImg(i,e&&"IMG"===e.tagName?e:null),this._setIconStyles(i,t),!this.options.crossOrigin&&""!==this.options.crossOrigin||(i.crossOrigin=!0===this.options.crossOrigin?"":this.options.crossOrigin),i;if("icon"===t)throw new Error("iconUrl not set in Icon options (see the docs).");return null},_setIconStyles:function(t,e){var i=this.options,n=i[e+"Size"],n=m(n="number"==typeof n?[n,n]:n),o=m("shadow"===e&&i.shadowAnchor||i.iconAnchor||n&&n.divideBy(2,!0));t.className="leaflet-marker-"+e+" "+(i.className||""),o&&(t.style.marginLeft=-o.x+"px",t.style.marginTop=-o.y+"px"),n&&(t.style.width=n.x+"px",t.style.height=n.y+"px")},_createImg:function(t,e){return(e=e||document.createElement("img")).src=t,e},_getIconUrl:function(t){return b.retina&&this.options[t+"RetinaUrl"]||this.options[t+"Url"]}});var _i=di.extend({options:{iconUrl:"marker-icon.png",iconRetinaUrl:"marker-icon-2x.png",shadowUrl:"marker-shadow.png",iconSize:[25,41],iconAnchor:[12,41],popupAnchor:[1,-34],tooltipAnchor:[16,-28],shadowSize:[41,41]},_getIconUrl:function(t){return"string"!=typeof _i.imagePath&&(_i.imagePath=this._detectIconPath()),(this.options.imagePath||_i.imagePath)+di.prototype._getIconUrl.call(this,t)},_stripUrl:function(t){function e(t,e,i){return(e=e.exec(t))&&e[i]}return(t=e(t,/^url\((['"])?(.+)\1\)$/,2))&&e(t,/^(.*)marker-icon\.png$/,1)},_detectIconPath:function(){var t=P("div","leaflet-default-icon-path",document.body),e=pe(t,"background-image")||pe(t,"backgroundImage");return document.body.removeChild(t),(e=this._stripUrl(e))?e:(t=document.querySelector('link[href$="leaflet.css"]'))?t.href.substring(0,t.href.length-"leaflet.css".length-1):""}}),pi=n.extend({initialize:function(t){this._marker=t},addHooks:function(){var t=this._marker._icon;this._draggable||(this._draggable=new Xe(t,t,!0)),this._draggable.on({dragstart:this._onDragStart,predrag:this._onPreDrag,drag:this._onDrag,dragend:this._onDragEnd},this).enable(),M(t,"leaflet-marker-draggable")},removeHooks:function(){this._draggable.off({dragstart:this._onDragStart,predrag:this._onPreDrag,drag:this._onDrag,dragend:this._onDragEnd},this).disable(),this._marker._icon&&z(this._marker._icon,"leaflet-marker-draggable")},moved:function(){return this._draggable&&this._draggable._moved},_adjustPan:function(t){var e=this._marker,i=e._map,n=this._marker.options.autoPanSpeed,o=this._marker.options.autoPanPadding,s=Pe(e._icon),r=i.getPixelBounds(),a=i.getPixelOrigin(),a=_(r.min._subtract(a).add(o),r.max._subtract(a).subtract(o));a.contains(s)||(o=m((Math.max(a.max.x,s.x)-a.max.x)/(r.max.x-a.max.x)-(Math.min(a.min.x,s.x)-a.min.x)/(r.min.x-a.min.x),(Math.max(a.max.y,s.y)-a.max.y)/(r.max.y-a.max.y)-(Math.min(a.min.y,s.y)-a.min.y)/(r.min.y-a.min.y)).multiplyBy(n),i.panBy(o,{animate:!1}),this._draggable._newPos._add(o),this._draggable._startPos._add(o),Z(e._icon,this._draggable._newPos),this._onDrag(t),this._panRequest=x(this._adjustPan.bind(this,t)))},_onDragStart:function(){this._oldLatLng=this._marker.getLatLng(),this._marker.closePopup&&this._marker.closePopup(),this._marker.fire("movestart").fire("dragstart")},_onPreDrag:function(t){this._marker.options.autoPan&&(r(this._panRequest),this._panRequest=x(this._adjustPan.bind(this,t)))},_onDrag:function(t){var e=this._marker,i=e._shadow,n=Pe(e._icon),o=e._map.layerPointToLatLng(n);i&&Z(i,n),e._latlng=o,t.latlng=o,t.oldLatLng=this._oldLatLng,e.fire("move",t).fire("drag",t)},_onDragEnd:function(t){r(this._panRequest),delete this._oldLatLng,this._marker.fire("moveend").fire("dragend",t)}}),mi=o.extend({options:{icon:new _i,interactive:!0,keyboard:!0,title:"",alt:"Marker",zIndexOffset:0,opacity:1,riseOnHover:!1,riseOffset:250,pane:"markerPane",shadowPane:"shadowPane",bubblingMouseEvents:!1,autoPanOnFocus:!0,draggable:!1,autoPan:!1,autoPanPadding:[50,50],autoPanSpeed:10},initialize:function(t,e){c(this,e),this._latlng=w(t)},onAdd:function(t){this._zoomAnimated=this._zoomAnimated&&t.options.markerZoomAnimation,this._zoomAnimated&&t.on("zoomanim",this._animateZoom,this),this._initIcon(),this.update()},onRemove:function(t){this.dragging&&this.dragging.enabled()&&(this.options.draggable=!0,this.dragging.removeHooks()),delete this.dragging,this._zoomAnimated&&t.off("zoomanim",this._animateZoom,this),this._removeIcon(),this._removeShadow()},getEvents:function(){return{zoom:this.update,viewreset:this.update}},getLatLng:function(){return this._latlng},setLatLng:function(t){var e=this._latlng;return this._latlng=w(t),this.update(),this.fire("move",{oldLatLng:e,latlng:this._latlng})},setZIndexOffset:function(t){return this.options.zIndexOffset=t,this.update()},getIcon:function(){return this.options.icon},setIcon:function(t){return this.options.icon=t,this._map&&(this._initIcon(),this.update()),this._popup&&this.bindPopup(this._popup,this._popup.options),this},getElement:function(){return this._icon},update:function(){var t;return this._icon&&this._map&&(t=this._map.latLngToLayerPoint(this._latlng).round(),this._setPos(t)),this},_initIcon:function(){var t=this.options,e="leaflet-zoom-"+(this._zoomAnimated?"animated":"hide"),i=t.icon.createIcon(this._icon),n=!1,i=(i!==this._icon&&(this._icon&&this._removeIcon(),n=!0,t.title&&(i.title=t.title),"IMG"===i.tagName&&(i.alt=t.alt||"")),M(i,e),t.keyboard&&(i.tabIndex="0",i.setAttribute("role","button")),this._icon=i,t.riseOnHover&&this.on({mouseover:this._bringToFront,mouseout:this._resetZIndex}),this.options.autoPanOnFocus&&S(i,"focus",this._panOnFocus,this),t.icon.createShadow(this._shadow)),o=!1;i!==this._shadow&&(this._removeShadow(),o=!0),i&&(M(i,e),i.alt=""),this._shadow=i,t.opacity<1&&this._updateOpacity(),n&&this.getPane().appendChild(this._icon),this._initInteraction(),i&&o&&this.getPane(t.shadowPane).appendChild(this._shadow)},_removeIcon:function(){this.options.riseOnHover&&this.off({mouseover:this._bringToFront,mouseout:this._resetZIndex}),this.options.autoPanOnFocus&&k(this._icon,"focus",this._panOnFocus,this),T(this._icon),this.removeInteractiveTarget(this._icon),this._icon=null},_removeShadow:function(){this._shadow&&T(this._shadow),this._shadow=null},_setPos:function(t){this._icon&&Z(this._icon,t),this._shadow&&Z(this._shadow,t),this._zIndex=t.y+this.options.zIndexOffset,this._resetZIndex()},_updateZIndex:function(t){this._icon&&(this._icon.style.zIndex=this._zIndex+t)},_animateZoom:function(t){t=this._map._latLngToNewLayerPoint(this._latlng,t.zoom,t.center).round();this._setPos(t)},_initInteraction:function(){var t;this.options.interactive&&(M(this._icon,"leaflet-interactive"),this.addInteractiveTarget(this._icon),pi&&(t=this.options.draggable,this.dragging&&(t=this.dragging.enabled(),this.dragging.disable()),this.dragging=new pi(this),t&&this.dragging.enable()))},setOpacity:function(t){return this.options.opacity=t,this._map&&this._updateOpacity(),this},_updateOpacity:function(){var t=this.options.opacity;this._icon&&C(this._icon,t),this._shadow&&C(this._shadow,t)},_bringToFront:function(){this._updateZIndex(this.options.riseOffset)},_resetZIndex:function(){this._updateZIndex(0)},_panOnFocus:function(){var t,e,i=this._map;i&&(t=(e=this.options.icon.options).iconSize?m(e.iconSize):m(0,0),e=e.iconAnchor?m(e.iconAnchor):m(0,0),i.panInside(this._latlng,{paddingTopLeft:e,paddingBottomRight:t.subtract(e)}))},_getPopupAnchor:function(){return this.options.icon.options.popupAnchor},_getTooltipAnchor:function(){return this.options.icon.options.tooltipAnchor}});var fi=o.extend({options:{stroke:!0,color:"#3388ff",weight:3,opacity:1,lineCap:"round",lineJoin:"round",dashArray:null,dashOffset:null,fill:!1,fillColor:null,fillOpacity:.2,fillRule:"evenodd",interactive:!0,bubblingMouseEvents:!0},beforeAdd:function(t){this._renderer=t.getRenderer(this)},onAdd:function(){this._renderer._initPath(this),this._reset(),this._renderer._addPath(this)},onRemove:function(){this._renderer._removePath(this)},redraw:function(){return this._map&&this._renderer._updatePath(this),this},setStyle:function(t){return c(this,t),this._renderer&&(this._renderer._updateStyle(this),this.options.stroke&&t&&Object.prototype.hasOwnProperty.call(t,"weight")&&this._updateBounds()),this},bringToFront:function(){return this._renderer&&this._renderer._bringToFront(this),this},bringToBack:function(){return this._renderer&&this._renderer._bringToBack(this),this},getElement:function(){return this._path},_reset:function(){this._project(),this._update()},_clickTolerance:function(){return(this.options.stroke?this.options.weight/2:0)+(this._renderer.options.tolerance||0)}}),gi=fi.extend({options:{fill:!0,radius:10},initialize:function(t,e){c(this,e),this._latlng=w(t),this._radius=this.options.radius},setLatLng:function(t){var e=this._latlng;return this._latlng=w(t),this.redraw(),this.fire("move",{oldLatLng:e,latlng:this._latlng})},getLatLng:function(){return this._latlng},setRadius:function(t){return this.options.radius=this._radius=t,this.redraw()},getRadius:function(){return this._radius},setStyle:function(t){var e=t&&t.radius||this._radius;return fi.prototype.setStyle.call(this,t),this.setRadius(e),this},_project:function(){this._point=this._map.latLngToLayerPoint(this._latlng),this._updateBounds()},_updateBounds:function(){var t=this._radius,e=this._radiusY||t,i=this._clickTolerance(),t=[t+i,e+i];this._pxBounds=new f(this._point.subtract(t),this._point.add(t))},_update:function(){this._map&&this._updatePath()},_updatePath:function(){this._renderer._updateCircle(this)},_empty:function(){return this._radius&&!this._renderer._bounds.intersects(this._pxBounds)},_containsPoint:function(t){return t.distanceTo(this._point)<=this._radius+this._clickTolerance()}});var vi=gi.extend({initialize:function(t,e,i){if(c(this,e="number"==typeof e?l({},i,{radius:e}):e),this._latlng=w(t),isNaN(this.options.radius))throw new Error("Circle radius cannot be NaN");this._mRadius=this.options.radius},setRadius:function(t){return this._mRadius=t,this.redraw()},getRadius:function(){return this._mRadius},getBounds:function(){var t=[this._radius,this._radiusY||this._radius];return new s(this._map.layerPointToLatLng(this._point.subtract(t)),this._map.layerPointToLatLng(this._point.add(t)))},setStyle:fi.prototype.setStyle,_project:function(){var t,e,i,n,o,s=this._latlng.lng,r=this._latlng.lat,a=this._map,h=a.options.crs;h.distance===st.distance?(n=Math.PI/180,o=this._mRadius/st.R/n,t=a.project([r+o,s]),e=a.project([r-o,s]),e=t.add(e).divideBy(2),i=a.unproject(e).lat,n=Math.acos((Math.cos(o*n)-Math.sin(r*n)*Math.sin(i*n))/(Math.cos(r*n)*Math.cos(i*n)))/n,!isNaN(n)&&0!==n||(n=o/Math.cos(Math.PI/180*r)),this._point=e.subtract(a.getPixelOrigin()),this._radius=isNaN(n)?0:e.x-a.project([i,s-n]).x,this._radiusY=e.y-t.y):(o=h.unproject(h.project(this._latlng).subtract([this._mRadius,0])),this._point=a.latLngToLayerPoint(this._latlng),this._radius=this._point.x-a.latLngToLayerPoint(o).x),this._updateBounds()}});var yi=fi.extend({options:{smoothFactor:1,noClip:!1},initialize:function(t,e){c(this,e),this._setLatLngs(t)},getLatLngs:function(){return this._latlngs},setLatLngs:function(t){return this._setLatLngs(t),this.redraw()},isEmpty:function(){return!this._latlngs.length},closestLayerPoint:function(t){for(var e=1/0,i=null,n=ri,o=0,s=this._parts.length;o<s;o++)for(var r=this._parts[o],a=1,h=r.length;a<h;a++){var l,u,c=n(t,l=r[a-1],u=r[a],!0);c<e&&(e=c,i=n(t,l,u))}return i&&(i.distance=Math.sqrt(e)),i},getCenter:function(){if(this._map)return hi(this._defaultShape(),this._map.options.crs);throw new Error("Must add layer to map before using getCenter()")},getBounds:function(){return this._bounds},addLatLng:function(t,e){return e=e||this._defaultShape(),t=w(t),e.push(t),this._bounds.extend(t),this.redraw()},_setLatLngs:function(t){this._bounds=new s,this._latlngs=this._convertLatLngs(t)},_defaultShape:function(){return I(this._latlngs)?this._latlngs:this._latlngs[0]},_convertLatLngs:function(t){for(var e=[],i=I(t),n=0,o=t.length;n<o;n++)i?(e[n]=w(t[n]),this._bounds.extend(e[n])):e[n]=this._convertLatLngs(t[n]);return e},_project:function(){var t=new f;this._rings=[],this._projectLatlngs(this._latlngs,this._rings,t),this._bounds.isValid()&&t.isValid()&&(this._rawPxBounds=t,this._updateBounds())},_updateBounds:function(){var t=this._clickTolerance(),t=new p(t,t);this._rawPxBounds&&(this._pxBounds=new f([this._rawPxBounds.min.subtract(t),this._rawPxBounds.max.add(t)]))},_projectLatlngs:function(t,e,i){var n,o,s=t[0]instanceof v,r=t.length;if(s){for(o=[],n=0;n<r;n++)o[n]=this._map.latLngToLayerPoint(t[n]),i.extend(o[n]);e.push(o)}else for(n=0;n<r;n++)this._projectLatlngs(t[n],e,i)},_clipPoints:function(){var t=this._renderer._bounds;if(this._parts=[],this._pxBounds&&this._pxBounds.intersects(t))if(this.options.noClip)this._parts=this._rings;else for(var e,i,n,o,s=this._parts,r=0,a=0,h=this._rings.length;r<h;r++)for(e=0,i=(o=this._rings[r]).length;e<i-1;e++)(n=ni(o[e],o[e+1],t,e,!0))&&(s[a]=s[a]||[],s[a].push(n[0]),n[1]===o[e+1]&&e!==i-2||(s[a].push(n[1]),a++))},_simplifyPoints:function(){for(var t=this._parts,e=this.options.smoothFactor,i=0,n=t.length;i<n;i++)t[i]=ei(t[i],e)},_update:function(){this._map&&(this._clipPoints(),this._simplifyPoints(),this._updatePath())},_updatePath:function(){this._renderer._updatePoly(this)},_containsPoint:function(t,e){var i,n,o,s,r,a,h=this._clickTolerance();if(this._pxBounds&&this._pxBounds.contains(t))for(i=0,s=this._parts.length;i<s;i++)for(n=0,o=(r=(a=this._parts[i]).length)-1;n<r;o=n++)if((e||0!==n)&&ii(t,a[o],a[n])<=h)return!0;return!1}});yi._flat=ai;var xi=yi.extend({options:{fill:!0},isEmpty:function(){return!this._latlngs.length||!this._latlngs[0].length},getCenter:function(){if(this._map)return $e(this._defaultShape(),this._map.options.crs);throw new Error("Must add layer to map before using getCenter()")},_convertLatLngs:function(t){var t=yi.prototype._convertLatLngs.call(this,t),e=t.length;return 2<=e&&t[0]instanceof v&&t[0].equals(t[e-1])&&t.pop(),t},_setLatLngs:function(t){yi.prototype._setLatLngs.call(this,t),I(this._latlngs)&&(this._latlngs=[this._latlngs])},_defaultShape:function(){return(I(this._latlngs[0])?this._latlngs:this._latlngs[0])[0]},_clipPoints:function(){var t=this._renderer._bounds,e=this.options.weight,e=new p(e,e),t=new f(t.min.subtract(e),t.max.add(e));if(this._parts=[],this._pxBounds&&this._pxBounds.intersects(t))if(this.options.noClip)this._parts=this._rings;else for(var i,n=0,o=this._rings.length;n<o;n++)(i=Je(this._rings[n],t,!0)).length&&this._parts.push(i)},_updatePath:function(){this._renderer._updatePoly(this,!0)},_containsPoint:function(t){var e,i,n,o,s,r,a,h,l=!1;if(!this._pxBounds||!this._pxBounds.contains(t))return!1;for(o=0,a=this._parts.length;o<a;o++)for(s=0,r=(h=(e=this._parts[o]).length)-1;s<h;r=s++)i=e[s],n=e[r],i.y>t.y!=n.y>t.y&&t.x<(n.x-i.x)*(t.y-i.y)/(n.y-i.y)+i.x&&(l=!l);return l||yi.prototype._containsPoint.call(this,t,!0)}});var wi=ci.extend({initialize:function(t,e){c(this,e),this._layers={},t&&this.addData(t)},addData:function(t){var e,i,n,o=d(t)?t:t.features;if(o){for(e=0,i=o.length;e<i;e++)((n=o[e]).geometries||n.geometry||n.features||n.coordinates)&&this.addData(n);return this}var s,r=this.options;return(!r.filter||r.filter(t))&&(s=bi(t,r))?(s.feature=Zi(t),s.defaultOptions=s.options,this.resetStyle(s),r.onEachFeature&&r.onEachFeature(t,s),this.addLayer(s)):this},resetStyle:function(t){return void 0===t?this.eachLayer(this.resetStyle,this):(t.options=l({},t.defaultOptions),this._setLayerStyle(t,this.options.style),this)},setStyle:function(e){return this.eachLayer(function(t){this._setLayerStyle(t,e)},this)},_setLayerStyle:function(t,e){t.setStyle&&("function"==typeof e&&(e=e(t.feature)),t.setStyle(e))}});function bi(t,e){var i,n,o,s,r="Feature"===t.type?t.geometry:t,a=r?r.coordinates:null,h=[],l=e&&e.pointToLayer,u=e&&e.coordsToLatLng||Li;if(!a&&!r)return null;switch(r.type){case"Point":return Pi(l,t,i=u(a),e);case"MultiPoint":for(o=0,s=a.length;o<s;o++)i=u(a[o]),h.push(Pi(l,t,i,e));return new ci(h);case"LineString":case"MultiLineString":return n=Ti(a,"LineString"===r.type?0:1,u),new yi(n,e);case"Polygon":case"MultiPolygon":return n=Ti(a,"Polygon"===r.type?1:2,u),new xi(n,e);case"GeometryCollection":for(o=0,s=r.geometries.length;o<s;o++){var c=bi({geometry:r.geometries[o],type:"Feature",properties:t.properties},e);c&&h.push(c)}return new ci(h);case"FeatureCollection":for(o=0,s=r.features.length;o<s;o++){var d=bi(r.features[o],e);d&&h.push(d)}return new ci(h);default:throw new Error("Invalid GeoJSON object.")}}function Pi(t,e,i,n){return t?t(e,i):new mi(i,n&&n.markersInheritOptions&&n)}function Li(t){return new v(t[1],t[0],t[2])}function Ti(t,e,i){for(var n,o=[],s=0,r=t.length;s<r;s++)n=e?Ti(t[s],e-1,i):(i||Li)(t[s]),o.push(n);return o}function Mi(t,e){return void 0!==(t=w(t)).alt?[i(t.lng,e),i(t.lat,e),i(t.alt,e)]:[i(t.lng,e),i(t.lat,e)]}function zi(t,e,i,n){for(var o=[],s=0,r=t.length;s<r;s++)o.push(e?zi(t[s],I(t[s])?0:e-1,i,n):Mi(t[s],n));return!e&&i&&0<o.length&&o.push(o[0].slice()),o}function Ci(t,e){return t.feature?l({},t.feature,{geometry:e}):Zi(e)}function Zi(t){return"Feature"===t.type||"FeatureCollection"===t.type?t:{type:"Feature",properties:{},geometry:t}}Tt={toGeoJSON:function(t){return Ci(this,{type:"Point",coordinates:Mi(this.getLatLng(),t)})}};function Si(t,e){return new wi(t,e)}mi.include(Tt),vi.include(Tt),gi.include(Tt),yi.include({toGeoJSON:function(t){var e=!I(this._latlngs);return Ci(this,{type:(e?"Multi":"")+"LineString",coordinates:zi(this._latlngs,e?1:0,!1,t)})}}),xi.include({toGeoJSON:function(t){var e=!I(this._latlngs),i=e&&!I(this._latlngs[0]),t=zi(this._latlngs,i?2:e?1:0,!0,t);return Ci(this,{type:(i?"Multi":"")+"Polygon",coordinates:t=e?t:[t]})}}),ui.include({toMultiPoint:function(e){var i=[];return this.eachLayer(function(t){i.push(t.toGeoJSON(e).geometry.coordinates)}),Ci(this,{type:"MultiPoint",coordinates:i})},toGeoJSON:function(e){var i,n,t=this.feature&&this.feature.geometry&&this.feature.geometry.type;return"MultiPoint"===t?this.toMultiPoint(e):(i="GeometryCollection"===t,n=[],this.eachLayer(function(t){t.toGeoJSON&&(t=t.toGeoJSON(e),i?n.push(t.geometry):"FeatureCollection"===(t=Zi(t)).type?n.push.apply(n,t.features):n.push(t))}),i?Ci(this,{geometries:n,type:"GeometryCollection"}):{type:"FeatureCollection",features:n})}});var Mt=Si,Ei=o.extend({options:{opacity:1,alt:"",interactive:!1,crossOrigin:!1,errorOverlayUrl:"",zIndex:1,className:""},initialize:function(t,e,i){this._url=t,this._bounds=g(e),c(this,i)},onAdd:function(){this._image||(this._initImage(),this.options.opacity<1&&this._updateOpacity()),this.options.interactive&&(M(this._image,"leaflet-interactive"),this.addInteractiveTarget(this._image)),this.getPane().appendChild(this._image),this._reset()},onRemove:function(){T(this._image),this.options.interactive&&this.removeInteractiveTarget(this._image)},setOpacity:function(t){return this.options.opacity=t,this._image&&this._updateOpacity(),this},setStyle:function(t){return t.opacity&&this.setOpacity(t.opacity),this},bringToFront:function(){return this._map&&fe(this._image),this},bringToBack:function(){return this._map&&ge(this._image),this},setUrl:function(t){return this._url=t,this._image&&(this._image.src=t),this},setBounds:function(t){return this._bounds=g(t),this._map&&this._reset(),this},getEvents:function(){var t={zoom:this._reset,viewreset:this._reset};return this._zoomAnimated&&(t.zoomanim=this._animateZoom),t},setZIndex:function(t){return this.options.zIndex=t,this._updateZIndex(),this},getBounds:function(){return this._bounds},getElement:function(){return this._image},_initImage:function(){var t="IMG"===this._url.tagName,e=this._image=t?this._url:P("img");M(e,"leaflet-image-layer"),this._zoomAnimated&&M(e,"leaflet-zoom-animated"),this.options.className&&M(e,this.options.className),e.onselectstart=u,e.onmousemove=u,e.onload=a(this.fire,this,"load"),e.onerror=a(this._overlayOnError,this,"error"),!this.options.crossOrigin&&""!==this.options.crossOrigin||(e.crossOrigin=!0===this.options.crossOrigin?"":this.options.crossOrigin),this.options.zIndex&&this._updateZIndex(),t?this._url=e.src:(e.src=this._url,e.alt=this.options.alt)},_animateZoom:function(t){var e=this._map.getZoomScale(t.zoom),t=this._map._latLngBoundsToNewLayerBounds(this._bounds,t.zoom,t.center).min;be(this._image,t,e)},_reset:function(){var t=this._image,e=new f(this._map.latLngToLayerPoint(this._bounds.getNorthWest()),this._map.latLngToLayerPoint(this._bounds.getSouthEast())),i=e.getSize();Z(t,e.min),t.style.width=i.x+"px",t.style.height=i.y+"px"},_updateOpacity:function(){C(this._image,this.options.opacity)},_updateZIndex:function(){this._image&&void 0!==this.options.zIndex&&null!==this.options.zIndex&&(this._image.style.zIndex=this.options.zIndex)},_overlayOnError:function(){this.fire("error");var t=this.options.errorOverlayUrl;t&&this._url!==t&&(this._url=t,this._image.src=t)},getCenter:function(){return this._bounds.getCenter()}}),ki=Ei.extend({options:{autoplay:!0,loop:!0,keepAspectRatio:!0,muted:!1,playsInline:!0},_initImage:function(){var t="VIDEO"===this._url.tagName,e=this._image=t?this._url:P("video");if(M(e,"leaflet-image-layer"),this._zoomAnimated&&M(e,"leaflet-zoom-animated"),this.options.className&&M(e,this.options.className),e.onselectstart=u,e.onmousemove=u,e.onloadeddata=a(this.fire,this,"load"),t){for(var i=e.getElementsByTagName("source"),n=[],o=0;o<i.length;o++)n.push(i[o].src);this._url=0<i.length?n:[e.src]}else{d(this._url)||(this._url=[this._url]),!this.options.keepAspectRatio&&Object.prototype.hasOwnProperty.call(e.style,"objectFit")&&(e.style.objectFit="fill"),e.autoplay=!!this.options.autoplay,e.loop=!!this.options.loop,e.muted=!!this.options.muted,e.playsInline=!!this.options.playsInline;for(var s=0;s<this._url.length;s++){var r=P("source");r.src=this._url[s],e.appendChild(r)}}}});var Oi=Ei.extend({_initImage:function(){var t=this._image=this._url;M(t,"leaflet-image-layer"),this._zoomAnimated&&M(t,"leaflet-zoom-animated"),this.options.className&&M(t,this.options.className),t.onselectstart=u,t.onmousemove=u}});var Ai=o.extend({options:{interactive:!1,offset:[0,0],className:"",pane:void 0,content:""},initialize:function(t,e){t&&(t instanceof v||d(t))?(this._latlng=w(t),c(this,e)):(c(this,t),this._source=e),this.options.content&&(this._content=this.options.content)},openOn:function(t){return(t=arguments.length?t:this._source._map).hasLayer(this)||t.addLayer(this),this},close:function(){return this._map&&this._map.removeLayer(this),this},toggle:function(t){return this._map?this.close():(arguments.length?this._source=t:t=this._source,this._prepareOpen(),this.openOn(t._map)),this},onAdd:function(t){this._zoomAnimated=t._zoomAnimated,this._container||this._initLayout(),t._fadeAnimated&&C(this._container,0),clearTimeout(this._removeTimeout),this.getPane().appendChild(this._container),this.update(),t._fadeAnimated&&C(this._container,1),this.bringToFront(),this.options.interactive&&(M(this._container,"leaflet-interactive"),this.addInteractiveTarget(this._container))},onRemove:function(t){t._fadeAnimated?(C(this._container,0),this._removeTimeout=setTimeout(a(T,void 0,this._container),200)):T(this._container),this.options.interactive&&(z(this._container,"leaflet-interactive"),this.removeInteractiveTarget(this._container))},getLatLng:function(){return this._latlng},setLatLng:function(t){return this._latlng=w(t),this._map&&(this._updatePosition(),this._adjustPan()),this},getContent:function(){return this._content},setContent:function(t){return this._content=t,this.update(),this},getElement:function(){return this._container},update:function(){this._map&&(this._container.style.visibility="hidden",this._updateContent(),this._updateLayout(),this._updatePosition(),this._container.style.visibility="",this._adjustPan())},getEvents:function(){var t={zoom:this._updatePosition,viewreset:this._updatePosition};return this._zoomAnimated&&(t.zoomanim=this._animateZoom),t},isOpen:function(){return!!this._map&&this._map.hasLayer(this)},bringToFront:function(){return this._map&&fe(this._container),this},bringToBack:function(){return this._map&&ge(this._container),this},_prepareOpen:function(t){if(!(i=this._source)._map)return!1;if(i instanceof ci){var e,i=null,n=this._source._layers;for(e in n)if(n[e]._map){i=n[e];break}if(!i)return!1;this._source=i}if(!t)if(i.getCenter)t=i.getCenter();else if(i.getLatLng)t=i.getLatLng();else{if(!i.getBounds)throw new Error("Unable to get source layer LatLng.");t=i.getBounds().getCenter()}return this.setLatLng(t),this._map&&this.update(),!0},_updateContent:function(){if(this._content){var t=this._contentNode,e="function"==typeof this._content?this._content(this._source||this):this._content;if("string"==typeof e)t.innerHTML=e;else{for(;t.hasChildNodes();)t.removeChild(t.firstChild);t.appendChild(e)}this.fire("contentupdate")}},_updatePosition:function(){var t,e,i;this._map&&(e=this._map.latLngToLayerPoint(this._latlng),t=m(this.options.offset),i=this._getAnchor(),this._zoomAnimated?Z(this._container,e.add(i)):t=t.add(e).add(i),e=this._containerBottom=-t.y,i=this._containerLeft=-Math.round(this._containerWidth/2)+t.x,this._container.style.bottom=e+"px",this._container.style.left=i+"px")},_getAnchor:function(){return[0,0]}}),Bi=(A.include({_initOverlay:function(t,e,i,n){var o=e;return o instanceof t||(o=new t(n).setContent(e)),i&&o.setLatLng(i),o}}),o.include({_initOverlay:function(t,e,i,n){var o=i;return o instanceof t?(c(o,n),o._source=this):(o=e&&!n?e:new t(n,this)).setContent(i),o}}),Ai.extend({options:{pane:"popupPane",offset:[0,7],maxWidth:300,minWidth:50,maxHeight:null,autoPan:!0,autoPanPaddingTopLeft:null,autoPanPaddingBottomRight:null,autoPanPadding:[5,5],keepInView:!1,closeButton:!0,autoClose:!0,closeOnEscapeKey:!0,className:""},openOn:function(t){return!(t=arguments.length?t:this._source._map).hasLayer(this)&&t._popup&&t._popup.options.autoClose&&t.removeLayer(t._popup),t._popup=this,Ai.prototype.openOn.call(this,t)},onAdd:function(t){Ai.prototype.onAdd.call(this,t),t.fire("popupopen",{popup:this}),this._source&&(this._source.fire("popupopen",{popup:this},!0),this._source instanceof fi||this._source.on("preclick",Ae))},onRemove:function(t){Ai.prototype.onRemove.call(this,t),t.fire("popupclose",{popup:this}),this._source&&(this._source.fire("popupclose",{popup:this},!0),this._source instanceof fi||this._source.off("preclick",Ae))},getEvents:function(){var t=Ai.prototype.getEvents.call(this);return(void 0!==this.options.closeOnClick?this.options.closeOnClick:this._map.options.closePopupOnClick)&&(t.preclick=this.close),this.options.keepInView&&(t.moveend=this._adjustPan),t},_initLayout:function(){var t="leaflet-popup",e=this._container=P("div",t+" "+(this.options.className||"")+" leaflet-zoom-animated"),i=this._wrapper=P("div",t+"-content-wrapper",e);this._contentNode=P("div",t+"-content",i),Ie(e),Be(this._contentNode),S(e,"contextmenu",Ae),this._tipContainer=P("div",t+"-tip-container",e),this._tip=P("div",t+"-tip",this._tipContainer),this.options.closeButton&&((i=this._closeButton=P("a",t+"-close-button",e)).setAttribute("role","button"),i.setAttribute("aria-label","Close popup"),i.href="#close",i.innerHTML='<span aria-hidden="true">&#215;</span>',S(i,"click",function(t){O(t),this.close()},this))},_updateLayout:function(){var t=this._contentNode,e=t.style,i=(e.width="",e.whiteSpace="nowrap",t.offsetWidth),i=Math.min(i,this.options.maxWidth),i=(i=Math.max(i,this.options.minWidth),e.width=i+1+"px",e.whiteSpace="",e.height="",t.offsetHeight),n=this.options.maxHeight,o="leaflet-popup-scrolled";(n&&n<i?(e.height=n+"px",M):z)(t,o),this._containerWidth=this._container.offsetWidth},_animateZoom:function(t){var t=this._map._latLngToNewLayerPoint(this._latlng,t.zoom,t.center),e=this._getAnchor();Z(this._container,t.add(e))},_adjustPan:function(){var t,e,i,n,o,s,r,a;this.options.autoPan&&(this._map._panAnim&&this._map._panAnim.stop(),this._autopanning?this._autopanning=!1:(t=this._map,e=parseInt(pe(this._container,"marginBottom"),10)||0,e=this._container.offsetHeight+e,a=this._containerWidth,(i=new p(this._containerLeft,-e-this._containerBottom))._add(Pe(this._container)),i=t.layerPointToContainerPoint(i),o=m(this.options.autoPanPadding),n=m(this.options.autoPanPaddingTopLeft||o),o=m(this.options.autoPanPaddingBottomRight||o),s=t.getSize(),r=0,i.x+a+o.x>s.x&&(r=i.x+a-s.x+o.x),i.x-r-n.x<(a=0)&&(r=i.x-n.x),i.y+e+o.y>s.y&&(a=i.y+e-s.y+o.y),i.y-a-n.y<0&&(a=i.y-n.y),(r||a)&&(this.options.keepInView&&(this._autopanning=!0),t.fire("autopanstart").panBy([r,a]))))},_getAnchor:function(){return m(this._source&&this._source._getPopupAnchor?this._source._getPopupAnchor():[0,0])}})),Ii=(A.mergeOptions({closePopupOnClick:!0}),A.include({openPopup:function(t,e,i){return this._initOverlay(Bi,t,e,i).openOn(this),this},closePopup:function(t){return(t=arguments.length?t:this._popup)&&t.close(),this}}),o.include({bindPopup:function(t,e){return this._popup=this._initOverlay(Bi,this._popup,t,e),this._popupHandlersAdded||(this.on({click:this._openPopup,keypress:this._onKeyPress,remove:this.closePopup,move:this._movePopup}),this._popupHandlersAdded=!0),this},unbindPopup:function(){return this._popup&&(this.off({click:this._openPopup,keypress:this._onKeyPress,remove:this.closePopup,move:this._movePopup}),this._popupHandlersAdded=!1,this._popup=null),this},openPopup:function(t){return this._popup&&(this instanceof ci||(this._popup._source=this),this._popup._prepareOpen(t||this._latlng)&&this._popup.openOn(this._map)),this},closePopup:function(){return this._popup&&this._popup.close(),this},togglePopup:function(){return this._popup&&this._popup.toggle(this),this},isPopupOpen:function(){return!!this._popup&&this._popup.isOpen()},setPopupContent:function(t){return this._popup&&this._popup.setContent(t),this},getPopup:function(){return this._popup},_openPopup:function(t){var e;this._popup&&this._map&&(Re(t),e=t.layer||t.target,this._popup._source!==e||e instanceof fi?(this._popup._source=e,this.openPopup(t.latlng)):this._map.hasLayer(this._popup)?this.closePopup():this.openPopup(t.latlng))},_movePopup:function(t){this._popup.setLatLng(t.latlng)},_onKeyPress:function(t){13===t.originalEvent.keyCode&&this._openPopup(t)}}),Ai.extend({options:{pane:"tooltipPane",offset:[0,0],direction:"auto",permanent:!1,sticky:!1,opacity:.9},onAdd:function(t){Ai.prototype.onAdd.call(this,t),this.setOpacity(this.options.opacity),t.fire("tooltipopen",{tooltip:this}),this._source&&(this.addEventParent(this._source),this._source.fire("tooltipopen",{tooltip:this},!0))},onRemove:function(t){Ai.prototype.onRemove.call(this,t),t.fire("tooltipclose",{tooltip:this}),this._source&&(this.removeEventParent(this._source),this._source.fire("tooltipclose",{tooltip:this},!0))},getEvents:function(){var t=Ai.prototype.getEvents.call(this);return this.options.permanent||(t.preclick=this.close),t},_initLayout:function(){var t="leaflet-tooltip "+(this.options.className||"")+" leaflet-zoom-"+(this._zoomAnimated?"animated":"hide");this._contentNode=this._container=P("div",t),this._container.setAttribute("role","tooltip"),this._container.setAttribute("id","leaflet-tooltip-"+h(this))},_updateLayout:function(){},_adjustPan:function(){},_setPosition:function(t){var e,i=this._map,n=this._container,o=i.latLngToContainerPoint(i.getCenter()),i=i.layerPointToContainerPoint(t),s=this.options.direction,r=n.offsetWidth,a=n.offsetHeight,h=m(this.options.offset),l=this._getAnchor(),i="top"===s?(e=r/2,a):"bottom"===s?(e=r/2,0):(e="center"===s?r/2:"right"===s?0:"left"===s?r:i.x<o.x?(s="right",0):(s="left",r+2*(h.x+l.x)),a/2);t=t.subtract(m(e,i,!0)).add(h).add(l),z(n,"leaflet-tooltip-right"),z(n,"leaflet-tooltip-left"),z(n,"leaflet-tooltip-top"),z(n,"leaflet-tooltip-bottom"),M(n,"leaflet-tooltip-"+s),Z(n,t)},_updatePosition:function(){var t=this._map.latLngToLayerPoint(this._latlng);this._setPosition(t)},setOpacity:function(t){this.options.opacity=t,this._container&&C(this._container,t)},_animateZoom:function(t){t=this._map._latLngToNewLayerPoint(this._latlng,t.zoom,t.center);this._setPosition(t)},_getAnchor:function(){return m(this._source&&this._source._getTooltipAnchor&&!this.options.sticky?this._source._getTooltipAnchor():[0,0])}})),Ri=(A.include({openTooltip:function(t,e,i){return this._initOverlay(Ii,t,e,i).openOn(this),this},closeTooltip:function(t){return t.close(),this}}),o.include({bindTooltip:function(t,e){return this._tooltip&&this.isTooltipOpen()&&this.unbindTooltip(),this._tooltip=this._initOverlay(Ii,this._tooltip,t,e),this._initTooltipInteractions(),this._tooltip.options.permanent&&this._map&&this._map.hasLayer(this)&&this.openTooltip(),this},unbindTooltip:function(){return this._tooltip&&(this._initTooltipInteractions(!0),this.closeTooltip(),this._tooltip=null),this},_initTooltipInteractions:function(t){var e,i;!t&&this._tooltipHandlersAdded||(e=t?"off":"on",i={remove:this.closeTooltip,move:this._moveTooltip},this._tooltip.options.permanent?i.add=this._openTooltip:(i.mouseover=this._openTooltip,i.mouseout=this.closeTooltip,i.click=this._openTooltip,this._map?this._addFocusListeners():i.add=this._addFocusListeners),this._tooltip.options.sticky&&(i.mousemove=this._moveTooltip),this[e](i),this._tooltipHandlersAdded=!t)},openTooltip:function(t){return this._tooltip&&(this instanceof ci||(this._tooltip._source=this),this._tooltip._prepareOpen(t)&&(this._tooltip.openOn(this._map),this.getElement?this._setAriaDescribedByOnLayer(this):this.eachLayer&&this.eachLayer(this._setAriaDescribedByOnLayer,this))),this},closeTooltip:function(){if(this._tooltip)return this._tooltip.close()},toggleTooltip:function(){return this._tooltip&&this._tooltip.toggle(this),this},isTooltipOpen:function(){return this._tooltip.isOpen()},setTooltipContent:function(t){return this._tooltip&&this._tooltip.setContent(t),this},getTooltip:function(){return this._tooltip},_addFocusListeners:function(){this.getElement?this._addFocusListenersOnLayer(this):this.eachLayer&&this.eachLayer(this._addFocusListenersOnLayer,this)},_addFocusListenersOnLayer:function(t){var e="function"==typeof t.getElement&&t.getElement();e&&(S(e,"focus",function(){this._tooltip._source=t,this.openTooltip()},this),S(e,"blur",this.closeTooltip,this))},_setAriaDescribedByOnLayer:function(t){t="function"==typeof t.getElement&&t.getElement();t&&t.setAttribute("aria-describedby",this._tooltip._container.id)},_openTooltip:function(t){var e;this._tooltip&&this._map&&(this._map.dragging&&this._map.dragging.moving()&&!this._openOnceFlag?(this._openOnceFlag=!0,(e=this)._map.once("moveend",function(){e._openOnceFlag=!1,e._openTooltip(t)})):(this._tooltip._source=t.layer||t.target,this.openTooltip(this._tooltip.options.sticky?t.latlng:void 0)))},_moveTooltip:function(t){var e=t.latlng;this._tooltip.options.sticky&&t.originalEvent&&(t=this._map.mouseEventToContainerPoint(t.originalEvent),t=this._map.containerPointToLayerPoint(t),e=this._map.layerPointToLatLng(t)),this._tooltip.setLatLng(e)}}),di.extend({options:{iconSize:[12,12],html:!1,bgPos:null,className:"leaflet-div-icon"},createIcon:function(t){var t=t&&"DIV"===t.tagName?t:document.createElement("div"),e=this.options;return e.html instanceof Element?(me(t),t.appendChild(e.html)):t.innerHTML=!1!==e.html?e.html:"",e.bgPos&&(e=m(e.bgPos),t.style.backgroundPosition=-e.x+"px "+-e.y+"px"),this._setIconStyles(t,"icon"),t},createShadow:function(){return null}}));di.Default=_i;var Ni=o.extend({options:{tileSize:256,opacity:1,updateWhenIdle:b.mobile,updateWhenZooming:!0,updateInterval:200,zIndex:1,bounds:null,minZoom:0,maxZoom:void 0,maxNativeZoom:void 0,minNativeZoom:void 0,noWrap:!1,pane:"tilePane",className:"",keepBuffer:2},initialize:function(t){c(this,t)},onAdd:function(){this._initContainer(),this._levels={},this._tiles={},this._resetView()},beforeAdd:function(t){t._addZoomLimit(this)},onRemove:function(t){this._removeAllTiles(),T(this._container),t._removeZoomLimit(this),this._container=null,this._tileZoom=void 0},bringToFront:function(){return this._map&&(fe(this._container),this._setAutoZIndex(Math.max)),this},bringToBack:function(){return this._map&&(ge(this._container),this._setAutoZIndex(Math.min)),this},getContainer:function(){return this._container},setOpacity:function(t){return this.options.opacity=t,this._updateOpacity(),this},setZIndex:function(t){return this.options.zIndex=t,this._updateZIndex(),this},isLoading:function(){return this._loading},redraw:function(){var t;return this._map&&(this._removeAllTiles(),(t=this._clampZoom(this._map.getZoom()))!==this._tileZoom&&(this._tileZoom=t,this._updateLevels()),this._update()),this},getEvents:function(){var t={viewprereset:this._invalidateAll,viewreset:this._resetView,zoom:this._resetView,moveend:this._onMoveEnd};return this.options.updateWhenIdle||(this._onMove||(this._onMove=j(this._onMoveEnd,this.options.updateInterval,this)),t.move=this._onMove),this._zoomAnimated&&(t.zoomanim=this._animateZoom),t},createTile:function(){return document.createElement("div")},getTileSize:function(){var t=this.options.tileSize;return t instanceof p?t:new p(t,t)},_updateZIndex:function(){this._container&&void 0!==this.options.zIndex&&null!==this.options.zIndex&&(this._container.style.zIndex=this.options.zIndex)},_setAutoZIndex:function(t){for(var e,i=this.getPane().children,n=-t(-1/0,1/0),o=0,s=i.length;o<s;o++)e=i[o].style.zIndex,i[o]!==this._container&&e&&(n=t(n,+e));isFinite(n)&&(this.options.zIndex=n+t(-1,1),this._updateZIndex())},_updateOpacity:function(){if(this._map&&!b.ielt9){C(this._container,this.options.opacity);var t,e=+new Date,i=!1,n=!1;for(t in this._tiles){var o,s=this._tiles[t];s.current&&s.loaded&&(o=Math.min(1,(e-s.loaded)/200),C(s.el,o),o<1?i=!0:(s.active?n=!0:this._onOpaqueTile(s),s.active=!0))}n&&!this._noPrune&&this._pruneTiles(),i&&(r(this._fadeFrame),this._fadeFrame=x(this._updateOpacity,this))}},_onOpaqueTile:u,_initContainer:function(){this._container||(this._container=P("div","leaflet-layer "+(this.options.className||"")),this._updateZIndex(),this.options.opacity<1&&this._updateOpacity(),this.getPane().appendChild(this._container))},_updateLevels:function(){var t=this._tileZoom,e=this.options.maxZoom;if(void 0!==t){for(var i in this._levels)i=Number(i),this._levels[i].el.children.length||i===t?(this._levels[i].el.style.zIndex=e-Math.abs(t-i),this._onUpdateLevel(i)):(T(this._levels[i].el),this._removeTilesAtZoom(i),this._onRemoveLevel(i),delete this._levels[i]);var n=this._levels[t],o=this._map;return n||((n=this._levels[t]={}).el=P("div","leaflet-tile-container leaflet-zoom-animated",this._container),n.el.style.zIndex=e,n.origin=o.project(o.unproject(o.getPixelOrigin()),t).round(),n.zoom=t,this._setZoomTransform(n,o.getCenter(),o.getZoom()),u(n.el.offsetWidth),this._onCreateLevel(n)),this._level=n}},_onUpdateLevel:u,_onRemoveLevel:u,_onCreateLevel:u,_pruneTiles:function(){if(this._map){var t,e,i,n=this._map.getZoom();if(n>this.options.maxZoom||n<this.options.minZoom)this._removeAllTiles();else{for(t in this._tiles)(i=this._tiles[t]).retain=i.current;for(t in this._tiles)(i=this._tiles[t]).current&&!i.active&&(e=i.coords,this._retainParent(e.x,e.y,e.z,e.z-5)||this._retainChildren(e.x,e.y,e.z,e.z+2));for(t in this._tiles)this._tiles[t].retain||this._removeTile(t)}}},_removeTilesAtZoom:function(t){for(var e in this._tiles)this._tiles[e].coords.z===t&&this._removeTile(e)},_removeAllTiles:function(){for(var t in this._tiles)this._removeTile(t)},_invalidateAll:function(){for(var t in this._levels)T(this._levels[t].el),this._onRemoveLevel(Number(t)),delete this._levels[t];this._removeAllTiles(),this._tileZoom=void 0},_retainParent:function(t,e,i,n){var t=Math.floor(t/2),e=Math.floor(e/2),i=i-1,o=new p(+t,+e),o=(o.z=i,this._tileCoordsToKey(o)),o=this._tiles[o];return o&&o.active?o.retain=!0:(o&&o.loaded&&(o.retain=!0),n<i&&this._retainParent(t,e,i,n))},_retainChildren:function(t,e,i,n){for(var o=2*t;o<2*t+2;o++)for(var s=2*e;s<2*e+2;s++){var r=new p(o,s),r=(r.z=i+1,this._tileCoordsToKey(r)),r=this._tiles[r];r&&r.active?r.retain=!0:(r&&r.loaded&&(r.retain=!0),i+1<n&&this._retainChildren(o,s,i+1,n))}},_resetView:function(t){t=t&&(t.pinch||t.flyTo);this._setView(this._map.getCenter(),this._map.getZoom(),t,t)},_animateZoom:function(t){this._setView(t.center,t.zoom,!0,t.noUpdate)},_clampZoom:function(t){var e=this.options;return void 0!==e.minNativeZoom&&t<e.minNativeZoom?e.minNativeZoom:void 0!==e.maxNativeZoom&&e.maxNativeZoom<t?e.maxNativeZoom:t},_setView:function(t,e,i,n){var o=Math.round(e),o=void 0!==this.options.maxZoom&&o>this.options.maxZoom||void 0!==this.options.minZoom&&o<this.options.minZoom?void 0:this._clampZoom(o),s=this.options.updateWhenZooming&&o!==this._tileZoom;n&&!s||(this._tileZoom=o,this._abortLoading&&this._abortLoading(),this._updateLevels(),this._resetGrid(),void 0!==o&&this._update(t),i||this._pruneTiles(),this._noPrune=!!i),this._setZoomTransforms(t,e)},_setZoomTransforms:function(t,e){for(var i in this._levels)this._setZoomTransform(this._levels[i],t,e)},_setZoomTransform:function(t,e,i){var n=this._map.getZoomScale(i,t.zoom),e=t.origin.multiplyBy(n).subtract(this._map._getNewPixelOrigin(e,i)).round();b.any3d?be(t.el,e,n):Z(t.el,e)},_resetGrid:function(){var t=this._map,e=t.options.crs,i=this._tileSize=this.getTileSize(),n=this._tileZoom,o=this._map.getPixelWorldBounds(this._tileZoom);o&&(this._globalTileRange=this._pxBoundsToTileRange(o)),this._wrapX=e.wrapLng&&!this.options.noWrap&&[Math.floor(t.project([0,e.wrapLng[0]],n).x/i.x),Math.ceil(t.project([0,e.wrapLng[1]],n).x/i.y)],this._wrapY=e.wrapLat&&!this.options.noWrap&&[Math.floor(t.project([e.wrapLat[0],0],n).y/i.x),Math.ceil(t.project([e.wrapLat[1],0],n).y/i.y)]},_onMoveEnd:function(){this._map&&!this._map._animatingZoom&&this._update()},_getTiledPixelBounds:function(t){var e=this._map,i=e._animatingZoom?Math.max(e._animateToZoom,e.getZoom()):e.getZoom(),i=e.getZoomScale(i,this._tileZoom),t=e.project(t,this._tileZoom).floor(),e=e.getSize().divideBy(2*i);return new f(t.subtract(e),t.add(e))},_update:function(t){var e=this._map;if(e){var i=this._clampZoom(e.getZoom());if(void 0===t&&(t=e.getCenter()),void 0!==this._tileZoom){var n,e=this._getTiledPixelBounds(t),o=this._pxBoundsToTileRange(e),s=o.getCenter(),r=[],e=this.options.keepBuffer,a=new f(o.getBottomLeft().subtract([e,-e]),o.getTopRight().add([e,-e]));if(!(isFinite(o.min.x)&&isFinite(o.min.y)&&isFinite(o.max.x)&&isFinite(o.max.y)))throw new Error("Attempted to load an infinite number of tiles");for(n in this._tiles){var h=this._tiles[n].coords;h.z===this._tileZoom&&a.contains(new p(h.x,h.y))||(this._tiles[n].current=!1)}if(1<Math.abs(i-this._tileZoom))this._setView(t,i);else{for(var l=o.min.y;l<=o.max.y;l++)for(var u=o.min.x;u<=o.max.x;u++){var c,d=new p(u,l);d.z=this._tileZoom,this._isValidTile(d)&&((c=this._tiles[this._tileCoordsToKey(d)])?c.current=!0:r.push(d))}if(r.sort(function(t,e){return t.distanceTo(s)-e.distanceTo(s)}),0!==r.length){this._loading||(this._loading=!0,this.fire("loading"));for(var _=document.createDocumentFragment(),u=0;u<r.length;u++)this._addTile(r[u],_);this._level.el.appendChild(_)}}}}},_isValidTile:function(t){var e=this._map.options.crs;if(!e.infinite){var i=this._globalTileRange;if(!e.wrapLng&&(t.x<i.min.x||t.x>i.max.x)||!e.wrapLat&&(t.y<i.min.y||t.y>i.max.y))return!1}return!this.options.bounds||(e=this._tileCoordsToBounds(t),g(this.options.bounds).overlaps(e))},_keyToBounds:function(t){return this._tileCoordsToBounds(this._keyToTileCoords(t))},_tileCoordsToNwSe:function(t){var e=this._map,i=this.getTileSize(),n=t.scaleBy(i),i=n.add(i);return[e.unproject(n,t.z),e.unproject(i,t.z)]},_tileCoordsToBounds:function(t){t=this._tileCoordsToNwSe(t),t=new s(t[0],t[1]);return t=this.options.noWrap?t:this._map.wrapLatLngBounds(t)},_tileCoordsToKey:function(t){return t.x+":"+t.y+":"+t.z},_keyToTileCoords:function(t){var t=t.split(":"),e=new p(+t[0],+t[1]);return e.z=+t[2],e},_removeTile:function(t){var e=this._tiles[t];e&&(T(e.el),delete this._tiles[t],this.fire("tileunload",{tile:e.el,coords:this._keyToTileCoords(t)}))},_initTile:function(t){M(t,"leaflet-tile");var e=this.getTileSize();t.style.width=e.x+"px",t.style.height=e.y+"px",t.onselectstart=u,t.onmousemove=u,b.ielt9&&this.options.opacity<1&&C(t,this.options.opacity)},_addTile:function(t,e){var i=this._getTilePos(t),n=this._tileCoordsToKey(t),o=this.createTile(this._wrapCoords(t),a(this._tileReady,this,t));this._initTile(o),this.createTile.length<2&&x(a(this._tileReady,this,t,null,o)),Z(o,i),this._tiles[n]={el:o,coords:t,current:!0},e.appendChild(o),this.fire("tileloadstart",{tile:o,coords:t})},_tileReady:function(t,e,i){e&&this.fire("tileerror",{error:e,tile:i,coords:t});var n=this._tileCoordsToKey(t);(i=this._tiles[n])&&(i.loaded=+new Date,this._map._fadeAnimated?(C(i.el,0),r(this._fadeFrame),this._fadeFrame=x(this._updateOpacity,this)):(i.active=!0,this._pruneTiles()),e||(M(i.el,"leaflet-tile-loaded"),this.fire("tileload",{tile:i.el,coords:t})),this._noTilesToLoad()&&(this._loading=!1,this.fire("load"),b.ielt9||!this._map._fadeAnimated?x(this._pruneTiles,this):setTimeout(a(this._pruneTiles,this),250)))},_getTilePos:function(t){return t.scaleBy(this.getTileSize()).subtract(this._level.origin)},_wrapCoords:function(t){var e=new p(this._wrapX?H(t.x,this._wrapX):t.x,this._wrapY?H(t.y,this._wrapY):t.y);return e.z=t.z,e},_pxBoundsToTileRange:function(t){var e=this.getTileSize();return new f(t.min.unscaleBy(e).floor(),t.max.unscaleBy(e).ceil().subtract([1,1]))},_noTilesToLoad:function(){for(var t in this._tiles)if(!this._tiles[t].loaded)return!1;return!0}});var Di=Ni.extend({options:{minZoom:0,maxZoom:18,subdomains:"abc",errorTileUrl:"",zoomOffset:0,tms:!1,zoomReverse:!1,detectRetina:!1,crossOrigin:!1,referrerPolicy:!1},initialize:function(t,e){this._url=t,(e=c(this,e)).detectRetina&&b.retina&&0<e.maxZoom?(e.tileSize=Math.floor(e.tileSize/2),e.zoomReverse?(e.zoomOffset--,e.minZoom=Math.min(e.maxZoom,e.minZoom+1)):(e.zoomOffset++,e.maxZoom=Math.max(e.minZoom,e.maxZoom-1)),e.minZoom=Math.max(0,e.minZoom)):e.zoomReverse?e.minZoom=Math.min(e.maxZoom,e.minZoom):e.maxZoom=Math.max(e.minZoom,e.maxZoom),"string"==typeof e.subdomains&&(e.subdomains=e.subdomains.split("")),this.on("tileunload",this._onTileRemove)},setUrl:function(t,e){return this._url===t&&void 0===e&&(e=!0),this._url=t,e||this.redraw(),this},createTile:function(t,e){var i=document.createElement("img");return S(i,"load",a(this._tileOnLoad,this,e,i)),S(i,"error",a(this._tileOnError,this,e,i)),!this.options.crossOrigin&&""!==this.options.crossOrigin||(i.crossOrigin=!0===this.options.crossOrigin?"":this.options.crossOrigin),"string"==typeof this.options.referrerPolicy&&(i.referrerPolicy=this.options.referrerPolicy),i.alt="",i.src=this.getTileUrl(t),i},getTileUrl:function(t){var e={r:b.retina?"@2x":"",s:this._getSubdomain(t),x:t.x,y:t.y,z:this._getZoomForUrl()};return this._map&&!this._map.options.crs.infinite&&(t=this._globalTileRange.max.y-t.y,this.options.tms&&(e.y=t),e["-y"]=t),q(this._url,l(e,this.options))},_tileOnLoad:function(t,e){b.ielt9?setTimeout(a(t,this,null,e),0):t(null,e)},_tileOnError:function(t,e,i){var n=this.options.errorTileUrl;n&&e.getAttribute("src")!==n&&(e.src=n),t(i,e)},_onTileRemove:function(t){t.tile.onload=null},_getZoomForUrl:function(){var t=this._tileZoom,e=this.options.maxZoom;return(t=this.options.zoomReverse?e-t:t)+this.options.zoomOffset},_getSubdomain:function(t){t=Math.abs(t.x+t.y)%this.options.subdomains.length;return this.options.subdomains[t]},_abortLoading:function(){var t,e,i;for(t in this._tiles)this._tiles[t].coords.z!==this._tileZoom&&((i=this._tiles[t].el).onload=u,i.onerror=u,i.complete||(i.src=K,e=this._tiles[t].coords,T(i),delete this._tiles[t],this.fire("tileabort",{tile:i,coords:e})))},_removeTile:function(t){var e=this._tiles[t];if(e)return e.el.setAttribute("src",K),Ni.prototype._removeTile.call(this,t)},_tileReady:function(t,e,i){if(this._map&&(!i||i.getAttribute("src")!==K))return Ni.prototype._tileReady.call(this,t,e,i)}});function ji(t,e){return new Di(t,e)}var Hi=Di.extend({defaultWmsParams:{service:"WMS",request:"GetMap",layers:"",styles:"",format:"image/jpeg",transparent:!1,version:"1.1.1"},options:{crs:null,uppercase:!1},initialize:function(t,e){this._url=t;var i,n=l({},this.defaultWmsParams);for(i in e)i in this.options||(n[i]=e[i]);var t=(e=c(this,e)).detectRetina&&b.retina?2:1,o=this.getTileSize();n.width=o.x*t,n.height=o.y*t,this.wmsParams=n},onAdd:function(t){this._crs=this.options.crs||t.options.crs,this._wmsVersion=parseFloat(this.wmsParams.version);var e=1.3<=this._wmsVersion?"crs":"srs";this.wmsParams[e]=this._crs.code,Di.prototype.onAdd.call(this,t)},getTileUrl:function(t){var e=this._tileCoordsToNwSe(t),i=this._crs,i=_(i.project(e[0]),i.project(e[1])),e=i.min,i=i.max,e=(1.3<=this._wmsVersion&&this._crs===li?[e.y,e.x,i.y,i.x]:[e.x,e.y,i.x,i.y]).join(","),i=Di.prototype.getTileUrl.call(this,t);return i+U(this.wmsParams,i,this.options.uppercase)+(this.options.uppercase?"&BBOX=":"&bbox=")+e},setParams:function(t,e){return l(this.wmsParams,t),e||this.redraw(),this}});Di.WMS=Hi,ji.wms=function(t,e){return new Hi(t,e)};var Wi=o.extend({options:{padding:.1},initialize:function(t){c(this,t),h(this),this._layers=this._layers||{}},onAdd:function(){this._container||(this._initContainer(),M(this._container,"leaflet-zoom-animated")),this.getPane().appendChild(this._container),this._update(),this.on("update",this._updatePaths,this)},onRemove:function(){this.off("update",this._updatePaths,this),this._destroyContainer()},getEvents:function(){var t={viewreset:this._reset,zoom:this._onZoom,moveend:this._update,zoomend:this._onZoomEnd};return this._zoomAnimated&&(t.zoomanim=this._onAnimZoom),t},_onAnimZoom:function(t){this._updateTransform(t.center,t.zoom)},_onZoom:function(){this._updateTransform(this._map.getCenter(),this._map.getZoom())},_updateTransform:function(t,e){var i=this._map.getZoomScale(e,this._zoom),n=this._map.getSize().multiplyBy(.5+this.options.padding),o=this._map.project(this._center,e),n=n.multiplyBy(-i).add(o).subtract(this._map._getNewPixelOrigin(t,e));b.any3d?be(this._container,n,i):Z(this._container,n)},_reset:function(){for(var t in this._update(),this._updateTransform(this._center,this._zoom),this._layers)this._layers[t]._reset()},_onZoomEnd:function(){for(var t in this._layers)this._layers[t]._project()},_updatePaths:function(){for(var t in this._layers)this._layers[t]._update()},_update:function(){var t=this.options.padding,e=this._map.getSize(),i=this._map.containerPointToLayerPoint(e.multiplyBy(-t)).round();this._bounds=new f(i,i.add(e.multiplyBy(1+2*t)).round()),this._center=this._map.getCenter(),this._zoom=this._map.getZoom()}}),Fi=Wi.extend({options:{tolerance:0},getEvents:function(){var t=Wi.prototype.getEvents.call(this);return t.viewprereset=this._onViewPreReset,t},_onViewPreReset:function(){this._postponeUpdatePaths=!0},onAdd:function(){Wi.prototype.onAdd.call(this),this._draw()},_initContainer:function(){var t=this._container=document.createElement("canvas");S(t,"mousemove",this._onMouseMove,this),S(t,"click dblclick mousedown mouseup contextmenu",this._onClick,this),S(t,"mouseout",this._handleMouseOut,this),t._leaflet_disable_events=!0,this._ctx=t.getContext("2d")},_destroyContainer:function(){r(this._redrawRequest),delete this._ctx,T(this._container),k(this._container),delete this._container},_updatePaths:function(){if(!this._postponeUpdatePaths){for(var t in this._redrawBounds=null,this._layers)this._layers[t]._update();this._redraw()}},_update:function(){var t,e,i,n;this._map._animatingZoom&&this._bounds||(Wi.prototype._update.call(this),t=this._bounds,e=this._container,i=t.getSize(),n=b.retina?2:1,Z(e,t.min),e.width=n*i.x,e.height=n*i.y,e.style.width=i.x+"px",e.style.height=i.y+"px",b.retina&&this._ctx.scale(2,2),this._ctx.translate(-t.min.x,-t.min.y),this.fire("update"))},_reset:function(){Wi.prototype._reset.call(this),this._postponeUpdatePaths&&(this._postponeUpdatePaths=!1,this._updatePaths())},_initPath:function(t){this._updateDashArray(t);t=(this._layers[h(t)]=t)._order={layer:t,prev:this._drawLast,next:null};this._drawLast&&(this._drawLast.next=t),this._drawLast=t,this._drawFirst=this._drawFirst||this._drawLast},_addPath:function(t){this._requestRedraw(t)},_removePath:function(t){var e=t._order,i=e.next,e=e.prev;i?i.prev=e:this._drawLast=e,e?e.next=i:this._drawFirst=i,delete t._order,delete this._layers[h(t)],this._requestRedraw(t)},_updatePath:function(t){this._extendRedrawBounds(t),t._project(),t._update(),this._requestRedraw(t)},_updateStyle:function(t){this._updateDashArray(t),this._requestRedraw(t)},_updateDashArray:function(t){if("string"==typeof t.options.dashArray){for(var e,i=t.options.dashArray.split(/[, ]+/),n=[],o=0;o<i.length;o++){if(e=Number(i[o]),isNaN(e))return;n.push(e)}t.options._dashArray=n}else t.options._dashArray=t.options.dashArray},_requestRedraw:function(t){this._map&&(this._extendRedrawBounds(t),this._redrawRequest=this._redrawRequest||x(this._redraw,this))},_extendRedrawBounds:function(t){var e;t._pxBounds&&(e=(t.options.weight||0)+1,this._redrawBounds=this._redrawBounds||new f,this._redrawBounds.extend(t._pxBounds.min.subtract([e,e])),this._redrawBounds.extend(t._pxBounds.max.add([e,e])))},_redraw:function(){this._redrawRequest=null,this._redrawBounds&&(this._redrawBounds.min._floor(),this._redrawBounds.max._ceil()),this._clear(),this._draw(),this._redrawBounds=null},_clear:function(){var t,e=this._redrawBounds;e?(t=e.getSize(),this._ctx.clearRect(e.min.x,e.min.y,t.x,t.y)):(this._ctx.save(),this._ctx.setTransform(1,0,0,1,0,0),this._ctx.clearRect(0,0,this._container.width,this._container.height),this._ctx.restore())},_draw:function(){var t,e,i=this._redrawBounds;this._ctx.save(),i&&(e=i.getSize(),this._ctx.beginPath(),this._ctx.rect(i.min.x,i.min.y,e.x,e.y),this._ctx.clip()),this._drawing=!0;for(var n=this._drawFirst;n;n=n.next)t=n.layer,(!i||t._pxBounds&&t._pxBounds.intersects(i))&&t._updatePath();this._drawing=!1,this._ctx.restore()},_updatePoly:function(t,e){if(this._drawing){var i,n,o,s,r=t._parts,a=r.length,h=this._ctx;if(a){for(h.beginPath(),i=0;i<a;i++){for(n=0,o=r[i].length;n<o;n++)s=r[i][n],h[n?"lineTo":"moveTo"](s.x,s.y);e&&h.closePath()}this._fillStroke(h,t)}}},_updateCircle:function(t){var e,i,n,o;this._drawing&&!t._empty()&&(e=t._point,i=this._ctx,n=Math.max(Math.round(t._radius),1),1!=(o=(Math.max(Math.round(t._radiusY),1)||n)/n)&&(i.save(),i.scale(1,o)),i.beginPath(),i.arc(e.x,e.y/o,n,0,2*Math.PI,!1),1!=o&&i.restore(),this._fillStroke(i,t))},_fillStroke:function(t,e){var i=e.options;i.fill&&(t.globalAlpha=i.fillOpacity,t.fillStyle=i.fillColor||i.color,t.fill(i.fillRule||"evenodd")),i.stroke&&0!==i.weight&&(t.setLineDash&&t.setLineDash(e.options&&e.options._dashArray||[]),t.globalAlpha=i.opacity,t.lineWidth=i.weight,t.strokeStyle=i.color,t.lineCap=i.lineCap,t.lineJoin=i.lineJoin,t.stroke())},_onClick:function(t){for(var e,i,n=this._map.mouseEventToLayerPoint(t),o=this._drawFirst;o;o=o.next)(e=o.layer).options.interactive&&e._containsPoint(n)&&(("click"===t.type||"preclick"===t.type)&&this._map._draggableMoved(e)||(i=e));this._fireEvent(!!i&&[i],t)},_onMouseMove:function(t){var e;!this._map||this._map.dragging.moving()||this._map._animatingZoom||(e=this._map.mouseEventToLayerPoint(t),this._handleMouseHover(t,e))},_handleMouseOut:function(t){var e=this._hoveredLayer;e&&(z(this._container,"leaflet-interactive"),this._fireEvent([e],t,"mouseout"),this._hoveredLayer=null,this._mouseHoverThrottled=!1)},_handleMouseHover:function(t,e){if(!this._mouseHoverThrottled){for(var i,n,o=this._drawFirst;o;o=o.next)(i=o.layer).options.interactive&&i._containsPoint(e)&&(n=i);n!==this._hoveredLayer&&(this._handleMouseOut(t),n&&(M(this._container,"leaflet-interactive"),this._fireEvent([n],t,"mouseover"),this._hoveredLayer=n)),this._fireEvent(!!this._hoveredLayer&&[this._hoveredLayer],t),this._mouseHoverThrottled=!0,setTimeout(a(function(){this._mouseHoverThrottled=!1},this),32)}},_fireEvent:function(t,e,i){this._map._fireDOMEvent(e,i||e.type,t)},_bringToFront:function(t){var e,i,n=t._order;n&&(e=n.next,i=n.prev,e&&((e.prev=i)?i.next=e:e&&(this._drawFirst=e),n.prev=this._drawLast,(this._drawLast.next=n).next=null,this._drawLast=n,this._requestRedraw(t)))},_bringToBack:function(t){var e,i,n=t._order;n&&(e=n.next,(i=n.prev)&&((i.next=e)?e.prev=i:i&&(this._drawLast=i),n.prev=null,n.next=this._drawFirst,this._drawFirst.prev=n,this._drawFirst=n,this._requestRedraw(t)))}});function Ui(t){return b.canvas?new Fi(t):null}var Vi=function(){try{return document.namespaces.add("lvml","urn:schemas-microsoft-com:vml"),function(t){return document.createElement("<lvml:"+t+' class="lvml">')}}catch(t){}return function(t){return document.createElement("<"+t+' xmlns="urn:schemas-microsoft.com:vml" class="lvml">')}}(),zt={_initContainer:function(){this._container=P("div","leaflet-vml-container")},_update:function(){this._map._animatingZoom||(Wi.prototype._update.call(this),this.fire("update"))},_initPath:function(t){var e=t._container=Vi("shape");M(e,"leaflet-vml-shape "+(this.options.className||"")),e.coordsize="1 1",t._path=Vi("path"),e.appendChild(t._path),this._updateStyle(t),this._layers[h(t)]=t},_addPath:function(t){var e=t._container;this._container.appendChild(e),t.options.interactive&&t.addInteractiveTarget(e)},_removePath:function(t){var e=t._container;T(e),t.removeInteractiveTarget(e),delete this._layers[h(t)]},_updateStyle:function(t){var e=t._stroke,i=t._fill,n=t.options,o=t._container;o.stroked=!!n.stroke,o.filled=!!n.fill,n.stroke?(e=e||(t._stroke=Vi("stroke")),o.appendChild(e),e.weight=n.weight+"px",e.color=n.color,e.opacity=n.opacity,n.dashArray?e.dashStyle=d(n.dashArray)?n.dashArray.join(" "):n.dashArray.replace(/( *, *)/g," "):e.dashStyle="",e.endcap=n.lineCap.replace("butt","flat"),e.joinstyle=n.lineJoin):e&&(o.removeChild(e),t._stroke=null),n.fill?(i=i||(t._fill=Vi("fill")),o.appendChild(i),i.color=n.fillColor||n.color,i.opacity=n.fillOpacity):i&&(o.removeChild(i),t._fill=null)},_updateCircle:function(t){var e=t._point.round(),i=Math.round(t._radius),n=Math.round(t._radiusY||i);this._setPath(t,t._empty()?"M0 0":"AL "+e.x+","+e.y+" "+i+","+n+" 0,23592600")},_setPath:function(t,e){t._path.v=e},_bringToFront:function(t){fe(t._container)},_bringToBack:function(t){ge(t._container)}},qi=b.vml?Vi:ct,Gi=Wi.extend({_initContainer:function(){this._container=qi("svg"),this._container.setAttribute("pointer-events","none"),this._rootGroup=qi("g"),this._container.appendChild(this._rootGroup)},_destroyContainer:function(){T(this._container),k(this._container),delete this._container,delete this._rootGroup,delete this._svgSize},_update:function(){var t,e,i;this._map._animatingZoom&&this._bounds||(Wi.prototype._update.call(this),e=(t=this._bounds).getSize(),i=this._container,this._svgSize&&this._svgSize.equals(e)||(this._svgSize=e,i.setAttribute("width",e.x),i.setAttribute("height",e.y)),Z(i,t.min),i.setAttribute("viewBox",[t.min.x,t.min.y,e.x,e.y].join(" ")),this.fire("update"))},_initPath:function(t){var e=t._path=qi("path");t.options.className&&M(e,t.options.className),t.options.interactive&&M(e,"leaflet-interactive"),this._updateStyle(t),this._layers[h(t)]=t},_addPath:function(t){this._rootGroup||this._initContainer(),this._rootGroup.appendChild(t._path),t.addInteractiveTarget(t._path)},_removePath:function(t){T(t._path),t.removeInteractiveTarget(t._path),delete this._layers[h(t)]},_updatePath:function(t){t._project(),t._update()},_updateStyle:function(t){var e=t._path,t=t.options;e&&(t.stroke?(e.setAttribute("stroke",t.color),e.setAttribute("stroke-opacity",t.opacity),e.setAttribute("stroke-width",t.weight),e.setAttribute("stroke-linecap",t.lineCap),e.setAttribute("stroke-linejoin",t.lineJoin),t.dashArray?e.setAttribute("stroke-dasharray",t.dashArray):e.removeAttribute("stroke-dasharray"),t.dashOffset?e.setAttribute("stroke-dashoffset",t.dashOffset):e.removeAttribute("stroke-dashoffset")):e.setAttribute("stroke","none"),t.fill?(e.setAttribute("fill",t.fillColor||t.color),e.setAttribute("fill-opacity",t.fillOpacity),e.setAttribute("fill-rule",t.fillRule||"evenodd")):e.setAttribute("fill","none"))},_updatePoly:function(t,e){this._setPath(t,dt(t._parts,e))},_updateCircle:function(t){var e=t._point,i=Math.max(Math.round(t._radius),1),n="a"+i+","+(Math.max(Math.round(t._radiusY),1)||i)+" 0 1,0 ",e=t._empty()?"M0 0":"M"+(e.x-i)+","+e.y+n+2*i+",0 "+n+2*-i+",0 ";this._setPath(t,e)},_setPath:function(t,e){t._path.setAttribute("d",e)},_bringToFront:function(t){fe(t._path)},_bringToBack:function(t){ge(t._path)}});function Ki(t){return b.svg||b.vml?new Gi(t):null}b.vml&&Gi.include(zt),A.include({getRenderer:function(t){t=(t=t.options.renderer||this._getPaneRenderer(t.options.pane)||this.options.renderer||this._renderer)||(this._renderer=this._createRenderer());return this.hasLayer(t)||this.addLayer(t),t},_getPaneRenderer:function(t){var e;return"overlayPane"!==t&&void 0!==t&&(void 0===(e=this._paneRenderers[t])&&(e=this._createRenderer({pane:t}),this._paneRenderers[t]=e),e)},_createRenderer:function(t){return this.options.preferCanvas&&Ui(t)||Ki(t)}});var Yi=xi.extend({initialize:function(t,e){xi.prototype.initialize.call(this,this._boundsToLatLngs(t),e)},setBounds:function(t){return this.setLatLngs(this._boundsToLatLngs(t))},_boundsToLatLngs:function(t){return[(t=g(t)).getSouthWest(),t.getNorthWest(),t.getNorthEast(),t.getSouthEast()]}});Gi.create=qi,Gi.pointsToPath=dt,wi.geometryToLayer=bi,wi.coordsToLatLng=Li,wi.coordsToLatLngs=Ti,wi.latLngToCoords=Mi,wi.latLngsToCoords=zi,wi.getFeature=Ci,wi.asFeature=Zi,A.mergeOptions({boxZoom:!0});var _t=n.extend({initialize:function(t){this._map=t,this._container=t._container,this._pane=t._panes.overlayPane,this._resetStateTimeout=0,t.on("unload",this._destroy,this)},addHooks:function(){S(this._container,"mousedown",this._onMouseDown,this)},removeHooks:function(){k(this._container,"mousedown",this._onMouseDown,this)},moved:function(){return this._moved},_destroy:function(){T(this._pane),delete this._pane},_resetState:function(){this._resetStateTimeout=0,this._moved=!1},_clearDeferredResetState:function(){0!==this._resetStateTimeout&&(clearTimeout(this._resetStateTimeout),this._resetStateTimeout=0)},_onMouseDown:function(t){if(!t.shiftKey||1!==t.which&&1!==t.button)return!1;this._clearDeferredResetState(),this._resetState(),re(),Le(),this._startPoint=this._map.mouseEventToContainerPoint(t),S(document,{contextmenu:Re,mousemove:this._onMouseMove,mouseup:this._onMouseUp,keydown:this._onKeyDown},this)},_onMouseMove:function(t){this._moved||(this._moved=!0,this._box=P("div","leaflet-zoom-box",this._container),M(this._container,"leaflet-crosshair"),this._map.fire("boxzoomstart")),this._point=this._map.mouseEventToContainerPoint(t);var t=new f(this._point,this._startPoint),e=t.getSize();Z(this._box,t.min),this._box.style.width=e.x+"px",this._box.style.height=e.y+"px"},_finish:function(){this._moved&&(T(this._box),z(this._container,"leaflet-crosshair")),ae(),Te(),k(document,{contextmenu:Re,mousemove:this._onMouseMove,mouseup:this._onMouseUp,keydown:this._onKeyDown},this)},_onMouseUp:function(t){1!==t.which&&1!==t.button||(this._finish(),this._moved&&(this._clearDeferredResetState(),this._resetStateTimeout=setTimeout(a(this._resetState,this),0),t=new s(this._map.containerPointToLatLng(this._startPoint),this._map.containerPointToLatLng(this._point)),this._map.fitBounds(t).fire("boxzoomend",{boxZoomBounds:t})))},_onKeyDown:function(t){27===t.keyCode&&(this._finish(),this._clearDeferredResetState(),this._resetState())}}),Ct=(A.addInitHook("addHandler","boxZoom",_t),A.mergeOptions({doubleClickZoom:!0}),n.extend({addHooks:function(){this._map.on("dblclick",this._onDoubleClick,this)},removeHooks:function(){this._map.off("dblclick",this._onDoubleClick,this)},_onDoubleClick:function(t){var e=this._map,i=e.getZoom(),n=e.options.zoomDelta,i=t.originalEvent.shiftKey?i-n:i+n;"center"===e.options.doubleClickZoom?e.setZoom(i):e.setZoomAround(t.containerPoint,i)}})),Zt=(A.addInitHook("addHandler","doubleClickZoom",Ct),A.mergeOptions({dragging:!0,inertia:!0,inertiaDeceleration:3400,inertiaMaxSpeed:1/0,easeLinearity:.2,worldCopyJump:!1,maxBoundsViscosity:0}),n.extend({addHooks:function(){var t;this._draggable||(t=this._map,this._draggable=new Xe(t._mapPane,t._container),this._draggable.on({dragstart:this._onDragStart,drag:this._onDrag,dragend:this._onDragEnd},this),this._draggable.on("predrag",this._onPreDragLimit,this),t.options.worldCopyJump&&(this._draggable.on("predrag",this._onPreDragWrap,this),t.on("zoomend",this._onZoomEnd,this),t.whenReady(this._onZoomEnd,this))),M(this._map._container,"leaflet-grab leaflet-touch-drag"),this._draggable.enable(),this._positions=[],this._times=[]},removeHooks:function(){z(this._map._container,"leaflet-grab"),z(this._map._container,"leaflet-touch-drag"),this._draggable.disable()},moved:function(){return this._draggable&&this._draggable._moved},moving:function(){return this._draggable&&this._draggable._moving},_onDragStart:function(){var t,e=this._map;e._stop(),this._map.options.maxBounds&&this._map.options.maxBoundsViscosity?(t=g(this._map.options.maxBounds),this._offsetLimit=_(this._map.latLngToContainerPoint(t.getNorthWest()).multiplyBy(-1),this._map.latLngToContainerPoint(t.getSouthEast()).multiplyBy(-1).add(this._map.getSize())),this._viscosity=Math.min(1,Math.max(0,this._map.options.maxBoundsViscosity))):this._offsetLimit=null,e.fire("movestart").fire("dragstart"),e.options.inertia&&(this._positions=[],this._times=[])},_onDrag:function(t){var e,i;this._map.options.inertia&&(e=this._lastTime=+new Date,i=this._lastPos=this._draggable._absPos||this._draggable._newPos,this._positions.push(i),this._times.push(e),this._prunePositions(e)),this._map.fire("move",t).fire("drag",t)},_prunePositions:function(t){for(;1<this._positions.length&&50<t-this._times[0];)this._positions.shift(),this._times.shift()},_onZoomEnd:function(){var t=this._map.getSize().divideBy(2),e=this._map.latLngToLayerPoint([0,0]);this._initialWorldOffset=e.subtract(t).x,this._worldWidth=this._map.getPixelWorldBounds().getSize().x},_viscousLimit:function(t,e){return t-(t-e)*this._viscosity},_onPreDragLimit:function(){var t,e;this._viscosity&&this._offsetLimit&&(t=this._draggable._newPos.subtract(this._draggable._startPos),e=this._offsetLimit,t.x<e.min.x&&(t.x=this._viscousLimit(t.x,e.min.x)),t.y<e.min.y&&(t.y=this._viscousLimit(t.y,e.min.y)),t.x>e.max.x&&(t.x=this._viscousLimit(t.x,e.max.x)),t.y>e.max.y&&(t.y=this._viscousLimit(t.y,e.max.y)),this._draggable._newPos=this._draggable._startPos.add(t))},_onPreDragWrap:function(){var t=this._worldWidth,e=Math.round(t/2),i=this._initialWorldOffset,n=this._draggable._newPos.x,o=(n-e+i)%t+e-i,n=(n+e+i)%t-e-i,t=Math.abs(o+i)<Math.abs(n+i)?o:n;this._draggable._absPos=this._draggable._newPos.clone(),this._draggable._newPos.x=t},_onDragEnd:function(t){var e,i,n,o,s=this._map,r=s.options,a=!r.inertia||t.noInertia||this._times.length<2;s.fire("dragend",t),!a&&(this._prunePositions(+new Date),t=this._lastPos.subtract(this._positions[0]),a=(this._lastTime-this._times[0])/1e3,e=r.easeLinearity,a=(t=t.multiplyBy(e/a)).distanceTo([0,0]),i=Math.min(r.inertiaMaxSpeed,a),t=t.multiplyBy(i/a),n=i/(r.inertiaDeceleration*e),(o=t.multiplyBy(-n/2).round()).x||o.y)?(o=s._limitOffset(o,s.options.maxBounds),x(function(){s.panBy(o,{duration:n,easeLinearity:e,noMoveStart:!0,animate:!0})})):s.fire("moveend")}})),St=(A.addInitHook("addHandler","dragging",Zt),A.mergeOptions({keyboard:!0,keyboardPanDelta:80}),n.extend({keyCodes:{left:[37],right:[39],down:[40],up:[38],zoomIn:[187,107,61,171],zoomOut:[189,109,54,173]},initialize:function(t){this._map=t,this._setPanDelta(t.options.keyboardPanDelta),this._setZoomDelta(t.options.zoomDelta)},addHooks:function(){var t=this._map._container;t.tabIndex<=0&&(t.tabIndex="0"),S(t,{focus:this._onFocus,blur:this._onBlur,mousedown:this._onMouseDown},this),this._map.on({focus:this._addHooks,blur:this._removeHooks},this)},removeHooks:function(){this._removeHooks(),k(this._map._container,{focus:this._onFocus,blur:this._onBlur,mousedown:this._onMouseDown},this),this._map.off({focus:this._addHooks,blur:this._removeHooks},this)},_onMouseDown:function(){var t,e,i;this._focused||(i=document.body,t=document.documentElement,e=i.scrollTop||t.scrollTop,i=i.scrollLeft||t.scrollLeft,this._map._container.focus(),window.scrollTo(i,e))},_onFocus:function(){this._focused=!0,this._map.fire("focus")},_onBlur:function(){this._focused=!1,this._map.fire("blur")},_setPanDelta:function(t){for(var e=this._panKeys={},i=this.keyCodes,n=0,o=i.left.length;n<o;n++)e[i.left[n]]=[-1*t,0];for(n=0,o=i.right.length;n<o;n++)e[i.right[n]]=[t,0];for(n=0,o=i.down.length;n<o;n++)e[i.down[n]]=[0,t];for(n=0,o=i.up.length;n<o;n++)e[i.up[n]]=[0,-1*t]},_setZoomDelta:function(t){for(var e=this._zoomKeys={},i=this.keyCodes,n=0,o=i.zoomIn.length;n<o;n++)e[i.zoomIn[n]]=t;for(n=0,o=i.zoomOut.length;n<o;n++)e[i.zoomOut[n]]=-t},_addHooks:function(){S(document,"keydown",this._onKeyDown,this)},_removeHooks:function(){k(document,"keydown",this._onKeyDown,this)},_onKeyDown:function(t){if(!(t.altKey||t.ctrlKey||t.metaKey)){var e,i,n=t.keyCode,o=this._map;if(n in this._panKeys)o._panAnim&&o._panAnim._inProgress||(i=this._panKeys[n],t.shiftKey&&(i=m(i).multiplyBy(3)),o.options.maxBounds&&(i=o._limitOffset(m(i),o.options.maxBounds)),o.options.worldCopyJump?(e=o.wrapLatLng(o.unproject(o.project(o.getCenter()).add(i))),o.panTo(e)):o.panBy(i));else if(n in this._zoomKeys)o.setZoom(o.getZoom()+(t.shiftKey?3:1)*this._zoomKeys[n]);else{if(27!==n||!o._popup||!o._popup.options.closeOnEscapeKey)return;o.closePopup()}Re(t)}}})),Et=(A.addInitHook("addHandler","keyboard",St),A.mergeOptions({scrollWheelZoom:!0,wheelDebounceTime:40,wheelPxPerZoomLevel:60}),n.extend({addHooks:function(){S(this._map._container,"wheel",this._onWheelScroll,this),this._delta=0},removeHooks:function(){k(this._map._container,"wheel",this._onWheelScroll,this)},_onWheelScroll:function(t){var e=He(t),i=this._map.options.wheelDebounceTime,e=(this._delta+=e,this._lastMousePos=this._map.mouseEventToContainerPoint(t),this._startTime||(this._startTime=+new Date),Math.max(i-(+new Date-this._startTime),0));clearTimeout(this._timer),this._timer=setTimeout(a(this._performZoom,this),e),Re(t)},_performZoom:function(){var t=this._map,e=t.getZoom(),i=this._map.options.zoomSnap||0,n=(t._stop(),this._delta/(4*this._map.options.wheelPxPerZoomLevel)),n=4*Math.log(2/(1+Math.exp(-Math.abs(n))))/Math.LN2,i=i?Math.ceil(n/i)*i:n,n=t._limitZoom(e+(0<this._delta?i:-i))-e;this._delta=0,this._startTime=null,n&&("center"===t.options.scrollWheelZoom?t.setZoom(e+n):t.setZoomAround(this._lastMousePos,e+n))}})),kt=(A.addInitHook("addHandler","scrollWheelZoom",Et),A.mergeOptions({tapHold:b.touchNative&&b.safari&&b.mobile,tapTolerance:15}),n.extend({addHooks:function(){S(this._map._container,"touchstart",this._onDown,this)},removeHooks:function(){k(this._map._container,"touchstart",this._onDown,this)},_onDown:function(t){var e;clearTimeout(this._holdTimeout),1===t.touches.length&&(e=t.touches[0],this._startPos=this._newPos=new p(e.clientX,e.clientY),this._holdTimeout=setTimeout(a(function(){this._cancel(),this._isTapValid()&&(S(document,"touchend",O),S(document,"touchend touchcancel",this._cancelClickPrevent),this._simulateEvent("contextmenu",e))},this),600),S(document,"touchend touchcancel contextmenu",this._cancel,this),S(document,"touchmove",this._onMove,this))},_cancelClickPrevent:function t(){k(document,"touchend",O),k(document,"touchend touchcancel",t)},_cancel:function(){clearTimeout(this._holdTimeout),k(document,"touchend touchcancel contextmenu",this._cancel,this),k(document,"touchmove",this._onMove,this)},_onMove:function(t){t=t.touches[0];this._newPos=new p(t.clientX,t.clientY)},_isTapValid:function(){return this._newPos.distanceTo(this._startPos)<=this._map.options.tapTolerance},_simulateEvent:function(t,e){t=new MouseEvent(t,{bubbles:!0,cancelable:!0,view:window,screenX:e.screenX,screenY:e.screenY,clientX:e.clientX,clientY:e.clientY});t._simulated=!0,e.target.dispatchEvent(t)}})),Ot=(A.addInitHook("addHandler","tapHold",kt),A.mergeOptions({touchZoom:b.touch,bounceAtZoomLimits:!0}),n.extend({addHooks:function(){M(this._map._container,"leaflet-touch-zoom"),S(this._map._container,"touchstart",this._onTouchStart,this)},removeHooks:function(){z(this._map._container,"leaflet-touch-zoom"),k(this._map._container,"touchstart",this._onTouchStart,this)},_onTouchStart:function(t){var e,i,n=this._map;!t.touches||2!==t.touches.length||n._animatingZoom||this._zooming||(e=n.mouseEventToContainerPoint(t.touches[0]),i=n.mouseEventToContainerPoint(t.touches[1]),this._centerPoint=n.getSize()._divideBy(2),this._startLatLng=n.containerPointToLatLng(this._centerPoint),"center"!==n.options.touchZoom&&(this._pinchStartLatLng=n.containerPointToLatLng(e.add(i)._divideBy(2))),this._startDist=e.distanceTo(i),this._startZoom=n.getZoom(),this._moved=!1,this._zooming=!0,n._stop(),S(document,"touchmove",this._onTouchMove,this),S(document,"touchend touchcancel",this._onTouchEnd,this),O(t))},_onTouchMove:function(t){if(t.touches&&2===t.touches.length&&this._zooming){var e=this._map,i=e.mouseEventToContainerPoint(t.touches[0]),n=e.mouseEventToContainerPoint(t.touches[1]),o=i.distanceTo(n)/this._startDist;if(this._zoom=e.getScaleZoom(o,this._startZoom),!e.options.bounceAtZoomLimits&&(this._zoom<e.getMinZoom()&&o<1||this._zoom>e.getMaxZoom()&&1<o)&&(this._zoom=e._limitZoom(this._zoom)),"center"===e.options.touchZoom){if(this._center=this._startLatLng,1==o)return}else{i=i._add(n)._divideBy(2)._subtract(this._centerPoint);if(1==o&&0===i.x&&0===i.y)return;this._center=e.unproject(e.project(this._pinchStartLatLng,this._zoom).subtract(i),this._zoom)}this._moved||(e._moveStart(!0,!1),this._moved=!0),r(this._animRequest);n=a(e._move,e,this._center,this._zoom,{pinch:!0,round:!1},void 0);this._animRequest=x(n,this,!0),O(t)}},_onTouchEnd:function(){this._moved&&this._zooming?(this._zooming=!1,r(this._animRequest),k(document,"touchmove",this._onTouchMove,this),k(document,"touchend touchcancel",this._onTouchEnd,this),this._map.options.zoomAnimation?this._map._animateZoom(this._center,this._map._limitZoom(this._zoom),!0,this._map.options.zoomSnap):this._map._resetView(this._center,this._map._limitZoom(this._zoom))):this._zooming=!1}})),Xi=(A.addInitHook("addHandler","touchZoom",Ot),A.BoxZoom=_t,A.DoubleClickZoom=Ct,A.Drag=Zt,A.Keyboard=St,A.ScrollWheelZoom=Et,A.TapHold=kt,A.TouchZoom=Ot,t.Bounds=f,t.Browser=b,t.CRS=ot,t.Canvas=Fi,t.Circle=vi,t.CircleMarker=gi,t.Class=et,t.Control=B,t.DivIcon=Ri,t.DivOverlay=Ai,t.DomEvent=mt,t.DomUtil=pt,t.Draggable=Xe,t.Evented=it,t.FeatureGroup=ci,t.GeoJSON=wi,t.GridLayer=Ni,t.Handler=n,t.Icon=di,t.ImageOverlay=Ei,t.LatLng=v,t.LatLngBounds=s,t.Layer=o,t.LayerGroup=ui,t.LineUtil=vt,t.Map=A,t.Marker=mi,t.Mixin=ft,t.Path=fi,t.Point=p,t.PolyUtil=gt,t.Polygon=xi,t.Polyline=yi,t.Popup=Bi,t.PosAnimation=Fe,t.Projection=wt,t.Rectangle=Yi,t.Renderer=Wi,t.SVG=Gi,t.SVGOverlay=Oi,t.TileLayer=Di,t.Tooltip=Ii,t.Transformation=at,t.Util=tt,t.VideoOverlay=ki,t.bind=a,t.bounds=_,t.canvas=Ui,t.circle=function(t,e,i){return new vi(t,e,i)},t.circleMarker=function(t,e){return new gi(t,e)},t.control=Ue,t.divIcon=function(t){return new Ri(t)},t.extend=l,t.featureGroup=function(t,e){return new ci(t,e)},t.geoJSON=Si,t.geoJson=Mt,t.gridLayer=function(t){return new Ni(t)},t.icon=function(t){return new di(t)},t.imageOverlay=function(t,e,i){return new Ei(t,e,i)},t.latLng=w,t.latLngBounds=g,t.layerGroup=function(t,e){return new ui(t,e)},t.map=function(t,e){return new A(t,e)},t.marker=function(t,e){return new mi(t,e)},t.point=m,t.polygon=function(t,e){return new xi(t,e)},t.polyline=function(t,e){return new yi(t,e)},t.popup=function(t,e){return new Bi(t,e)},t.rectangle=function(t,e){return new Yi(t,e)},t.setOptions=c,t.stamp=h,t.svg=Ki,t.svgOverlay=function(t,e,i){return new Oi(t,e,i)},t.tileLayer=ji,t.tooltip=function(t,e){return new Ii(t,e)},t.transformation=ht,t.version="1.9.4",t.videoOverlay=function(t,e,i){return new ki(t,e,i)},window.L);t.noConflict=function(){return window.L=Xi,this},window.L=t});
+//# sourceMappingURL=leaflet.js.map
+  </script>
+  <style>
+/* ── RESPONSIVE REDESIGN OVERRIDES ───────────────────────────────────── */
+
+/* Neutralize old layout wrappers */
+#main-layout { display: contents !important; }
+#sidebar, #sidebar-overlay, #context-panel, #bottom-sheet { display: none !important; }
+
+/* App shell — full-height column */
+#app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+/* ── TOP BAR ── */
+#top-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 52px;
+  padding: 0 10px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  position: relative;
+  z-index: 100;
+}
+
+#btn-menu {
+  width: 36px; height: 36px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 8px; color: var(--muted);
+  flex-shrink: 0; cursor: pointer;
+  background: none; border: none;
+}
+#btn-menu:hover { color: var(--text); background: var(--bg-inset); }
+
+.ref-pill {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 12px;
+  background: var(--bg-inset); border: 1px solid var(--border);
+  border-radius: 20px; color: var(--text);
+  font-size: 15px; font-weight: 600;
+  cursor: pointer; white-space: nowrap;
+  flex: 1; min-width: 0; max-width: 220px;
+  justify-content: space-between;
+}
+.ref-pill:hover { border-color: var(--gold-light); }
+.ref-pill-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.topbar-gap { flex: 1; }
+
+.trans-pill {
+  display: flex; align-items: center; gap: 4px;
+  padding: 5px 10px;
+  background: var(--bg-inset); border: 1px solid var(--border);
+  border-radius: 16px; color: var(--text-dim);
+  font-size: 13px; font-weight: 500;
+  cursor: pointer; white-space: nowrap; flex-shrink: 0;
+}
+.trans-pill:hover { border-color: var(--gold-light); color: var(--text); }
+
+#btn-search-open, #btn-parallel-new {
+  width: 36px; height: 36px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 8px; color: var(--muted);
+  flex-shrink: 0; cursor: pointer;
+  background: none; border: none;
+}
+#btn-search-open:hover, #btn-parallel-new:hover { color: var(--text); background: var(--bg-inset); }
+#btn-parallel-new.active { color: var(--gold-light); }
+
+/* ── LAYOUT CONTAINER ── */
+#layout-container {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* ── READER AREA ── */
+#reader-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+#chapter-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.chapter-title-center {
+  flex: 1;
+  text-align: center;
+  min-width: 0;
+}
+
+#chapter-book-display {
+  font-size: 16px; font-weight: 700;
+  color: var(--gold-light); line-height: 1.2;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+#chapter-num-display {
+  font-size: 11px; color: var(--muted);
+}
+
+.ch-nav-btn {
+  width: 36px; height: 36px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 8px; color: var(--muted);
+  cursor: pointer; flex-shrink: 0;
+  background: none; border: 1px solid var(--border);
+  transition: all 0.1s;
+}
+.ch-nav-btn:hover { color: var(--text); border-color: var(--gold-light); }
+.ch-nav-btn:disabled { opacity: 0.3; pointer-events: none; }
+
+#chapter-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px 80px;
+}
+
+/* ── STUDY PANEL (desktop right column + mobile bottom sheet) ── */
+#study-panel {
+  display: none;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-panel);
+}
+
+.sheet-handle-row {
+  display: none;
+  justify-content: center;
+  padding: 10px 0 6px;
+  flex-shrink: 0;
+  cursor: grab;
+  touch-action: none;
+}
+.sheet-handle-pill {
+  width: 40px; height: 4px;
+  background: var(--border); border-radius: 2px;
+}
+
+.panel-tab-bar-wrap {
+  position: relative;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+.panel-tab-bar-wrap::after {
+  content: '';
+  position: absolute;
+  right: 0; top: 0; bottom: 0;
+  width: 36px;
+  background: linear-gradient(to right, transparent, var(--bg-panel, var(--bg)));
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
+.panel-tab-bar-wrap.scrolled-end::after { opacity: 0; }
+
+.panel-tab-bar {
+  display: flex;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.panel-tab-bar::-webkit-scrollbar { display: none; }
+
+.panel-tab-bar .tab-btn {
+  padding: 8px 9px;
+  font-size: 11.5px; color: var(--muted);
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  flex-shrink: 0; cursor: pointer;
+  background: none;
+  border-top: none; border-left: none; border-right: none;
+  transition: color 0.1s;
+}
+.panel-tab-bar .tab-btn.active {
+  color: var(--gold-light);
+  border-bottom-color: var(--gold-light);
+}
+
+.tab-content {
+  flex: 1; overflow-y: auto;
+  padding: 14px;
+}
+.tab-content.hidden { display: none; }
+
+/* ── MOBILE BOTTOM BAR ── */
+#mobile-bottom-bar {
+  display: flex;
+  height: 52px;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.mob-nav-btn {
+  flex: 1;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 2px; color: var(--muted);
+  font-size: 11px; cursor: pointer;
+  background: none; border: none; padding: 4px;
+  transition: color 0.1s;
+}
+.mob-nav-btn:hover { color: var(--gold-light); }
+.mob-nav-btn:disabled { opacity: 0.35; pointer-events: none; }
+
+/* ── MOBILE-SPECIFIC OVERRIDES ── */
+@media (max-width: 767px) {
+  #study-panel {
+    display: flex;
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    height: 0;
+    z-index: 500;
+    border-top: 1px solid var(--border);
+    border-radius: 16px 16px 0 0;
+    transition: height 0.3s cubic-bezier(0.4,0,0.2,1);
+    box-shadow: 0 -4px 24px rgba(0,0,0,0.35);
+  }
+  #study-panel.panel-open { height: 58%; }
+  #study-panel.panel-expanded { height: 92%; }
+
+  .sheet-handle-row { display: flex; }
+
+  #chapter-content { padding-bottom: 56px; }
+
+  .app-title { display: none; }
+}
+
+/* ── DESKTOP ── */
+@media (min-width: 768px) {
+  #study-panel {
+    display: flex;
+    width: 340px; flex-shrink: 0;
+    border-left: 1px solid var(--border);
+  }
+  #mobile-bottom-bar { display: none; }
+  #chapter-content { padding: 20px 28px 40px; }
+  #top-bar { padding: 0 16px; gap: 10px; }
+}
+
+@media (min-width: 768px) and (max-width: 1023px) {
+  #study-panel { width: 290px; }
+}
+
+/* ── PICKER MODALS ── */
+.picker-overlay {
+  position: fixed; inset: 0;
+  z-index: 800;
+  display: flex; align-items: flex-end;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.picker-overlay.open {
+  pointer-events: auto; opacity: 1;
+}
+
+.picker-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(0,0,0,0.6);
+}
+
+.picker-sheet {
+  position: relative; width: 100%;
+  max-height: 82vh;
+  background: var(--bg-panel);
+  border-radius: 18px 18px 0 0;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  transform: translateY(100%);
+  transition: transform 0.3s cubic-bezier(0.4,0,0.2,1);
+  box-shadow: 0 -4px 32px rgba(0,0,0,0.4);
+}
+.picker-overlay.open .picker-sheet { transform: translateY(0); }
+
+.picker-header {
+  display: flex; align-items: center;
+  gap: 8px; padding: 14px 14px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.picker-tab-btn {
+  flex: 1; padding: 8px 10px;
+  font-size: 13px; font-weight: 600;
+  color: var(--muted);
+  background: var(--bg-inset);
+  border-radius: 8px; cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.15s;
+}
+.picker-tab-btn.active {
+  background: var(--gold-dark);
+  color: #0a0a14;
+  border-color: var(--gold-dark);
+}
+
+.picker-close {
+  width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; background: var(--bg-inset);
+  color: var(--muted); font-size: 14px;
+  cursor: pointer; flex-shrink: 0; border: none;
+}
+.picker-close:hover { color: var(--text); background: var(--border); }
+
+.picker-body { flex: 1; overflow-y: auto; padding: 12px; }
+
+.picker-book-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 5px;
+}
+
+.picker-book-btn {
+  padding: 8px 2px;
+  font-size: 9.5px; font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  background: var(--bg-inset); border: 1px solid var(--border);
+  border-radius: 6px; cursor: pointer;
+  text-align: center; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  transition: all 0.1s;
+}
+.picker-book-btn:hover, .picker-book-btn.active {
+  background: var(--gold-dark); color: #0a0a14;
+  border-color: var(--gold-dark);
+}
+
+.picker-chapter-header {
+  display: flex; align-items: center;
+  gap: 12px; margin-bottom: 12px;
+}
+
+.picker-back-btn {
+  font-size: 13px; color: var(--gold-light);
+  cursor: pointer; background: none; border: none; padding: 4px 0;
+}
+
+#picker-selected-book {
+  font-size: 16px; font-weight: 700; color: var(--text);
+}
+
+.picker-chapter-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 5px;
+}
+
+.picker-chapter-btn {
+  padding: 11px 2px;
+  font-size: 14px; font-weight: 500;
+  color: var(--text-dim);
+  background: var(--bg-inset); border: 1px solid var(--border);
+  border-radius: 6px; cursor: pointer;
+  text-align: center; transition: all 0.1s;
+}
+.picker-chapter-btn:hover { background: var(--bg-selected); color: var(--text); }
+.picker-chapter-btn.active {
+  background: var(--gold-dark); color: #0a0a14;
+  border-color: var(--gold-dark); font-weight: 800;
+}
+
+/* Translation picker */
+.picker-sheet--trans { max-height: 65vh; }
+.picker-title { font-size: 15px; font-weight: 600; color: var(--text); }
+
+.trans-picker-list { overflow-y: auto; padding: 8px 10px 16px; }
+
+.trans-picker-item {
+  display: flex; align-items: center; gap: 12px;
+  width: 100%; padding: 12px 14px;
+  border-radius: 8px; cursor: pointer;
+  background: none; border: none;
+  color: var(--text); transition: background 0.1s;
+  text-align: left;
+}
+.trans-picker-item:hover { background: var(--bg-inset); }
+.trans-picker-item.active { background: color-mix(in srgb, var(--gold-dark) 15%, transparent); }
+
+.trans-abbr { font-size: 15px; font-weight: 800; color: var(--gold-light); width: 56px; flex-shrink: 0; }
+.trans-name { font-size: 13px; color: var(--text-dim); }
+
+/* ── MENU DRAWER ── */
+#menu-drawer {
+  position: fixed;
+  left: 0; top: 52px;
+  width: 220px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 0 0 12px 0;
+  z-index: 600; overflow: hidden;
+  transform: translateX(-100%);
+  transition: transform 0.25s cubic-bezier(0.4,0,0.2,1);
+  box-shadow: 4px 4px 20px rgba(0,0,0,0.35);
+}
+#menu-drawer.open { transform: translateX(0); }
+
+.menu-drawer-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 13px 16px;
+  font-size: 14px; color: var(--text);
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  border-left: none; border-right: none; border-top: none;
+  width: 100%; text-align: left;
+}
+.menu-drawer-item:hover { background: var(--bg-inset); }
+.menu-drawer-item:last-child { border-bottom: none; }
+.menu-drawer-item.danger { color: #e05555; }
+
+/* Desktop center pickers as dialogs */
+@media (min-width: 768px) {
+  .picker-overlay { align-items: center; justify-content: center; }
+  .picker-sheet {
+    border-radius: 12px;
+    width: 500px; max-width: 90vw;
+    transform: scale(0.94) translateY(0);
+    box-shadow: 0 16px 48px rgba(0,0,0,0.55);
+  }
+  .picker-overlay.open .picker-sheet { transform: scale(1) translateY(0); }
+  .picker-sheet--trans { width: 380px; }
+  .picker-book-grid { grid-template-columns: repeat(8, 1fr); }
+  .picker-chapter-grid { grid-template-columns: repeat(10, 1fr); }
+}
+  </style>
 </head>
 <body>
 <!-- ============================================================
@@ -3874,48 +5107,49 @@ img, svg {
 
   <!-- TOP BAR -->
   <header id="top-bar" role="banner">
-    <button id="hamburger-btn" aria-label="Open book navigation" aria-expanded="false" aria-controls="sidebar">
-      <span class="sr-only">Menu</span>
-      <span class="hamburger-icon" aria-hidden="true">
-        <span></span>
-        <span></span>
-        <span></span>
-      </span>
-    </button>
 
-    <span class="app-title" aria-hidden="true">✝ THE CHRIST PILLAR</span>
-
-    <label for="translation-select" class="sr-only">Bible Translation</label>
-    <select id="translation-select" aria-label="Select Bible translation">
-      <option value="KJV">KJV</option>
-      <option value="ESV" selected>ESV</option>
-      <option value="NIV">NIV</option>
-      <option value="NASB">NASB</option>
-      <option value="NLT">NLT</option>
-      <option value="NKJV">NKJV</option>
-      <option value="AMP">AMP</option>
-      <option value="CSB">CSB</option>
-      <option value="MSG">MSG</option>
-      <option value="RSV">RSV</option>
-    </select>
-
-    <button id="search-toggle-btn" aria-label="Open search" aria-controls="search-overlay">
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-        <circle cx="7.5" cy="7.5" r="5.5" stroke="currentColor" stroke-width="1.5"/>
-        <path d="M11.5 11.5L16 16" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+    <!-- Menu button (sessions, bookmarks, history) -->
+    <button id="btn-menu" aria-label="Open menu" aria-expanded="false" aria-controls="menu-drawer">
+      <svg width="18" height="14" viewBox="0 0 18 14" fill="none" aria-hidden="true">
+        <path d="M1 1h16M1 7h16M1 13h16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
       </svg>
     </button>
 
-    <input type="search" id="search-input" placeholder="Search scriptures…" aria-label="Search scriptures" autocomplete="off" spellcheck="false">
-
-    <button id="parallel-toggle-btn" aria-pressed="false" aria-label="Toggle parallel Bible view">
-      <svg width="15" height="14" viewBox="0 0 15 14" fill="none" aria-hidden="true">
-        <rect x="0.75" y="1" width="5.5" height="12" rx="1" stroke="currentColor" stroke-width="1.3"/>
-        <rect x="8.75" y="1" width="5.5" height="12" rx="1" stroke="currentColor" stroke-width="1.3"/>
+    <!-- Reference pill — tapping opens the book/chapter picker -->
+    <button id="btn-ref-pill" class="ref-pill" aria-label="Navigate to book and chapter" aria-haspopup="dialog">
+      <span class="ref-pill-text" id="ref-display">John 3</span>
+      <svg class="pill-chevron" width="10" height="6" viewBox="0 0 10 6" fill="none" aria-hidden="true">
+        <path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
-      <span class="btn-label">Parallel</span>
     </button>
 
+    <div class="topbar-gap"></div>
+
+    <!-- Translation pill -->
+    <button id="btn-trans-pill" class="trans-pill" aria-label="Select translation" aria-haspopup="dialog">
+      <span id="trans-display">KJV</span>
+      <svg class="pill-chevron" width="8" height="5" viewBox="0 0 8 5" fill="none" aria-hidden="true">
+        <path d="M1 1l3 3 3-3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
+
+    <!-- Search button -->
+    <button id="btn-search-open" aria-label="Search scriptures" aria-controls="search-overlay">
+      <svg width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true">
+        <circle cx="7" cy="7" r="5.2" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M10.5 10.5L15 15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+    </button>
+
+    <!-- Parallel toggle -->
+    <button id="btn-parallel-new" aria-pressed="false" aria-label="Toggle parallel view">
+      <svg width="14" height="13" viewBox="0 0 14 13" fill="none" aria-hidden="true">
+        <rect x="0.7" y="0.7" width="5" height="11.6" rx="1" stroke="currentColor" stroke-width="1.3"/>
+        <rect x="8.3" y="0.7" width="5" height="11.6" rx="1" stroke="currentColor" stroke-width="1.3"/>
+      </svg>
+    </button>
+
+    <!-- User chip -->
     <div id="user-chip" role="button" tabindex="0" aria-haspopup="true" aria-expanded="false" aria-label="User menu">
       <div class="user-initials" aria-hidden="true">JD</div>
       <span class="user-display-name">John Doe</span>
@@ -3972,926 +5206,198 @@ img, svg {
     </div>
   </header>
 
-  <!-- MAIN LAYOUT -->
-  <div id="main-layout">
+  <!-- MENU DRAWER (sessions / bookmarks / history / admin) -->
+  <div id="menu-drawer" role="dialog" aria-label="Menu" aria-hidden="true">
+    <button class="menu-drawer-item" id="menu-item-sessions" aria-label="Study Sessions">
+      <svg width="15" height="15" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+        <rect x="1" y="1" width="12" height="9" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
+        <path d="M4 13h6M7 10v3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+      </svg>
+      Study Sessions
+    </button>
+    <button class="menu-drawer-item" id="menu-item-bookmarks" aria-label="Bookmarks">
+      <svg width="15" height="15" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+        <path d="M2 1.5h10v11l-5-3-5 3V1.5z" stroke="currentColor" stroke-width="1.2"/>
+      </svg>
+      Bookmarks
+    </button>
+    <button class="menu-drawer-item" id="menu-item-history" aria-label="History">
+      <svg width="15" height="15" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+        <circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.2"/>
+        <path d="M7 4v3.5l2 1.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+      </svg>
+      History
+    </button>
+    <button class="menu-drawer-item" id="menu-item-admin" style="display:none" aria-label="Manage Users">
+      <svg width="15" height="15" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+        <circle cx="5" cy="4.5" r="2.5" stroke="currentColor" stroke-width="1.2"/>
+        <path d="M1 12c0-2.2 1.8-4 4-4s4 1.8 4 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+        <path d="M11 6v4M9 8h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+      </svg>
+      Manage Users
+    </button>
+  </div><!-- /#menu-drawer -->
 
-    <!-- SIDEBAR -->
-    <aside id="sidebar" aria-label="Book navigation">
-      <div class="sidebar-search">
-        <div class="sidebar-search-inner">
-          <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true">
-            <circle cx="5.5" cy="5.5" r="4" stroke="currentColor" stroke-width="1.3"/>
-            <path d="M8.5 8.5L12 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-          </svg>
-          <input type="search" placeholder="Find a book…" aria-label="Search books" autocomplete="off">
+  <!-- NAV PICKER MODAL — book/chapter grid -->
+  <div id="nav-picker" class="picker-overlay" role="dialog" aria-modal="true" aria-label="Navigate to book and chapter" aria-hidden="true">
+    <div class="picker-backdrop" id="nav-picker-backdrop"></div>
+    <div class="picker-sheet">
+      <div class="picker-header">
+        <button class="picker-tab-btn active" data-testament="OT" id="picker-ot-btn">Old Testament</button>
+        <button class="picker-tab-btn" data-testament="NT" id="picker-nt-btn">New Testament</button>
+        <button class="picker-close" id="btn-nav-picker-close" aria-label="Close">✕</button>
+      </div>
+      <div class="picker-body">
+        <div id="picker-book-view">
+          <div id="picker-book-grid" class="picker-book-grid"></div>
+        </div>
+        <div id="picker-chapter-view" class="hidden">
+          <div class="picker-chapter-header">
+            <button class="picker-back-btn" id="btn-picker-back">← Books</button>
+            <span id="picker-selected-book"></span>
+          </div>
+          <div id="picker-chapter-grid" class="picker-chapter-grid"></div>
         </div>
       </div>
+    </div>
+  </div><!-- /#nav-picker -->
 
-      <nav class="book-nav scroll-y" aria-label="Books of the Bible">
-        <div class="nav-section">
-          <div class="nav-section-label">Old Testament</div>
-          <div class="book-list">
-            <div class="book-item" data-book="genesis" data-chapters="50">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-genesis">
-                <span class="book-abbr">GEN</span>
-                <span class="book-name">Genesis</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-genesis" role="group" aria-label="Genesis chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span><span class="chapter-chip" data-chapter="32" tabindex="0">32</span><span class="chapter-chip" data-chapter="33" tabindex="0">33</span><span class="chapter-chip" data-chapter="34" tabindex="0">34</span><span class="chapter-chip" data-chapter="35" tabindex="0">35</span><span class="chapter-chip" data-chapter="36" tabindex="0">36</span><span class="chapter-chip" data-chapter="37" tabindex="0">37</span><span class="chapter-chip" data-chapter="38" tabindex="0">38</span><span class="chapter-chip" data-chapter="39" tabindex="0">39</span><span class="chapter-chip" data-chapter="40" tabindex="0">40</span><span class="chapter-chip" data-chapter="41" tabindex="0">41</span><span class="chapter-chip" data-chapter="42" tabindex="0">42</span><span class="chapter-chip" data-chapter="43" tabindex="0">43</span><span class="chapter-chip" data-chapter="44" tabindex="0">44</span><span class="chapter-chip" data-chapter="45" tabindex="0">45</span><span class="chapter-chip" data-chapter="46" tabindex="0">46</span><span class="chapter-chip" data-chapter="47" tabindex="0">47</span><span class="chapter-chip" data-chapter="48" tabindex="0">48</span><span class="chapter-chip" data-chapter="49" tabindex="0">49</span><span class="chapter-chip" data-chapter="50" tabindex="0">50</span></div>
-            </div>
-            <div class="book-item" data-book="exodus" data-chapters="40">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-exodus">
-                <span class="book-abbr">EXO</span>
-                <span class="book-name">Exodus</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-exodus" role="group" aria-label="Exodus chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span><span class="chapter-chip" data-chapter="32" tabindex="0">32</span><span class="chapter-chip" data-chapter="33" tabindex="0">33</span><span class="chapter-chip" data-chapter="34" tabindex="0">34</span><span class="chapter-chip" data-chapter="35" tabindex="0">35</span><span class="chapter-chip" data-chapter="36" tabindex="0">36</span><span class="chapter-chip" data-chapter="37" tabindex="0">37</span><span class="chapter-chip" data-chapter="38" tabindex="0">38</span><span class="chapter-chip" data-chapter="39" tabindex="0">39</span><span class="chapter-chip" data-chapter="40" tabindex="0">40</span></div>
-            </div>
-            <div class="book-item" data-book="leviticus" data-chapters="27">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-leviticus">
-                <span class="book-abbr">LEV</span>
-                <span class="book-name">Leviticus</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-leviticus" role="group" aria-label="Leviticus chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span></div>
-            </div>
-            <div class="book-item" data-book="numbers" data-chapters="36">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-numbers">
-                <span class="book-abbr">NUM</span>
-                <span class="book-name">Numbers</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-numbers" role="group" aria-label="Numbers chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span><span class="chapter-chip" data-chapter="32" tabindex="0">32</span><span class="chapter-chip" data-chapter="33" tabindex="0">33</span><span class="chapter-chip" data-chapter="34" tabindex="0">34</span><span class="chapter-chip" data-chapter="35" tabindex="0">35</span><span class="chapter-chip" data-chapter="36" tabindex="0">36</span></div>
-            </div>
-            <div class="book-item" data-book="deuteronomy" data-chapters="34">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-deuteronomy">
-                <span class="book-abbr">DEU</span>
-                <span class="book-name">Deuteronomy</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-deuteronomy" role="group" aria-label="Deuteronomy chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span><span class="chapter-chip" data-chapter="32" tabindex="0">32</span><span class="chapter-chip" data-chapter="33" tabindex="0">33</span><span class="chapter-chip" data-chapter="34" tabindex="0">34</span></div>
-            </div>
-            <div class="book-item" data-book="joshua" data-chapters="24">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-joshua">
-                <span class="book-abbr">JOS</span>
-                <span class="book-name">Joshua</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-joshua" role="group" aria-label="Joshua chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span></div>
-            </div>
-            <div class="book-item" data-book="judges" data-chapters="21">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-judges">
-                <span class="book-abbr">JDG</span>
-                <span class="book-name">Judges</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-judges" role="group" aria-label="Judges chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span></div>
-            </div>
-            <div class="book-item" data-book="ruth" data-chapters="4">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-ruth">
-                <span class="book-abbr">RUT</span>
-                <span class="book-name">Ruth</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-ruth" role="group" aria-label="Ruth chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span></div>
-            </div>
-            <div class="book-item" data-book="1_samuel" data-chapters="31">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-1_samuel">
-                <span class="book-abbr">1SA</span>
-                <span class="book-name">1 Samuel</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-1_samuel" role="group" aria-label="1 Samuel chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span></div>
-            </div>
-            <div class="book-item" data-book="2_samuel" data-chapters="24">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-2_samuel">
-                <span class="book-abbr">2SA</span>
-                <span class="book-name">2 Samuel</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-2_samuel" role="group" aria-label="2 Samuel chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span></div>
-            </div>
-            <div class="book-item" data-book="1_kings" data-chapters="22">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-1_kings">
-                <span class="book-abbr">1KI</span>
-                <span class="book-name">1 Kings</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-1_kings" role="group" aria-label="1 Kings chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span></div>
-            </div>
-            <div class="book-item" data-book="2_kings" data-chapters="25">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-2_kings">
-                <span class="book-abbr">2KI</span>
-                <span class="book-name">2 Kings</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-2_kings" role="group" aria-label="2 Kings chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span></div>
-            </div>
-            <div class="book-item" data-book="1_chronicles" data-chapters="29">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-1_chronicles">
-                <span class="book-abbr">1CH</span>
-                <span class="book-name">1 Chronicles</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-1_chronicles" role="group" aria-label="1 Chronicles chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span></div>
-            </div>
-            <div class="book-item" data-book="2_chronicles" data-chapters="36">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-2_chronicles">
-                <span class="book-abbr">2CH</span>
-                <span class="book-name">2 Chronicles</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-2_chronicles" role="group" aria-label="2 Chronicles chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span><span class="chapter-chip" data-chapter="32" tabindex="0">32</span><span class="chapter-chip" data-chapter="33" tabindex="0">33</span><span class="chapter-chip" data-chapter="34" tabindex="0">34</span><span class="chapter-chip" data-chapter="35" tabindex="0">35</span><span class="chapter-chip" data-chapter="36" tabindex="0">36</span></div>
-            </div>
-            <div class="book-item" data-book="ezra" data-chapters="10">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-ezra">
-                <span class="book-abbr">EZR</span>
-                <span class="book-name">Ezra</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-ezra" role="group" aria-label="Ezra chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span></div>
-            </div>
-            <div class="book-item" data-book="nehemiah" data-chapters="13">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-nehemiah">
-                <span class="book-abbr">NEH</span>
-                <span class="book-name">Nehemiah</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-nehemiah" role="group" aria-label="Nehemiah chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span></div>
-            </div>
-            <div class="book-item" data-book="esther" data-chapters="10">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-esther">
-                <span class="book-abbr">EST</span>
-                <span class="book-name">Esther</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-esther" role="group" aria-label="Esther chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span></div>
-            </div>
-            <div class="book-item" data-book="job" data-chapters="42">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-job">
-                <span class="book-abbr">JOB</span>
-                <span class="book-name">Job</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-job" role="group" aria-label="Job chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span><span class="chapter-chip" data-chapter="32" tabindex="0">32</span><span class="chapter-chip" data-chapter="33" tabindex="0">33</span><span class="chapter-chip" data-chapter="34" tabindex="0">34</span><span class="chapter-chip" data-chapter="35" tabindex="0">35</span><span class="chapter-chip" data-chapter="36" tabindex="0">36</span><span class="chapter-chip" data-chapter="37" tabindex="0">37</span><span class="chapter-chip" data-chapter="38" tabindex="0">38</span><span class="chapter-chip" data-chapter="39" tabindex="0">39</span><span class="chapter-chip" data-chapter="40" tabindex="0">40</span><span class="chapter-chip" data-chapter="41" tabindex="0">41</span><span class="chapter-chip" data-chapter="42" tabindex="0">42</span></div>
-            </div>
-            <div class="book-item" data-book="psalms" data-chapters="150">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-psalms">
-                <span class="book-abbr">PSA</span>
-                <span class="book-name">Psalms</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-psalms" role="group" aria-label="Psalms chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span><span class="chapter-chip" data-chapter="32" tabindex="0">32</span><span class="chapter-chip" data-chapter="33" tabindex="0">33</span><span class="chapter-chip" data-chapter="34" tabindex="0">34</span><span class="chapter-chip" data-chapter="35" tabindex="0">35</span><span class="chapter-chip" data-chapter="36" tabindex="0">36</span><span class="chapter-chip" data-chapter="37" tabindex="0">37</span><span class="chapter-chip" data-chapter="38" tabindex="0">38</span><span class="chapter-chip" data-chapter="39" tabindex="0">39</span><span class="chapter-chip" data-chapter="40" tabindex="0">40</span><span class="chapter-chip" data-chapter="41" tabindex="0">41</span><span class="chapter-chip" data-chapter="42" tabindex="0">42</span><span class="chapter-chip" data-chapter="43" tabindex="0">43</span><span class="chapter-chip" data-chapter="44" tabindex="0">44</span><span class="chapter-chip" data-chapter="45" tabindex="0">45</span><span class="chapter-chip" data-chapter="46" tabindex="0">46</span><span class="chapter-chip" data-chapter="47" tabindex="0">47</span><span class="chapter-chip" data-chapter="48" tabindex="0">48</span><span class="chapter-chip" data-chapter="49" tabindex="0">49</span><span class="chapter-chip" data-chapter="50" tabindex="0">50</span><span class="chapter-chip" data-chapter="51" tabindex="0">51</span><span class="chapter-chip" data-chapter="52" tabindex="0">52</span><span class="chapter-chip" data-chapter="53" tabindex="0">53</span><span class="chapter-chip" data-chapter="54" tabindex="0">54</span><span class="chapter-chip" data-chapter="55" tabindex="0">55</span><span class="chapter-chip" data-chapter="56" tabindex="0">56</span><span class="chapter-chip" data-chapter="57" tabindex="0">57</span><span class="chapter-chip" data-chapter="58" tabindex="0">58</span><span class="chapter-chip" data-chapter="59" tabindex="0">59</span><span class="chapter-chip" data-chapter="60" tabindex="0">60</span><span class="chapter-chip" data-chapter="61" tabindex="0">61</span><span class="chapter-chip" data-chapter="62" tabindex="0">62</span><span class="chapter-chip" data-chapter="63" tabindex="0">63</span><span class="chapter-chip" data-chapter="64" tabindex="0">64</span><span class="chapter-chip" data-chapter="65" tabindex="0">65</span><span class="chapter-chip" data-chapter="66" tabindex="0">66</span><span class="chapter-chip" data-chapter="67" tabindex="0">67</span><span class="chapter-chip" data-chapter="68" tabindex="0">68</span><span class="chapter-chip" data-chapter="69" tabindex="0">69</span><span class="chapter-chip" data-chapter="70" tabindex="0">70</span><span class="chapter-chip" data-chapter="71" tabindex="0">71</span><span class="chapter-chip" data-chapter="72" tabindex="0">72</span><span class="chapter-chip" data-chapter="73" tabindex="0">73</span><span class="chapter-chip" data-chapter="74" tabindex="0">74</span><span class="chapter-chip" data-chapter="75" tabindex="0">75</span><span class="chapter-chip" data-chapter="76" tabindex="0">76</span><span class="chapter-chip" data-chapter="77" tabindex="0">77</span><span class="chapter-chip" data-chapter="78" tabindex="0">78</span><span class="chapter-chip" data-chapter="79" tabindex="0">79</span><span class="chapter-chip" data-chapter="80" tabindex="0">80</span><span class="chapter-chip" data-chapter="81" tabindex="0">81</span><span class="chapter-chip" data-chapter="82" tabindex="0">82</span><span class="chapter-chip" data-chapter="83" tabindex="0">83</span><span class="chapter-chip" data-chapter="84" tabindex="0">84</span><span class="chapter-chip" data-chapter="85" tabindex="0">85</span><span class="chapter-chip" data-chapter="86" tabindex="0">86</span><span class="chapter-chip" data-chapter="87" tabindex="0">87</span><span class="chapter-chip" data-chapter="88" tabindex="0">88</span><span class="chapter-chip" data-chapter="89" tabindex="0">89</span><span class="chapter-chip" data-chapter="90" tabindex="0">90</span><span class="chapter-chip" data-chapter="91" tabindex="0">91</span><span class="chapter-chip" data-chapter="92" tabindex="0">92</span><span class="chapter-chip" data-chapter="93" tabindex="0">93</span><span class="chapter-chip" data-chapter="94" tabindex="0">94</span><span class="chapter-chip" data-chapter="95" tabindex="0">95</span><span class="chapter-chip" data-chapter="96" tabindex="0">96</span><span class="chapter-chip" data-chapter="97" tabindex="0">97</span><span class="chapter-chip" data-chapter="98" tabindex="0">98</span><span class="chapter-chip" data-chapter="99" tabindex="0">99</span><span class="chapter-chip" data-chapter="100" tabindex="0">100</span><span class="chapter-chip" data-chapter="101" tabindex="0">101</span><span class="chapter-chip" data-chapter="102" tabindex="0">102</span><span class="chapter-chip" data-chapter="103" tabindex="0">103</span><span class="chapter-chip" data-chapter="104" tabindex="0">104</span><span class="chapter-chip" data-chapter="105" tabindex="0">105</span><span class="chapter-chip" data-chapter="106" tabindex="0">106</span><span class="chapter-chip" data-chapter="107" tabindex="0">107</span><span class="chapter-chip" data-chapter="108" tabindex="0">108</span><span class="chapter-chip" data-chapter="109" tabindex="0">109</span><span class="chapter-chip" data-chapter="110" tabindex="0">110</span><span class="chapter-chip" data-chapter="111" tabindex="0">111</span><span class="chapter-chip" data-chapter="112" tabindex="0">112</span><span class="chapter-chip" data-chapter="113" tabindex="0">113</span><span class="chapter-chip" data-chapter="114" tabindex="0">114</span><span class="chapter-chip" data-chapter="115" tabindex="0">115</span><span class="chapter-chip" data-chapter="116" tabindex="0">116</span><span class="chapter-chip" data-chapter="117" tabindex="0">117</span><span class="chapter-chip" data-chapter="118" tabindex="0">118</span><span class="chapter-chip" data-chapter="119" tabindex="0">119</span><span class="chapter-chip" data-chapter="120" tabindex="0">120</span><span class="chapter-chip" data-chapter="121" tabindex="0">121</span><span class="chapter-chip" data-chapter="122" tabindex="0">122</span><span class="chapter-chip" data-chapter="123" tabindex="0">123</span><span class="chapter-chip" data-chapter="124" tabindex="0">124</span><span class="chapter-chip" data-chapter="125" tabindex="0">125</span><span class="chapter-chip" data-chapter="126" tabindex="0">126</span><span class="chapter-chip" data-chapter="127" tabindex="0">127</span><span class="chapter-chip" data-chapter="128" tabindex="0">128</span><span class="chapter-chip" data-chapter="129" tabindex="0">129</span><span class="chapter-chip" data-chapter="130" tabindex="0">130</span><span class="chapter-chip" data-chapter="131" tabindex="0">131</span><span class="chapter-chip" data-chapter="132" tabindex="0">132</span><span class="chapter-chip" data-chapter="133" tabindex="0">133</span><span class="chapter-chip" data-chapter="134" tabindex="0">134</span><span class="chapter-chip" data-chapter="135" tabindex="0">135</span><span class="chapter-chip" data-chapter="136" tabindex="0">136</span><span class="chapter-chip" data-chapter="137" tabindex="0">137</span><span class="chapter-chip" data-chapter="138" tabindex="0">138</span><span class="chapter-chip" data-chapter="139" tabindex="0">139</span><span class="chapter-chip" data-chapter="140" tabindex="0">140</span><span class="chapter-chip" data-chapter="141" tabindex="0">141</span><span class="chapter-chip" data-chapter="142" tabindex="0">142</span><span class="chapter-chip" data-chapter="143" tabindex="0">143</span><span class="chapter-chip" data-chapter="144" tabindex="0">144</span><span class="chapter-chip" data-chapter="145" tabindex="0">145</span><span class="chapter-chip" data-chapter="146" tabindex="0">146</span><span class="chapter-chip" data-chapter="147" tabindex="0">147</span><span class="chapter-chip" data-chapter="148" tabindex="0">148</span><span class="chapter-chip" data-chapter="149" tabindex="0">149</span><span class="chapter-chip" data-chapter="150" tabindex="0">150</span></div>
-            </div>
-            <div class="book-item" data-book="proverbs" data-chapters="31">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-proverbs">
-                <span class="book-abbr">PRO</span>
-                <span class="book-name">Proverbs</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-proverbs" role="group" aria-label="Proverbs chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span></div>
-            </div>
-            <div class="book-item" data-book="ecclesiastes" data-chapters="12">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-ecclesiastes">
-                <span class="book-abbr">ECC</span>
-                <span class="book-name">Ecclesiastes</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-ecclesiastes" role="group" aria-label="Ecclesiastes chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span></div>
-            </div>
-            <div class="book-item" data-book="song_of_solomon" data-chapters="8">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-song_of_solomon">
-                <span class="book-abbr">SNG</span>
-                <span class="book-name">Song of Solomon</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-song_of_solomon" role="group" aria-label="Song of Solomon chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span></div>
-            </div>
-            <div class="book-item" data-book="isaiah" data-chapters="66">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-isaiah">
-                <span class="book-abbr">ISA</span>
-                <span class="book-name">Isaiah</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-isaiah" role="group" aria-label="Isaiah chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span><span class="chapter-chip" data-chapter="32" tabindex="0">32</span><span class="chapter-chip" data-chapter="33" tabindex="0">33</span><span class="chapter-chip" data-chapter="34" tabindex="0">34</span><span class="chapter-chip" data-chapter="35" tabindex="0">35</span><span class="chapter-chip" data-chapter="36" tabindex="0">36</span><span class="chapter-chip" data-chapter="37" tabindex="0">37</span><span class="chapter-chip" data-chapter="38" tabindex="0">38</span><span class="chapter-chip" data-chapter="39" tabindex="0">39</span><span class="chapter-chip" data-chapter="40" tabindex="0">40</span><span class="chapter-chip" data-chapter="41" tabindex="0">41</span><span class="chapter-chip" data-chapter="42" tabindex="0">42</span><span class="chapter-chip" data-chapter="43" tabindex="0">43</span><span class="chapter-chip" data-chapter="44" tabindex="0">44</span><span class="chapter-chip" data-chapter="45" tabindex="0">45</span><span class="chapter-chip" data-chapter="46" tabindex="0">46</span><span class="chapter-chip" data-chapter="47" tabindex="0">47</span><span class="chapter-chip" data-chapter="48" tabindex="0">48</span><span class="chapter-chip" data-chapter="49" tabindex="0">49</span><span class="chapter-chip" data-chapter="50" tabindex="0">50</span><span class="chapter-chip" data-chapter="51" tabindex="0">51</span><span class="chapter-chip" data-chapter="52" tabindex="0">52</span><span class="chapter-chip" data-chapter="53" tabindex="0">53</span><span class="chapter-chip" data-chapter="54" tabindex="0">54</span><span class="chapter-chip" data-chapter="55" tabindex="0">55</span><span class="chapter-chip" data-chapter="56" tabindex="0">56</span><span class="chapter-chip" data-chapter="57" tabindex="0">57</span><span class="chapter-chip" data-chapter="58" tabindex="0">58</span><span class="chapter-chip" data-chapter="59" tabindex="0">59</span><span class="chapter-chip" data-chapter="60" tabindex="0">60</span><span class="chapter-chip" data-chapter="61" tabindex="0">61</span><span class="chapter-chip" data-chapter="62" tabindex="0">62</span><span class="chapter-chip" data-chapter="63" tabindex="0">63</span><span class="chapter-chip" data-chapter="64" tabindex="0">64</span><span class="chapter-chip" data-chapter="65" tabindex="0">65</span><span class="chapter-chip" data-chapter="66" tabindex="0">66</span></div>
-            </div>
-            <div class="book-item" data-book="jeremiah" data-chapters="52">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-jeremiah">
-                <span class="book-abbr">JER</span>
-                <span class="book-name">Jeremiah</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-jeremiah" role="group" aria-label="Jeremiah chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span><span class="chapter-chip" data-chapter="32" tabindex="0">32</span><span class="chapter-chip" data-chapter="33" tabindex="0">33</span><span class="chapter-chip" data-chapter="34" tabindex="0">34</span><span class="chapter-chip" data-chapter="35" tabindex="0">35</span><span class="chapter-chip" data-chapter="36" tabindex="0">36</span><span class="chapter-chip" data-chapter="37" tabindex="0">37</span><span class="chapter-chip" data-chapter="38" tabindex="0">38</span><span class="chapter-chip" data-chapter="39" tabindex="0">39</span><span class="chapter-chip" data-chapter="40" tabindex="0">40</span><span class="chapter-chip" data-chapter="41" tabindex="0">41</span><span class="chapter-chip" data-chapter="42" tabindex="0">42</span><span class="chapter-chip" data-chapter="43" tabindex="0">43</span><span class="chapter-chip" data-chapter="44" tabindex="0">44</span><span class="chapter-chip" data-chapter="45" tabindex="0">45</span><span class="chapter-chip" data-chapter="46" tabindex="0">46</span><span class="chapter-chip" data-chapter="47" tabindex="0">47</span><span class="chapter-chip" data-chapter="48" tabindex="0">48</span><span class="chapter-chip" data-chapter="49" tabindex="0">49</span><span class="chapter-chip" data-chapter="50" tabindex="0">50</span><span class="chapter-chip" data-chapter="51" tabindex="0">51</span><span class="chapter-chip" data-chapter="52" tabindex="0">52</span></div>
-            </div>
-            <div class="book-item" data-book="lamentations" data-chapters="5">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-lamentations">
-                <span class="book-abbr">LAM</span>
-                <span class="book-name">Lamentations</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-lamentations" role="group" aria-label="Lamentations chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span></div>
-            </div>
-            <div class="book-item" data-book="ezekiel" data-chapters="48">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-ezekiel">
-                <span class="book-abbr">EZK</span>
-                <span class="book-name">Ezekiel</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-ezekiel" role="group" aria-label="Ezekiel chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span><span class="chapter-chip" data-chapter="29" tabindex="0">29</span><span class="chapter-chip" data-chapter="30" tabindex="0">30</span><span class="chapter-chip" data-chapter="31" tabindex="0">31</span><span class="chapter-chip" data-chapter="32" tabindex="0">32</span><span class="chapter-chip" data-chapter="33" tabindex="0">33</span><span class="chapter-chip" data-chapter="34" tabindex="0">34</span><span class="chapter-chip" data-chapter="35" tabindex="0">35</span><span class="chapter-chip" data-chapter="36" tabindex="0">36</span><span class="chapter-chip" data-chapter="37" tabindex="0">37</span><span class="chapter-chip" data-chapter="38" tabindex="0">38</span><span class="chapter-chip" data-chapter="39" tabindex="0">39</span><span class="chapter-chip" data-chapter="40" tabindex="0">40</span><span class="chapter-chip" data-chapter="41" tabindex="0">41</span><span class="chapter-chip" data-chapter="42" tabindex="0">42</span><span class="chapter-chip" data-chapter="43" tabindex="0">43</span><span class="chapter-chip" data-chapter="44" tabindex="0">44</span><span class="chapter-chip" data-chapter="45" tabindex="0">45</span><span class="chapter-chip" data-chapter="46" tabindex="0">46</span><span class="chapter-chip" data-chapter="47" tabindex="0">47</span><span class="chapter-chip" data-chapter="48" tabindex="0">48</span></div>
-            </div>
-            <div class="book-item" data-book="daniel" data-chapters="12">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-daniel">
-                <span class="book-abbr">DAN</span>
-                <span class="book-name">Daniel</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-daniel" role="group" aria-label="Daniel chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span></div>
-            </div>
-            <div class="book-item" data-book="hosea" data-chapters="14">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-hosea">
-                <span class="book-abbr">HOS</span>
-                <span class="book-name">Hosea</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-hosea" role="group" aria-label="Hosea chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span></div>
-            </div>
-            <div class="book-item" data-book="joel" data-chapters="3">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-joel">
-                <span class="book-abbr">JOL</span>
-                <span class="book-name">Joel</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-joel" role="group" aria-label="Joel chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span></div>
-            </div>
-            <div class="book-item" data-book="amos" data-chapters="9">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-amos">
-                <span class="book-abbr">AMO</span>
-                <span class="book-name">Amos</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-amos" role="group" aria-label="Amos chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span></div>
-            </div>
-            <div class="book-item" data-book="obadiah" data-chapters="1">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-obadiah">
-                <span class="book-abbr">OBA</span>
-                <span class="book-name">Obadiah</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-obadiah" role="group" aria-label="Obadiah chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span></div>
-            </div>
-            <div class="book-item" data-book="jonah" data-chapters="4">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-jonah">
-                <span class="book-abbr">JON</span>
-                <span class="book-name">Jonah</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-jonah" role="group" aria-label="Jonah chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span></div>
-            </div>
-            <div class="book-item" data-book="micah" data-chapters="7">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-micah">
-                <span class="book-abbr">MIC</span>
-                <span class="book-name">Micah</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-micah" role="group" aria-label="Micah chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span></div>
-            </div>
-            <div class="book-item" data-book="nahum" data-chapters="3">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-nahum">
-                <span class="book-abbr">NAH</span>
-                <span class="book-name">Nahum</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-nahum" role="group" aria-label="Nahum chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span></div>
-            </div>
-            <div class="book-item" data-book="habakkuk" data-chapters="3">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-habakkuk">
-                <span class="book-abbr">HAB</span>
-                <span class="book-name">Habakkuk</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-habakkuk" role="group" aria-label="Habakkuk chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span></div>
-            </div>
-            <div class="book-item" data-book="zephaniah" data-chapters="3">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-zephaniah">
-                <span class="book-abbr">ZEP</span>
-                <span class="book-name">Zephaniah</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-zephaniah" role="group" aria-label="Zephaniah chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span></div>
-            </div>
-            <div class="book-item" data-book="haggai" data-chapters="2">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-haggai">
-                <span class="book-abbr">HAG</span>
-                <span class="book-name">Haggai</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-haggai" role="group" aria-label="Haggai chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span></div>
-            </div>
-            <div class="book-item" data-book="zechariah" data-chapters="14">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-zechariah">
-                <span class="book-abbr">ZEC</span>
-                <span class="book-name">Zechariah</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-zechariah" role="group" aria-label="Zechariah chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span></div>
-            </div>
-            <div class="book-item" data-book="malachi" data-chapters="4">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-malachi">
-                <span class="book-abbr">MAL</span>
-                <span class="book-name">Malachi</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-malachi" role="group" aria-label="Malachi chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span></div>
-            </div>
-          </div>
-        </div>
-        <div class="nav-section">
-          <div class="nav-section-label">New Testament</div>
-          <div class="book-list">
-            <div class="book-item" data-book="matthew" data-chapters="28">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-matthew">
-                <span class="book-abbr">MAT</span>
-                <span class="book-name">Matthew</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-matthew" role="group" aria-label="Matthew chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span></div>
-            </div>
-            <div class="book-item" data-book="mark" data-chapters="16">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-mark">
-                <span class="book-abbr">MRK</span>
-                <span class="book-name">Mark</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-mark" role="group" aria-label="Mark chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span></div>
-            </div>
-            <div class="book-item" data-book="luke" data-chapters="24">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-luke">
-                <span class="book-abbr">LUK</span>
-                <span class="book-name">Luke</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-luke" role="group" aria-label="Luke chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span></div>
-            </div>
-            <div class="book-item" data-book="john" data-chapters="21">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-john">
-                <span class="book-abbr">JHN</span>
-                <span class="book-name">John</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-john" role="group" aria-label="John chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span></div>
-            </div>
-            <div class="book-item" data-book="acts" data-chapters="28">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-acts">
-                <span class="book-abbr">ACT</span>
-                <span class="book-name">Acts</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-acts" role="group" aria-label="Acts chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span><span class="chapter-chip" data-chapter="23" tabindex="0">23</span><span class="chapter-chip" data-chapter="24" tabindex="0">24</span><span class="chapter-chip" data-chapter="25" tabindex="0">25</span><span class="chapter-chip" data-chapter="26" tabindex="0">26</span><span class="chapter-chip" data-chapter="27" tabindex="0">27</span><span class="chapter-chip" data-chapter="28" tabindex="0">28</span></div>
-            </div>
-            <div class="book-item" data-book="romans" data-chapters="16">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-romans">
-                <span class="book-abbr">ROM</span>
-                <span class="book-name">Romans</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-romans" role="group" aria-label="Romans chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span></div>
-            </div>
-            <div class="book-item" data-book="1_corinthians" data-chapters="16">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-1_corinthians">
-                <span class="book-abbr">1CO</span>
-                <span class="book-name">1 Corinthians</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-1_corinthians" role="group" aria-label="1 Corinthians chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span></div>
-            </div>
-            <div class="book-item" data-book="2_corinthians" data-chapters="13">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-2_corinthians">
-                <span class="book-abbr">2CO</span>
-                <span class="book-name">2 Corinthians</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-2_corinthians" role="group" aria-label="2 Corinthians chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span></div>
-            </div>
-            <div class="book-item" data-book="galatians" data-chapters="6">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-galatians">
-                <span class="book-abbr">GAL</span>
-                <span class="book-name">Galatians</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-galatians" role="group" aria-label="Galatians chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span></div>
-            </div>
-            <div class="book-item" data-book="ephesians" data-chapters="6">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-ephesians">
-                <span class="book-abbr">EPH</span>
-                <span class="book-name">Ephesians</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-ephesians" role="group" aria-label="Ephesians chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span></div>
-            </div>
-            <div class="book-item" data-book="philippians" data-chapters="4">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-philippians">
-                <span class="book-abbr">PHP</span>
-                <span class="book-name">Philippians</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-philippians" role="group" aria-label="Philippians chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span></div>
-            </div>
-            <div class="book-item" data-book="colossians" data-chapters="4">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-colossians">
-                <span class="book-abbr">COL</span>
-                <span class="book-name">Colossians</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-colossians" role="group" aria-label="Colossians chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span></div>
-            </div>
-            <div class="book-item" data-book="1_thessalonians" data-chapters="5">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-1_thessalonians">
-                <span class="book-abbr">1TH</span>
-                <span class="book-name">1 Thessalonians</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-1_thessalonians" role="group" aria-label="1 Thessalonians chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span></div>
-            </div>
-            <div class="book-item" data-book="2_thessalonians" data-chapters="3">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-2_thessalonians">
-                <span class="book-abbr">2TH</span>
-                <span class="book-name">2 Thessalonians</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-2_thessalonians" role="group" aria-label="2 Thessalonians chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span></div>
-            </div>
-            <div class="book-item" data-book="1_timothy" data-chapters="6">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-1_timothy">
-                <span class="book-abbr">1TI</span>
-                <span class="book-name">1 Timothy</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-1_timothy" role="group" aria-label="1 Timothy chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span></div>
-            </div>
-            <div class="book-item" data-book="2_timothy" data-chapters="4">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-2_timothy">
-                <span class="book-abbr">2TI</span>
-                <span class="book-name">2 Timothy</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-2_timothy" role="group" aria-label="2 Timothy chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span></div>
-            </div>
-            <div class="book-item" data-book="titus" data-chapters="3">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-titus">
-                <span class="book-abbr">TIT</span>
-                <span class="book-name">Titus</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-titus" role="group" aria-label="Titus chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span></div>
-            </div>
-            <div class="book-item" data-book="philemon" data-chapters="1">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-philemon">
-                <span class="book-abbr">PHM</span>
-                <span class="book-name">Philemon</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-philemon" role="group" aria-label="Philemon chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span></div>
-            </div>
-            <div class="book-item" data-book="hebrews" data-chapters="13">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-hebrews">
-                <span class="book-abbr">HEB</span>
-                <span class="book-name">Hebrews</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-hebrews" role="group" aria-label="Hebrews chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span></div>
-            </div>
-            <div class="book-item" data-book="james" data-chapters="5">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-james">
-                <span class="book-abbr">JAS</span>
-                <span class="book-name">James</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-james" role="group" aria-label="James chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span></div>
-            </div>
-            <div class="book-item" data-book="1_peter" data-chapters="5">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-1_peter">
-                <span class="book-abbr">1PE</span>
-                <span class="book-name">1 Peter</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-1_peter" role="group" aria-label="1 Peter chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span></div>
-            </div>
-            <div class="book-item" data-book="2_peter" data-chapters="3">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-2_peter">
-                <span class="book-abbr">2PE</span>
-                <span class="book-name">2 Peter</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-2_peter" role="group" aria-label="2 Peter chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span></div>
-            </div>
-            <div class="book-item" data-book="1_john" data-chapters="5">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-1_john">
-                <span class="book-abbr">1JN</span>
-                <span class="book-name">1 John</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-1_john" role="group" aria-label="1 John chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span></div>
-            </div>
-            <div class="book-item" data-book="2_john" data-chapters="1">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-2_john">
-                <span class="book-abbr">2JN</span>
-                <span class="book-name">2 John</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-2_john" role="group" aria-label="2 John chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span></div>
-            </div>
-            <div class="book-item" data-book="3_john" data-chapters="1">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-3_john">
-                <span class="book-abbr">3JN</span>
-                <span class="book-name">3 John</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-3_john" role="group" aria-label="3 John chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span></div>
-            </div>
-            <div class="book-item" data-book="jude" data-chapters="1">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-jude">
-                <span class="book-abbr">JUD</span>
-                <span class="book-name">Jude</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-jude" role="group" aria-label="Jude chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span></div>
-            </div>
-            <div class="book-item" data-book="revelation" data-chapters="22">
-              <button class="book-btn" aria-expanded="false" aria-controls="chapters-revelation">
-                <span class="book-abbr">REV</span>
-                <span class="book-name">Revelation</span>
-                <svg class="book-chevron" width="8" height="12" viewBox="0 0 8 12" fill="none" aria-hidden="true"><path d="M2 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="chapter-list" id="chapters-revelation" role="group" aria-label="Revelation chapters" hidden><span class="chapter-chip" data-chapter="1" tabindex="0">1</span><span class="chapter-chip" data-chapter="2" tabindex="0">2</span><span class="chapter-chip" data-chapter="3" tabindex="0">3</span><span class="chapter-chip" data-chapter="4" tabindex="0">4</span><span class="chapter-chip" data-chapter="5" tabindex="0">5</span><span class="chapter-chip" data-chapter="6" tabindex="0">6</span><span class="chapter-chip" data-chapter="7" tabindex="0">7</span><span class="chapter-chip" data-chapter="8" tabindex="0">8</span><span class="chapter-chip" data-chapter="9" tabindex="0">9</span><span class="chapter-chip" data-chapter="10" tabindex="0">10</span><span class="chapter-chip" data-chapter="11" tabindex="0">11</span><span class="chapter-chip" data-chapter="12" tabindex="0">12</span><span class="chapter-chip" data-chapter="13" tabindex="0">13</span><span class="chapter-chip" data-chapter="14" tabindex="0">14</span><span class="chapter-chip" data-chapter="15" tabindex="0">15</span><span class="chapter-chip" data-chapter="16" tabindex="0">16</span><span class="chapter-chip" data-chapter="17" tabindex="0">17</span><span class="chapter-chip" data-chapter="18" tabindex="0">18</span><span class="chapter-chip" data-chapter="19" tabindex="0">19</span><span class="chapter-chip" data-chapter="20" tabindex="0">20</span><span class="chapter-chip" data-chapter="21" tabindex="0">21</span><span class="chapter-chip" data-chapter="22" tabindex="0">22</span></div>
-            </div>
-          </div>
-        </div>
-      </nav>
-    </aside><!-- /#sidebar -->
+  <!-- TRANSLATION PICKER MODAL -->
+  <div id="trans-picker" class="picker-overlay" role="dialog" aria-modal="true" aria-label="Select translation" aria-hidden="true">
+    <div class="picker-backdrop" id="trans-picker-backdrop"></div>
+    <div class="picker-sheet picker-sheet--trans">
+      <div class="picker-header">
+        <span class="picker-title">Select Translation</span>
+        <button class="picker-close" id="btn-trans-picker-close" aria-label="Close">✕</button>
+      </div>
+      <div id="trans-picker-list" class="trans-picker-list"></div>
+    </div>
+  </div><!-- /#trans-picker -->
+
+  <!-- LAYOUT CONTAINER — reader + study panel -->
+  <div id="layout-container">
 
     <!-- READER AREA -->
     <main id="reader-area" role="main" aria-label="Scripture reader">
 
       <div id="chapter-header">
-        <button class="chapter-nav-btn" id="prev-chapter-btn" aria-label="Previous chapter">
-          <svg width="8" height="14" viewBox="0 0 8 14" fill="none" aria-hidden="true">
-            <path d="M6 2L2 7l4 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <button class="ch-nav-btn" id="btn-prev-chapter" aria-label="Previous chapter">
+          <svg width="8" height="13" viewBox="0 0 8 13" fill="none" aria-hidden="true">
+            <path d="M6 1.5L2 6.5l4 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
         </button>
-
-        <div class="chapter-title-group">
-          <div class="chapter-book-name" id="chapter-book-display">John</div>
-          <div class="chapter-number" id="chapter-num-display">Chapter 3</div>
+        <div class="chapter-title-center">
+          <div id="chapter-book-display">John</div>
+          <div id="chapter-num-display">Chapter 3</div>
         </div>
-
-        <div class="chapter-meta">
-          <span class="chapter-verse-count" id="chapter-verse-count">36 verses</span>
-          <button class="chapter-bookmark-btn" id="chapter-bookmark-btn" aria-label="Bookmark this chapter" aria-pressed="false">
-            <svg width="14" height="16" viewBox="0 0 14 16" fill="none" aria-hidden="true">
-              <path d="M2 1.5h10v13l-5-3-5 3V1.5z" stroke="currentColor" stroke-width="1.4"/>
-            </svg>
-          </button>
-        </div>
-
-        <button class="chapter-nav-btn" id="next-chapter-btn" aria-label="Next chapter">
-          <svg width="8" height="14" viewBox="0 0 8 14" fill="none" aria-hidden="true">
-            <path d="M2 2l4 5-4 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <button class="ch-nav-btn" id="btn-next-chapter" aria-label="Next chapter">
+          <svg width="8" height="13" viewBox="0 0 8 13" fill="none" aria-hidden="true">
+            <path d="M2 1.5l4 5-4 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
         </button>
       </div><!-- /#chapter-header -->
 
       <div id="chapter-content" class="scroll-y" role="region" aria-label="Chapter text" aria-live="polite" aria-atomic="false">
-
-        <div class="chapter-intro">
-          <div class="chapter-intro-ref">John · Chapter 3</div>
-        </div>
-
-        <article class="content-heading">The New Birth</article>
-
-        <div class="verse-row" data-verse="1" id="v-1">
-          <span class="verse-num" aria-label="Verse 1">1</span>
-          <span class="verse-text">Now there was a <span class="word" data-strongs="G5330" tabindex="0">Pharisee</span>, a <span class="word" data-strongs="G444" tabindex="0">man</span> named <span class="word" data-strongs="G3530" tabindex="0">Nicodemus</span> who was a <span class="word" data-strongs="G758" tabindex="0">member of the Jewish ruling council</span>.</span>
-          <div class="verse-actions" aria-label="Verse 1 actions">
-            <button class="verse-action-btn" aria-label="Bookmark verse 1" title="Bookmark">
-              <svg width="12" height="14" viewBox="0 0 12 14" fill="none"><path d="M1.5 1.5h9v11l-4.5-2.7L1.5 12.5V1.5z" stroke="currentColor" stroke-width="1.2"/></svg>
-            </button>
-            <button class="verse-action-btn" aria-label="Add note to verse 1" title="Note">
-              <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><rect x="1" y="1" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.2"/><path d="M3.5 4.5h6M3.5 7h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
-            </button>
-            <button class="verse-action-btn" aria-label="Copy verse 1" title="Copy">
-              <svg width="12" height="13" viewBox="0 0 12 13" fill="none"><rect x="4" y="1" width="7" height="9" rx="1" stroke="currentColor" stroke-width="1.2"/><path d="M1 4.5V12h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </div>
-        </div>
-
-        <div class="verse-row" data-verse="2" id="v-2">
-          <span class="verse-num" aria-label="Verse 2">2</span>
-          <span class="verse-text">He came to Jesus at night and said, <span class="red-letter">"<span class="word" data-strongs="G4461" tabindex="0">Rabbi</span>, we know that you are a <span class="word" data-strongs="G1320" tabindex="0">teacher</span> who has come from God. For no one could perform the <span class="word" data-strongs="G4592" tabindex="0">signs</span> you are doing if God were not with him."</span></span>
-          <div class="verse-actions" aria-label="Verse 2 actions">
-            <button class="verse-action-btn" aria-label="Bookmark verse 2" title="Bookmark">
-              <svg width="12" height="14" viewBox="0 0 12 14" fill="none"><path d="M1.5 1.5h9v11l-4.5-2.7L1.5 12.5V1.5z" stroke="currentColor" stroke-width="1.2"/></svg>
-            </button>
-            <button class="verse-action-btn" aria-label="Add note to verse 2" title="Note">
-              <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><rect x="1" y="1" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.2"/><path d="M3.5 4.5h6M3.5 7h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
-            </button>
-            <button class="verse-action-btn" aria-label="Copy verse 2" title="Copy">
-              <svg width="12" height="13" viewBox="0 0 12 13" fill="none"><rect x="4" y="1" width="7" height="9" rx="1" stroke="currentColor" stroke-width="1.2"/><path d="M1 4.5V12h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </div>
-        </div>
-
-        <div class="verse-row selected" data-verse="16" id="v-16">
-          <span class="verse-num" aria-label="Verse 16">16</span>
-          <span class="verse-text"><span class="red-letter">For <span class="word" data-strongs="G3779" tabindex="0">God</span> so <span class="word" data-strongs="G25" tabindex="0">loved</span> the <span class="word" data-strongs="G2889" tabindex="0">world</span> that he gave his one and only <span class="word" data-strongs="G3439" tabindex="0">Son</span>, that whoever <span class="word" data-strongs="G4100" tabindex="0">believes</span> in him shall not perish but have <span class="word" data-strongs="G166" tabindex="0">eternal life</span>.</span></span>
-          <div class="verse-actions" aria-label="Verse 16 actions">
-            <button class="verse-action-btn" aria-label="Bookmark verse 16" title="Bookmark">
-              <svg width="12" height="14" viewBox="0 0 12 14" fill="none"><path d="M1.5 1.5h9v11l-4.5-2.7L1.5 12.5V1.5z" stroke="currentColor" stroke-width="1.2"/></svg>
-            </button>
-            <button class="verse-action-btn" aria-label="Add note to verse 16" title="Note">
-              <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><rect x="1" y="1" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.2"/><path d="M3.5 4.5h6M3.5 7h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
-            </button>
-            <button class="verse-action-btn" aria-label="Copy verse 16" title="Copy">
-              <svg width="12" height="13" viewBox="0 0 12 13" fill="none"><rect x="4" y="1" width="7" height="9" rx="1" stroke="currentColor" stroke-width="1.2"/><path d="M1 4.5V12h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </div>
-        </div>
-
-        <div class="verse-row" data-verse="17" id="v-17">
-          <span class="verse-num" aria-label="Verse 17">17</span>
-          <span class="verse-text"><span class="red-letter">For God did not send his Son into the world to <span class="word" data-strongs="G2919" tabindex="0">condemn</span> the world, but to <span class="word" data-strongs="G4982" tabindex="0">save</span> the world through him.</span></span>
-          <div class="verse-actions" aria-label="Verse 17 actions">
-            <button class="verse-action-btn" aria-label="Bookmark verse 17" title="Bookmark">
-              <svg width="12" height="14" viewBox="0 0 12 14" fill="none"><path d="M1.5 1.5h9v11l-4.5-2.7L1.5 12.5V1.5z" stroke="currentColor" stroke-width="1.2"/></svg>
-            </button>
-            <button class="verse-action-btn" aria-label="Add note to verse 17" title="Note">
-              <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><rect x="1" y="1" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.2"/><path d="M3.5 4.5h6M3.5 7h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
-            </button>
-            <button class="verse-action-btn" aria-label="Copy verse 17" title="Copy">
-              <svg width="12" height="13" viewBox="0 0 12 13" fill="none"><rect x="4" y="1" width="7" height="9" rx="1" stroke="currentColor" stroke-width="1.2"/><path d="M1 4.5V12h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </div>
-        </div>
-
-        <div class="verse-row" data-verse="36" id="v-36">
-          <span class="verse-num" aria-label="Verse 36">36</span>
-          <span class="verse-text"><span class="word" data-strongs="G4100" tabindex="0">Whoever believes</span> in the Son has <span class="word" data-strongs="G166" tabindex="0">eternal life</span>, but whoever <span class="word" data-strongs="G544" tabindex="0">rejects</span> the Son will not see life, for God's <span class="word" data-strongs="G3709" tabindex="0">wrath</span> remains on them.</span>
-          <div class="verse-actions" aria-label="Verse 36 actions">
-            <button class="verse-action-btn" aria-label="Bookmark verse 36" title="Bookmark">
-              <svg width="12" height="14" viewBox="0 0 12 14" fill="none"><path d="M1.5 1.5h9v11l-4.5-2.7L1.5 12.5V1.5z" stroke="currentColor" stroke-width="1.2"/></svg>
-            </button>
-            <button class="verse-action-btn" aria-label="Add note to verse 36" title="Note">
-              <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><rect x="1" y="1" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.2"/><path d="M3.5 4.5h6M3.5 7h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
-            </button>
-            <button class="verse-action-btn" aria-label="Copy verse 36" title="Copy">
-              <svg width="12" height="13" viewBox="0 0 12 13" fill="none"><rect x="4" y="1" width="7" height="9" rx="1" stroke="currentColor" stroke-width="1.2"/><path d="M1 4.5V12h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </div>
-        </div>
-
+        <div class="loading-spinner" aria-label="Loading chapter">Loading…</div>
       </div><!-- /#chapter-content -->
 
     </main><!-- /#reader-area -->
 
-    <!-- CONTEXT PANEL (desktop right panel) -->
-    <aside id="context-panel" aria-label="Study tools">
+    <!-- STUDY PANEL — right column desktop / bottom sheet mobile -->
+    <aside id="study-panel" aria-label="Study tools">
 
-      <div class="panel-tabs" role="tablist" aria-label="Study panel tabs">
-        <button class="tab-btn active" role="tab" aria-selected="true" aria-controls="tab-crossrefs" id="tab-btn-crossrefs" data-tab="crossrefs">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M6 1v10M1 6h10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
-          Cross-refs
-        </button>
-        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-strongs" id="tab-btn-strongs" data-tab="strongs">Strong's</button>
-        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-interlinear" id="tab-btn-interlinear" data-tab="interlinear">Interlinear</button>
-        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-commentary" id="tab-btn-commentary" data-tab="commentary">Commentary</button>
-        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-notes" id="tab-btn-notes" data-tab="notes">Notes</button>
-        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-maps" id="tab-btn-maps" data-tab="maps">Maps</button>
+      <div class="sheet-handle-row" id="sheet-drag-handle" aria-hidden="true">
+        <div class="sheet-handle-pill"></div>
       </div>
 
-      <!-- Cross-references tab -->
-      <div class="tab-pane active" id="tab-crossrefs" role="tabpanel" aria-labelledby="tab-btn-crossrefs">
-        <div class="panel-empty" id="crossrefs-empty">
+      <div class="panel-tab-bar-wrap">
+        <div class="panel-tab-bar" role="tablist" aria-label="Study panel tabs">
+          <button class="tab-btn active" role="tab" aria-selected="true" data-tab="crossrefs">Cross-refs</button>
+          <button class="tab-btn" role="tab" aria-selected="false" data-tab="strongs">Strong's</button>
+          <button class="tab-btn" role="tab" aria-selected="false" data-tab="interlinear">Interlinear</button>
+          <button class="tab-btn" role="tab" aria-selected="false" data-tab="commentary">Commentary</button>
+          <button class="tab-btn" role="tab" aria-selected="false" data-tab="notes">Notes</button>
+          <button class="tab-btn" role="tab" aria-selected="false" data-tab="maps">🗺 Maps</button>
+        </div>
+      </div>
+
+      <div class="tab-content" id="tab-crossrefs" role="tabpanel">
+        <div class="panel-empty">
           <div class="panel-empty-icon" aria-hidden="true">✝</div>
           <div class="panel-empty-text">Tap a verse to see cross-references</div>
         </div>
-        <div id="crossrefs-content" hidden>
-          <div class="crossref-item" tabindex="0" role="button" data-ref="Romans 5:8">
-            <span class="crossref-ref">Romans 5:8</span>
-            <span class="crossref-preview">But God demonstrates his own love for us in this: While we were still sinners, Christ died for us.</span>
-          </div>
-          <div class="crossref-item" tabindex="0" role="button" data-ref="1 John 4:9">
-            <span class="crossref-ref">1 John 4:9</span>
-            <span class="crossref-preview">This is how God showed his love among us: He sent his one and only Son into the world that we might live through him.</span>
-          </div>
-          <div class="crossref-item" tabindex="0" role="button" data-ref="John 1:14">
-            <span class="crossref-ref">John 1:14</span>
-            <span class="crossref-preview">The Word became flesh and made his dwelling among us. We have seen his glory, the glory of the one and only Son, who came from the Father, full of grace and truth.</span>
-          </div>
-          <div class="crossref-item" tabindex="0" role="button" data-ref="Ephesians 2:8–9">
-            <span class="crossref-ref">Ephesians 2:8–9</span>
-            <span class="crossref-preview">For it is by grace you have been saved, through faith — and this is not from yourselves, it is the gift of God.</span>
-          </div>
-        </div>
       </div>
 
-      <!-- Strong's tab -->
-      <div class="tab-pane" id="tab-strongs" role="tabpanel" aria-labelledby="tab-btn-strongs">
-        <div class="panel-empty" id="strongs-empty">
+      <div class="tab-content hidden" id="tab-strongs" role="tabpanel">
+        <div class="panel-empty">
           <div class="panel-empty-icon" aria-hidden="true">α</div>
-          <div class="panel-empty-text">Tap a highlighted word to see its Strong's definition</div>
-        </div>
-        <div id="strongs-content" hidden>
-          <div class="strongs-header">
-            <span class="strongs-number">G25</span>
-            <span class="strongs-original">ἀγαπάω</span>
-            <span class="strongs-transliteration">agapaō</span>
-          </div>
-          <div class="strongs-section-label">Part of Speech</div>
-          <div class="strongs-definition">Verb</div>
-          <div class="strongs-section-label">Definition</div>
-          <div class="strongs-definition">To love, to be full of goodwill and exhibit the same; of the love of God toward his Son; of the love of men toward God; of the love of God and Christ toward men.</div>
-          <div class="strongs-section-label">Occurrences</div>
-          <div class="strongs-definition">143× in the New Testament</div>
-          <div class="strongs-section-label">Root</div>
-          <div class="strongs-definition">From ἄγαν (agan) — much; akin to ἄγω (agō), to lead</div>
+          <div class="panel-empty-text">Tap a highlighted word for Strong's definition</div>
         </div>
       </div>
 
-      <!-- Interlinear tab -->
-      <div class="tab-pane" id="tab-interlinear" role="tabpanel" aria-labelledby="tab-btn-interlinear">
-        <div class="panel-empty" id="interlinear-empty">
+      <div class="tab-content hidden" id="tab-interlinear" role="tabpanel">
+        <div class="panel-empty">
           <div class="panel-empty-icon" aria-hidden="true">λ</div>
           <div class="panel-empty-text">Select a verse to view interlinear text</div>
         </div>
-        <div id="interlinear-content" hidden>
-          <div style="display:flex;flex-wrap:wrap;direction:ltr">
-            <div class="interlinear-word" tabindex="0" data-strongs="G3779">
-              <span class="interlinear-original">Οὕτως</span>
-              <span class="interlinear-transliteration">Houtōs</span>
-              <span class="interlinear-gloss">For so</span>
-              <span class="interlinear-strongs">G3779</span>
-            </div>
-            <div class="interlinear-word" tabindex="0" data-strongs="G1063">
-              <span class="interlinear-original">γὰρ</span>
-              <span class="interlinear-transliteration">gar</span>
-              <span class="interlinear-gloss">for</span>
-              <span class="interlinear-strongs">G1063</span>
-            </div>
-            <div class="interlinear-word" tabindex="0" data-strongs="G25">
-              <span class="interlinear-original">ἠγάπησεν</span>
-              <span class="interlinear-transliteration">ēgapēsen</span>
-              <span class="interlinear-gloss">loved</span>
-              <span class="interlinear-strongs">G25</span>
-            </div>
-            <div class="interlinear-word" tabindex="0" data-strongs="G2316">
-              <span class="interlinear-original">ὁ θεὸς</span>
-              <span class="interlinear-transliteration">ho theos</span>
-              <span class="interlinear-gloss">God</span>
-              <span class="interlinear-strongs">G2316</span>
-            </div>
-            <div class="interlinear-word" tabindex="0" data-strongs="G2889">
-              <span class="interlinear-original">τὸν κόσμον</span>
-              <span class="interlinear-transliteration">ton kosmon</span>
-              <span class="interlinear-gloss">the world</span>
-              <span class="interlinear-strongs">G2889</span>
-            </div>
-          </div>
-        </div>
       </div>
 
-      <!-- Commentary tab -->
-      <div class="tab-pane" id="tab-commentary" role="tabpanel" aria-labelledby="tab-btn-commentary">
-        <div class="panel-empty" id="commentary-empty">
+      <div class="tab-content hidden" id="tab-commentary" role="tabpanel">
+        <div class="panel-empty">
           <div class="panel-empty-icon" aria-hidden="true">📜</div>
           <div class="panel-empty-text">Select a verse to read commentary</div>
         </div>
-        <div id="commentary-content" hidden>
-          <div class="commentary-source">
-            <span>Commentary on John 3:16</span>
-            <select class="commentary-source-select" aria-label="Select commentary source">
-              <option value="matthew-henry">Matthew Henry</option>
-              <option value="spurgeon">Spurgeon</option>
-              <option value="calvin">Calvin</option>
-              <option value="benson">Benson</option>
-            </select>
-          </div>
-          <div class="commentary-body">
-            God so loved the world — The world of mankind; not only the Jews but the Gentiles also. The word so here points at the manner of this love, which was such as had never been before. He gave his only-begotten Son — A gift freely made; not merely sent as an ambassador or servant, but given up to suffer and die for us. That whosoever believeth — On these terms, open to all without distinction.</div>
+      </div>
+
+      <div class="tab-content hidden" id="tab-notes" role="tabpanel">
+        <textarea class="notes-textarea" placeholder="Add a personal note…" aria-label="Personal verse note" rows="4" style="margin-top:10px;width:100%;box-sizing:border-box;resize:vertical;background:var(--bg-inset);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:10px;font-size:13px;"></textarea>
+        <div class="notes-save-row" style="margin-top:8px">
+          <button class="notes-save-btn">Save Note</button>
         </div>
       </div>
 
-      <!-- Notes tab -->
-      <div class="tab-pane" id="tab-notes" role="tabpanel" aria-labelledby="tab-btn-notes">
-        <div class="notes-toolbar">
-          <button class="notes-toolbar-btn" title="Bold" aria-label="Bold text">B</button>
-          <button class="notes-toolbar-btn" title="Italic" aria-label="Italic text" style="font-style:italic">I</button>
-          <button class="notes-toolbar-btn" title="Underline" aria-label="Underline text" style="text-decoration:underline">U</button>
-        </div>
-        <textarea class="notes-textarea" id="verse-note-textarea" placeholder="Add a personal note for this verse…" aria-label="Personal verse note" rows="5"></textarea>
-        <div class="notes-save-row">
-          <button class="notes-save-btn" id="save-note-btn">Save Note</button>
-        </div>
-        <div class="notes-list" id="notes-list" aria-label="Saved notes" aria-live="polite">
-          <div class="note-item">
-            <div class="note-item-ref">John 3:16</div>
-            <div class="note-item-body">The word "so" (Greek: houtōs) describes the manner and degree — God loved in this extraordinary way. See also Romans 5:8 for parallel.</div>
-            <div class="note-item-date">Added 2 days ago</div>
-          </div>
+      <div class="tab-content hidden" id="tab-maps" role="tabpanel">
+        <div class="panel-empty">
+          <div class="panel-empty-icon" aria-hidden="true">🗺</div>
+          <div class="panel-empty-text">Select a location to view on map</div>
         </div>
       </div>
 
-      <!-- Maps tab -->
-      <div class="tab-pane" id="tab-maps" role="tabpanel" aria-labelledby="tab-btn-maps">
-        <div class="map-placeholder" role="img" aria-label="Bible map viewer (select a location to view)">
-          <svg width="32" height="32" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-            <rect x="2" y="6" width="28" height="20" rx="2" stroke="currentColor" stroke-width="1.5"/>
-            <path d="M11 6v20M21 6v20M2 16h28" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2"/>
-            <circle cx="16" cy="13" r="2.5" stroke="currentColor" stroke-width="1.5"/>
-            <path d="M16 15.5C16 15.5 12 19 12 21.5" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
-          </svg>
-          <span style="font-size:12px">Interactive map loading</span>
-        </div>
-        <div class="map-location-list" aria-label="Locations mentioned in this passage">
-          <div class="map-location-item" tabindex="0" role="button" aria-label="View Jerusalem on map">
-            <div class="map-location-dot" style="background:#b8962e"></div>
-            <span class="map-location-name">Jerusalem</span>
-          </div>
-          <div class="map-location-item" tabindex="0" role="button" aria-label="View Judea on map">
-            <div class="map-location-dot" style="background:#7a6020"></div>
-            <span class="map-location-name">Judea</span>
-          </div>
-          <div class="map-location-item" tabindex="0" role="button" aria-label="View Jordan River on map">
-            <div class="map-location-dot" style="background:#4a7a9b"></div>
-            <span class="map-location-name">Jordan River</span>
-          </div>
-        </div>
-      </div>
+    </aside><!-- /#study-panel -->
 
-    </aside><!-- /#context-panel -->
+  </div><!-- /#layout-container -->
 
-  </div><!-- /#main-layout -->
+  <!-- MOBILE BOTTOM BAR — prev / study / next -->
+  <nav id="mobile-bottom-bar" aria-label="Chapter navigation">
+    <button class="mob-nav-btn" id="btn-mob-prev" aria-label="Previous chapter">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M10 3L6 8l4 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span>Prev</span>
+    </button>
+    <button class="mob-nav-btn" id="btn-mob-study" aria-label="Open study tools">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <rect x="1" y="2" width="14" height="11" rx="2" stroke="currentColor" stroke-width="1.4"/>
+        <path d="M4 6h8M4 9h5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+      </svg>
+      <span>Study</span>
+    </button>
+    <button class="mob-nav-btn" id="btn-mob-next" aria-label="Next chapter">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M6 3l4 5-4 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span>Next</span>
+    </button>
+  </nav><!-- /#mobile-bottom-bar -->
 
-  <!-- BOTTOM NAV (mobile) -->
-  <nav id="bottom-nav" aria-label="Primary navigation">
-    <div class="bottom-nav-inner">
-      <button class="bottom-nav-btn" id="bottomnav-books" aria-label="Books" aria-controls="sidebar" aria-expanded="false">
-        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-          <rect x="3" y="2" width="11" height="14" rx="1.5" stroke="currentColor" stroke-width="1.4"/>
-          <path d="M6 2v14" stroke="currentColor" stroke-width="1.4"/>
-          <path d="M16 4v14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-          <path d="M6 16l10 2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-        </svg>
-        Books
-      </button>
-      <button class="bottom-nav-btn" id="bottomnav-search" aria-label="Search" aria-controls="search-overlay">
-        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-          <circle cx="9" cy="9" r="6" stroke="currentColor" stroke-width="1.4"/>
-          <path d="M13.5 13.5L18 18" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-        </svg>
-        Search
-      </button>
-      <button class="bottom-nav-btn" id="bottomnav-notes" aria-label="Notes" aria-controls="bottom-sheet">
-        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-          <rect x="3" y="2" width="14" height="16" rx="1.5" stroke="currentColor" stroke-width="1.4"/>
-          <path d="M7 7h6M7 10h6M7 13h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-        </svg>
-        Notes
-      </button>
-    </div>
-  </nav><!-- /#bottom-nav -->
+  <!-- LEGACY STUBS — kept so JS querySelector calls don't crash -->
+  <div id="main-layout" aria-hidden="true" style="display:none">
+    <aside id="sidebar" aria-hidden="true"></aside>
+    <aside id="context-panel" aria-hidden="true"></aside>
+  </div>
+  <div id="bottom-sheet" aria-hidden="true" style="display:none"></div>
 
-  <!-- BOTTOM SHEET (mobile context panel) -->
-  <div id="bottom-sheet" role="dialog" aria-modal="false" aria-label="Study tools" aria-hidden="true">
-    <div class="sheet-handle" role="presentation" aria-hidden="true"></div>
-    <div class="sheet-body">
-      <div class="panel-tabs" role="tablist" aria-label="Study panel tabs">
-        <button class="tab-btn active" role="tab" aria-selected="true" aria-controls="sheet-tab-crossrefs" id="sheet-tab-btn-crossrefs" data-tab="crossrefs">Cross-refs</button>
-        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="sheet-tab-strongs" id="sheet-tab-btn-strongs" data-tab="strongs">Strong's</button>
-        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="sheet-tab-interlinear" id="sheet-tab-btn-interlinear" data-tab="interlinear">Interlinear</button>
-        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="sheet-tab-commentary" id="sheet-tab-btn-commentary" data-tab="commentary">Commentary</button>
-        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="sheet-tab-notes" id="sheet-tab-btn-notes" data-tab="notes">Notes</button>
-        <button class="tab-btn" role="tab" aria-selected="false" aria-controls="sheet-tab-maps" id="sheet-tab-btn-maps" data-tab="maps">Maps</button>
-      </div>
-      <div class="tab-pane active scroll-y" id="sheet-tab-crossrefs" role="tabpanel" aria-labelledby="sheet-tab-btn-crossrefs">
-        <div class="panel-empty"><div class="panel-empty-icon" aria-hidden="true">✝</div><div class="panel-empty-text">Tap a verse to see cross-references</div></div>
-      </div>
-      <div class="tab-pane scroll-y" id="sheet-tab-strongs" role="tabpanel" aria-labelledby="sheet-tab-btn-strongs">
-        <div class="panel-empty"><div class="panel-empty-icon" aria-hidden="true">α</div><div class="panel-empty-text">Tap a highlighted word for Strong's definition</div></div>
-      </div>
-      <div class="tab-pane scroll-y" id="sheet-tab-interlinear" role="tabpanel" aria-labelledby="sheet-tab-btn-interlinear">
-        <div class="panel-empty"><div class="panel-empty-icon" aria-hidden="true">λ</div><div class="panel-empty-text">Select a verse to view interlinear</div></div>
-      </div>
-      <div class="tab-pane scroll-y" id="sheet-tab-commentary" role="tabpanel" aria-labelledby="sheet-tab-btn-commentary">
-        <div class="panel-empty"><div class="panel-empty-icon" aria-hidden="true">📜</div><div class="panel-empty-text">Select a verse to read commentary</div></div>
-      </div>
-      <div class="tab-pane scroll-y" id="sheet-tab-notes" role="tabpanel" aria-labelledby="sheet-tab-btn-notes">
-        <textarea class="notes-textarea" placeholder="Add a personal note…" aria-label="Personal verse note" rows="4" style="margin-top:10px"></textarea>
-        <div class="notes-save-row"><button class="notes-save-btn">Save Note</button></div>
-      </div>
-      <div class="tab-pane scroll-y" id="sheet-tab-maps" role="tabpanel" aria-labelledby="sheet-tab-btn-maps">
-        <div class="panel-empty"><div class="panel-empty-icon" aria-hidden="true">🗺</div><div class="panel-empty-text">Select a location to view on map</div></div>
-      </div>
-    </div>
-  </div><!-- /#bottom-sheet -->
+  <!-- Legacy sidebar/reader/panel stubs removed; structure replaced above -->
 
   <!-- BACKDROP OVERLAY (shared) -->
   <div class="backdrop" id="main-backdrop" aria-hidden="true"></div>
@@ -5334,12 +5840,13 @@ function _clearAuthError(el) {
 function updateUserChip() {
   if (!currentUser) return;
 
-  const initialsEl = document.querySelector('.user-chip .initials');
-  const nameEl = document.querySelector('.user-chip .display-name');
+  const initialsEl = document.querySelector('#user-chip .user-initials');
+  const nameEl = document.querySelector('#user-chip .user-display-name');
   const adminItem = document.querySelector('.user-dropdown .admin-item');
 
   const displayName = currentUser.display_name || currentUser.username || '?';
-  if (initialsEl) initialsEl.textContent = displayName.charAt(0).toUpperCase();
+  const initials = displayName.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
+  if (initialsEl) initialsEl.textContent = initials;
   if (nameEl) nameEl.textContent = displayName;
 
   // Show / hide admin menu item
@@ -5579,12 +6086,8 @@ function _captureStateSnapshot() {
  * @param {string} tabName
  */
 function _activateTab(tabName) {
-  document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.tab === tabName);
-  });
-  document.querySelectorAll('.tab-pane').forEach(pane => {
-    pane.classList.toggle('active', pane.id === `tab-${tabName}`);
-  });
+  // Delegate to the reader's switchTab for consistent behaviour
+  if (typeof switchTab === 'function') switchTab(tabName);
 }
 
 // =============================================================================
@@ -6467,9 +6970,12 @@ async function loadChapter(book, chapter, verseHighlight = null) {
     : `#${book.replace(/\\s+/g, '-')}-${chapter}`;
   history.replaceState(null, '', hash);
 
-  // Update chapter header
-  const header = $('#chapter-header') || $('#chapter-title');
-  if (header) header.textContent = `${book} ${chapter}`;
+  // Update chapter title displays
+  const bookDisplay = $('#chapter-book-display');
+  const numDisplay  = $('#chapter-num-display');
+  if (bookDisplay) bookDisplay.textContent = book;
+  if (numDisplay)  numDisplay.textContent  = `Chapter ${chapter}`;
+  updateRefDisplay();
 
   // Clear content
   const content = $('#chapter-content');
@@ -6513,6 +7019,12 @@ async function loadChapter(book, chapter, verseHighlight = null) {
 
     // Update prev/next buttons
     updateChapterNav();
+
+    // Auto-load cross-refs and interlinear for verse 1 so the study panel always has content
+    if (!verseHighlight) {
+      loadCrossRefs(`${book} ${chapter}:1`);
+      if (state.activeTab === 'interlinear') loadInterlinear(`${book} ${chapter}:1`);
+    }
   } catch (err) {
     content.innerHTML = `<p class="error-msg">Failed to load chapter: ${escHtml(err.message)}</p>`;
   }
@@ -6542,13 +7054,15 @@ function getTaggedWords(taggedData, verseNum) {
 function renderVerse(verseNum, text, taggedWords = null) {
   const row = el('div', { class: 'verse-row', 'data-verse': verseNum });
 
-  const numEl = el('span', {
-    class: 'verse-num',
-    onclick: () => {
+  // Clicking anywhere on the row (except a Strong's word) selects the verse
+  row.addEventListener('click', (e) => {
+    if (!e.target.closest('.has-strongs')) {
       const ref = `${state.currentBook} ${state.currentChapter}:${verseNum}`;
       selectVerse(ref);
-    },
-  }, String(verseNum));
+    }
+  });
+
+  const numEl = el('span', { class: 'verse-num' }, String(verseNum));
   row.appendChild(numEl);
 
   const textEl = el('span', { class: 'verse-text' });
@@ -6661,13 +7175,21 @@ async function loadCrossRefs(ref) {
 
     const chipList = el('div', { class: 'xref-chip-list' });
     for (const xref of refs) {
-      const xrefRef  = xref.ref || xref.reference || xref;
-      const xrefText = xref.text || '';
+      // API shape: {book, chapter, verse_start, verse_end, votes}
+      let xrefRef, xrefLabel;
+      if (xref.book) {
+        const vEnd = xref.verse_end && xref.verse_end !== xref.verse_start ? `-${xref.verse_end}` : '';
+        xrefRef   = `${xref.book} ${xref.chapter}:${xref.verse_start}`;
+        xrefLabel = `${xref.book} ${xref.chapter}:${xref.verse_start}${vEnd}`;
+      } else {
+        xrefRef = xref.ref || xref.reference || String(xref);
+        xrefLabel = xrefRef;
+      }
       const chip = el('button', {
         class: 'xref-chip',
-        title: xrefText,
+        title: xrefLabel,
         onclick: () => navigateToRef(xrefRef),
-      }, String(xrefRef));
+      }, xrefLabel);
       chipList.appendChild(chip);
     }
     container.appendChild(chipList);
@@ -6768,7 +7290,7 @@ function renderInterlinear(data, container) {
   for (const word of words) {
     const strongsNum = word.strongs || word.strong || '';
     const tr = el('tr', {},
-      el('td', { class: 'il-english'  }, word.english  || word.text || ''),
+      el('td', { class: 'il-english'  }, word.gloss || word.english || word.text || ''),
       el('td', { class: 'il-original' }, word.original || word.lemma || ''),
       el('td', { class: 'il-translit' }, word.transliteration || word.translit || ''),
       el('td', { class: 'il-strongs'  },
@@ -6884,8 +7406,12 @@ function renderMapMarkers(places) {
   if (!state.leafletMap || !places) return;
   for (const place of places) {
     if (place.lat == null || place.lng == null) continue;
-    const popup  = `<strong>${escHtml(place.name)}</strong>` +
-      (place.refs ? `<br><small>${place.refs.join(', ')}</small>` : '');
+    const subtitle = place.notes
+      ? `<br><small>${escHtml(place.notes)}</small>`
+      : place.refs
+        ? `<br><small>${place.refs.map(escHtml).join(', ')}</small>`
+        : '';
+    const popup = `<strong>${escHtml(place.name)}</strong>${subtitle}`;
     const marker = L.marker([place.lat, place.lng])
       .addTo(state.leafletMap)
       .bindPopup(popup);
@@ -6908,25 +7434,29 @@ function switchTab(tabName) {
   // Lazy-init map on first open
   if (tabName === 'maps') initMap();
 
-  // Load data for newly-visible tab if a verse is selected
-  if (state.currentVerse) {
-    if (tabName === 'interlinear') loadInterlinear(state.currentVerse);
-    if (tabName === 'commentary')  loadCommentary(state.currentVerse);
+  // Load data for newly-visible tab, falling back to verse 1 of current chapter
+  const activeRef = state.currentVerse
+    || (state.currentBook ? `${state.currentBook} ${state.currentChapter}:1` : null);
+  if (activeRef) {
+    if (tabName === 'interlinear') loadInterlinear(activeRef);
+    if (tabName === 'commentary')  loadCommentary(activeRef);
   }
 }
 
 function openBottomSheet() {
-  const sheet = $('#bottom-sheet');
-  if (!sheet) return;
-  sheet.classList.add('open');
+  if (state.isDesktop()) return; // desktop: panel always visible
+  const panel = $('#study-panel');
+  if (!panel) return;
+  panel.classList.add('panel-open');
   state.bottomSheetOpen = true;
   document.body.classList.add('sheet-open');
 }
 
 function closeBottomSheet() {
-  const sheet = $('#bottom-sheet');
-  if (!sheet) return;
-  sheet.classList.remove('open');
+  const panel = $('#study-panel');
+  if (!panel) return;
+  panel.classList.remove('panel-open');
+  panel.classList.remove('panel-expanded');
   state.bottomSheetOpen = false;
   document.body.classList.remove('sheet-open');
 }
@@ -6962,7 +7492,7 @@ function handleResize() {
 function toggleParallelMode() {
   state.parallelMode = !state.parallelMode;
   const readerArea = $('#reader-area');
-  const btn        = $('#btn-parallel');
+  const btn        = $('#btn-parallel-new');
 
   if (!readerArea) return;
 
@@ -6972,7 +7502,11 @@ function toggleParallelMode() {
 
     // Pick a complementary translation
     if (!state.parallelTranslation) {
-      state.parallelTranslation = state.currentTranslation === 'KJV' ? 'ESV' : 'KJV';
+      const avail = state.cachedTranslations || [];
+      const alts  = avail.filter(t => t !== state.currentTranslation);
+      state.parallelTranslation = alts.includes('AKJV') ? 'AKJV'
+        : alts.includes('ASV') ? 'ASV'
+        : alts[0] || 'KJV';
     }
     ensureParallelColumn();
     loadParallelColumn(state.currentBook, state.currentChapter);
@@ -7220,7 +7754,145 @@ async function loadTranslations() {
   }
 }
 
-// ── 11. INIT ───────────────────────────────────────────────────────────────
+// ── 11. NAVIGATION PICKER ─────────────────────────────────────────────────
+
+const _BOOK_ABBR = {
+  'Genesis':'GEN','Exodus':'EXO','Leviticus':'LEV','Numbers':'NUM','Deuteronomy':'DEU',
+  'Joshua':'JOS','Judges':'JDG','Ruth':'RUT','1 Samuel':'1SA','2 Samuel':'2SA',
+  '1 Kings':'1KI','2 Kings':'2KI','1 Chronicles':'1CH','2 Chronicles':'2CH',
+  'Ezra':'EZR','Nehemiah':'NEH','Esther':'EST','Job':'JOB','Psalms':'PSA',
+  'Proverbs':'PRO','Ecclesiastes':'ECC','Song of Solomon':'SNG','Isaiah':'ISA',
+  'Jeremiah':'JER','Lamentations':'LAM','Ezekiel':'EZK','Daniel':'DAN','Hosea':'HOS',
+  'Joel':'JOL','Amos':'AMO','Obadiah':'OBA','Jonah':'JON','Micah':'MIC',
+  'Nahum':'NAH','Habakkuk':'HAB','Zephaniah':'ZEP','Haggai':'HAG','Zechariah':'ZEC',
+  'Malachi':'MAL','Matthew':'MAT','Mark':'MRK','Luke':'LUK','John':'JHN',
+  'Acts':'ACT','Romans':'ROM','1 Corinthians':'1CO','2 Corinthians':'2CO',
+  'Galatians':'GAL','Ephesians':'EPH','Philippians':'PHP','Colossians':'COL',
+  '1 Thessalonians':'1TH','2 Thessalonians':'2TH','1 Timothy':'1TI','2 Timothy':'2TI',
+  'Titus':'TIT','Philemon':'PHM','Hebrews':'HEB','James':'JAS','1 Peter':'1PE',
+  '2 Peter':'2PE','1 John':'1JN','2 John':'2JN','3 John':'3JN','Jude':'JUD',
+  'Revelation':'REV',
+};
+
+let _pickerTestament = 'OT';
+
+function openNavPicker() {
+  _buildPickerBookGrid(_pickerTestament);
+  const picker = $('#nav-picker');
+  if (picker) { picker.classList.add('open'); picker.setAttribute('aria-hidden','false'); }
+}
+
+function closeNavPicker() {
+  const picker = $('#nav-picker');
+  if (picker) { picker.classList.remove('open'); picker.setAttribute('aria-hidden','true'); }
+}
+
+function _buildPickerBookGrid(testament) {
+  _pickerTestament = testament;
+  $$('.picker-tab-btn').forEach(b => b.classList.toggle('active', b.dataset.testament === testament));
+
+  const grid = $('#picker-book-grid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  const books = testament === 'OT' ? OT_BOOKS : NT_BOOKS;
+  for (const book of books) {
+    const abbr = _BOOK_ABBR[book.name] || book.name.slice(0,3).toUpperCase();
+    const btn = el('button', {
+      class: 'picker-book-btn' + (book.name === state.currentBook ? ' active' : ''),
+      title: book.name,
+      onclick: () => _selectPickerBook(book),
+    }, abbr);
+    grid.appendChild(btn);
+  }
+
+  const bv = $('#picker-book-view');
+  const cv = $('#picker-chapter-view');
+  if (bv) bv.classList.remove('hidden');
+  if (cv) cv.classList.add('hidden');
+}
+
+function _selectPickerBook(book) {
+  const label = $('#picker-selected-book');
+  if (label) label.textContent = book.name;
+
+  const grid = $('#picker-chapter-grid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  for (let c = 1; c <= book.chapters; c++) {
+    const ch = c;
+    const btn = el('button', {
+      class: 'picker-chapter-btn' + (book.name === state.currentBook && ch === state.currentChapter ? ' active' : ''),
+      onclick: () => { closeNavPicker(); loadChapter(book.name, ch); },
+    }, String(ch));
+    grid.appendChild(btn);
+  }
+
+  const bv = $('#picker-book-view');
+  const cv = $('#picker-chapter-view');
+  if (bv) bv.classList.add('hidden');
+  if (cv) cv.classList.remove('hidden');
+}
+
+function updateRefDisplay() {
+  const el2 = $('#ref-display');
+  if (el2) el2.textContent = `${state.currentBook} ${state.currentChapter}`;
+  const bookDisplay = $('#chapter-book-display');
+  const numDisplay  = $('#chapter-num-display');
+  if (bookDisplay) bookDisplay.textContent = state.currentBook;
+  if (numDisplay)  numDisplay.textContent  = `Chapter ${state.currentChapter}`;
+}
+
+function openTransPicker() {
+  const list = $('#trans-picker-list');
+  if (list) {
+    list.innerHTML = '';
+    const translations = state.cachedTranslations || ['KJV','ESV','NIV','NASB','NKJV','NLT','AMP','CSB','MSG','RSV'];
+    for (const t of translations) {
+      const abbr = t.abbreviation || t;
+      const name = t.full_name || t.name || abbr;
+      const item = el('button', {
+        class: 'trans-picker-item' + (abbr === state.currentTranslation ? ' active' : ''),
+        onclick: () => {
+          state.currentTranslation = abbr;
+          const td = $('#trans-display');
+          if (td) td.textContent = abbr;
+          loadChapter(state.currentBook, state.currentChapter, state.currentVerse);
+          closeTransPicker();
+        },
+      });
+      item.appendChild(el('span', {class:'trans-abbr'}, abbr));
+      if (name !== abbr) item.appendChild(el('span', {class:'trans-name'}, name));
+      list.appendChild(item);
+    }
+  }
+  const picker = $('#trans-picker');
+  if (picker) { picker.classList.add('open'); picker.setAttribute('aria-hidden','false'); }
+}
+
+function closeTransPicker() {
+  const picker = $('#trans-picker');
+  if (picker) { picker.classList.remove('open'); picker.setAttribute('aria-hidden','true'); }
+}
+
+let _menuOpen = false;
+function toggleMenuDrawer() {
+  _menuOpen = !_menuOpen;
+  const drawer = $('#menu-drawer');
+  if (drawer) {
+    drawer.classList.toggle('open', _menuOpen);
+    drawer.setAttribute('aria-hidden', _menuOpen ? 'false' : 'true');
+  }
+  const btn = $('#btn-menu');
+  if (btn) btn.setAttribute('aria-expanded', _menuOpen ? 'true' : 'false');
+}
+
+function closeMenuDrawer() {
+  _menuOpen = false;
+  const drawer = $('#menu-drawer');
+  if (drawer) { drawer.classList.remove('open'); drawer.setAttribute('aria-hidden','true'); }
+}
+
+// ── 12. INIT ───────────────────────────────────────────────────────────────
 
 function init() {
   buildBookNav();
@@ -7233,14 +7905,50 @@ function init() {
     loadChapter(last.book, last.chapter);
   }
 
-  // Translation selector change
-  const transSelect = $('#translation-select');
-  if (transSelect) {
-    transSelect.value = state.currentTranslation;
-    transSelect.addEventListener('change', e => {
-      state.currentTranslation = e.target.value;
-      loadChapter(state.currentBook, state.currentChapter, state.currentVerse);
-    });
+  // Reference pill → nav picker
+  const refPill = $('#btn-ref-pill');
+  if (refPill) refPill.addEventListener('click', openNavPicker);
+
+  // Nav picker close / backdrop
+  const navPickerClose = $('#btn-nav-picker-close');
+  if (navPickerClose) navPickerClose.addEventListener('click', closeNavPicker);
+  const navPickerBackdrop = $('#nav-picker-backdrop');
+  if (navPickerBackdrop) navPickerBackdrop.addEventListener('click', closeNavPicker);
+
+  // Nav picker testament tabs
+  $$('.picker-tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => _buildPickerBookGrid(btn.dataset.testament));
+  });
+
+  // Nav picker back button (chapter view → book view)
+  const pickerBack = $('#btn-picker-back');
+  if (pickerBack) pickerBack.addEventListener('click', () => _buildPickerBookGrid(_pickerTestament));
+
+  // Translation pill → trans picker
+  const transPill = $('#btn-trans-pill');
+  if (transPill) transPill.addEventListener('click', openTransPicker);
+  const transPickerClose = $('#btn-trans-picker-close');
+  if (transPickerClose) transPickerClose.addEventListener('click', closeTransPicker);
+  const transPickerBackdrop = $('#trans-picker-backdrop');
+  if (transPickerBackdrop) transPickerBackdrop.addEventListener('click', closeTransPicker);
+
+  // Menu drawer
+  const menuBtn = $('#btn-menu');
+  if (menuBtn) menuBtn.addEventListener('click', toggleMenuDrawer);
+  const menuSessions = $('#menu-item-sessions');
+  if (menuSessions) menuSessions.addEventListener('click', () => { closeMenuDrawer(); openSessionsPanel(); });
+  const menuBookmarks = $('#menu-item-bookmarks');
+  if (menuBookmarks) menuBookmarks.addEventListener('click', () => { closeMenuDrawer(); openBookmarksPanel(); });
+  const menuHistory = $('#menu-item-history');
+  if (menuHistory) menuHistory.addEventListener('click', () => { closeMenuDrawer(); openHistoryPanel(); });
+  const menuAdmin = $('#menu-item-admin');
+  if (menuAdmin) menuAdmin.addEventListener('click', () => { closeMenuDrawer(); showAdminPanel(); });
+
+  // Show admin menu item if admin
+  if (isAdmin()) {
+    if (menuAdmin) menuAdmin.style.display = '';
+    const oldAdminItem = $('#manage-users-item');
+    if (oldAdminItem) oldAdminItem.style.display = '';
   }
 
   // Prev / Next chapter buttons
@@ -7249,62 +7957,96 @@ function init() {
   if (prevBtn) prevBtn.addEventListener('click', prevChapter);
   if (nextBtn) nextBtn.addEventListener('click', nextChapter);
 
+  // Mobile bottom bar
+  const mobPrev = $('#btn-mob-prev');
+  const mobNext = $('#btn-mob-next');
+  const mobStudy = $('#btn-mob-study');
+  if (mobPrev) mobPrev.addEventListener('click', prevChapter);
+  if (mobNext) mobNext.addEventListener('click', nextChapter);
+  if (mobStudy) mobStudy.addEventListener('click', openBottomSheet);
+
+  // Search button
+  const searchOpenBtn = $('#btn-search-open');
+  if (searchOpenBtn) searchOpenBtn.addEventListener('click', showSearchOverlay);
+
+  // Parallel toggle
+  const parallelBtn = $('#btn-parallel-new');
+  if (parallelBtn) parallelBtn.addEventListener('click', () => {
+    toggleParallelMode();
+    parallelBtn.classList.toggle('active', state.parallelMode);
+  });
+
+  // Drag-to-expand study panel on mobile
+  const dragHandle = $('#sheet-drag-handle');
+  if (dragHandle) {
+    let _startY = 0;
+    dragHandle.addEventListener('touchstart', e => {
+      _startY = e.touches[0].clientY;
+    }, { passive: true });
+    dragHandle.addEventListener('touchend', e => {
+      const dy = e.changedTouches[0].clientY - _startY;
+      const panel = $('#study-panel');
+      if (!panel) return;
+      if (dy > 60) {
+        // Swipe down — collapse
+        closeBottomSheet();
+      } else if (dy < -60) {
+        // Swipe up — expand
+        panel.classList.add('panel-expanded');
+      }
+    }, { passive: true });
+  }
+
+  // Tap outside study panel to close (mobile)
+  document.addEventListener('click', e => {
+    if (!state.isDesktop() && state.bottomSheetOpen) {
+      const panel = $('#study-panel');
+      if (panel && !panel.contains(e.target) && e.target !== $('#btn-mob-study')) {
+        closeBottomSheet();
+      }
+    }
+    // Close menu drawer if clicking outside
+    if (_menuOpen) {
+      const drawer = $('#menu-drawer');
+      const menuBtnEl = $('#btn-menu');
+      if (drawer && menuBtnEl && !drawer.contains(e.target) && !menuBtnEl.contains(e.target)) {
+        closeMenuDrawer();
+      }
+    }
+  });
+
+  // Tab buttons (using event delegation on study panel)
+  const studyPanel = $('#study-panel');
+  if (studyPanel) {
+    studyPanel.addEventListener('click', e => {
+      const btn = e.target.closest('.tab-btn');
+      if (btn && btn.dataset.tab) switchTab(btn.dataset.tab);
+    });
+  }
+
   // Keyboard nav
   document.addEventListener('keydown', e => {
-    // Don't intercept when user is typing
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
     if (e.key === 'ArrowLeft'  && !e.altKey) prevChapter();
     if (e.key === 'ArrowRight' && !e.altKey) nextChapter();
     if (e.key === 'Escape') {
       closeSearchOverlay();
       closeBottomSheet();
+      closeNavPicker();
+      closeTransPicker();
+      closeMenuDrawer();
     }
   });
 
-  // Sidebar toggle
-  const sidebarToggle = $('#btn-sidebar-toggle') || $('#sidebar-toggle');
-  if (sidebarToggle) sidebarToggle.addEventListener('click', toggleSidebar);
-
-  // Sidebar overlay (mobile tap-to-close)
-  const overlay = $('#sidebar-overlay');
-  if (overlay) overlay.addEventListener('click', toggleSidebar);
-
-  // Bottom sheet close button
-  const sheetClose = $('#btn-sheet-close');
-  if (sheetClose) sheetClose.addEventListener('click', closeBottomSheet);
-
-  // Swipe-down on bottom sheet handle
-  const sheetHandle = $('#sheet-handle');
-  if (sheetHandle) {
-    let touchStartY = 0;
-    sheetHandle.addEventListener('touchstart', e => { touchStartY = e.touches[0].clientY; }, { passive: true });
-    sheetHandle.addEventListener('touchend', e => {
-      const dy = e.changedTouches[0].clientY - touchStartY;
-      if (dy > 60) closeBottomSheet();
-    }, { passive: true });
-  }
-
-  // Tab buttons
-  $$('.tab-btn').forEach(btn => {
-    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
-  });
-
-  // Parallel mode toggle
-  const parallelBtn = $('#btn-parallel');
-  if (parallelBtn) parallelBtn.addEventListener('click', toggleParallelMode);
-
-  // Search input
-  const searchInput = $('#search-input');
-  if (searchInput) {
-    searchInput.addEventListener('keydown', e => {
-      if (e.key === 'Enter') handleSearch(searchInput.value);
-    });
-  }
-  const searchBtn = $('#btn-search');
-  if (searchBtn) {
-    searchBtn.addEventListener('click', () => {
-      const input = $('#search-input');
-      if (input) handleSearch(input.value);
+  // Legacy translation selector (still in DOM as hidden fallback)
+  const transSelect = $('#translation-select');
+  if (transSelect) {
+    transSelect.value = state.currentTranslation;
+    transSelect.addEventListener('change', e => {
+      state.currentTranslation = e.target.value;
+      const td = $('#trans-display');
+      if (td) td.textContent = e.target.value;
+      loadChapter(state.currentBook, state.currentChapter, state.currentVerse);
     });
   }
 
@@ -7320,13 +8062,35 @@ function init() {
   window.addEventListener('hashchange', () => restoreFromHash());
 
   // Resize handler
-  window.addEventListener('resize', handleResize);
+  window.addEventListener('resize', () => {
+    handleResize();
+    if (state.isDesktop()) {
+      closeNavPicker();
+      closeTransPicker();
+    }
+  });
 
   // Persist position before unload
   window.addEventListener('beforeunload', saveLastPosition);
 
+  // Initialize trans display
+  const td = $('#trans-display');
+  if (td) td.textContent = state.currentTranslation;
+
   // Activate first tab
   switchTab(state.activeTab);
+
+  // Tab bar scroll-fade: hide the right gradient once scrolled to end
+  const tabBar = document.querySelector('.panel-tab-bar');
+  const tabWrap = document.querySelector('.panel-tab-bar-wrap');
+  if (tabBar && tabWrap) {
+    const updateFade = () => {
+      const atEnd = tabBar.scrollLeft + tabBar.clientWidth >= tabBar.scrollWidth - 4;
+      tabWrap.classList.toggle('scrolled-end', atEnd);
+    };
+    tabBar.addEventListener('scroll', updateFade, { passive: true });
+    updateFade();
+  }
 
   console.log('[bible-reader] init complete');
 }

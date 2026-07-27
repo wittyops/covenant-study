@@ -1,0 +1,19 @@
+services:
+  bible:
+    image: ghcr.io/bearboss/wn-bible-01:latest
+    container_name: covenant-bible
+    ports:
+      - "8000:8000"
+    volumes:
+      - bible-userdata:/app/userdata
+    restart: unless-stopped
+    mem_limit: 1g
+    environment:
+      # Set a strong admin password on first run — the default admin account
+      # is created automatically on startup with these credentials.
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=changeme
+
+volumes:
+  bible-userdata:
+    driver: local
