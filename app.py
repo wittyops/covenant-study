@@ -9,7 +9,6 @@ import bcrypt
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-import aiofiles
 
 app = FastAPI(title="Christ Pillar — Bible Study", docs_url=None)
 
@@ -710,7 +709,7 @@ async def strongs_lookup(number: str):
 
 
 @app.get("/api/places")
-async def get_places(ref: str = Query(None)):
+async def get_places(ref: Optional[str] = Query(default=None)):
     """Return biblical places with coordinates. Without ref: all places. With ref: places found in that passage's text."""
     if ref is None:
         return {
@@ -1231,7 +1230,7 @@ async def delete_session(
 @app.get("/api/bookmarks/check")
 async def check_bookmark(
     ref: str = Query(...),
-    request: Request = None,
+    request: Optional[Request] = None,
     authorization: Optional[str] = Header(None),
 ):
     if request is None:
@@ -3789,6 +3788,7 @@ img, svg {
 <!-- ============================================================
      LOGIN SCREEN
      ============================================================ -->
+<div id="js-error-banner" style="display:none;position:fixed;top:0;left:0;right:0;background:#c0392b;color:#fff;padding:10px 16px;font-size:13px;z-index:9999;font-family:monospace;word-break:break-all;"></div>
 <div id="login-screen">
   <div class="login-card">
     <div class="login-logo">
@@ -5057,7 +5057,7 @@ let activeSessionId = null;
 let autoSaveInterval = null;
 
 // State that is tracked across session snapshots
-let currentRef = 'John 1:1';
+let _activeRef = 'John 1:1';
 let currentTranslation = 'KJV';
 let parallelMode = false;
 let parallelTranslations = [];
@@ -5199,6 +5199,8 @@ async function handleLogin(e) {
     return;
   }
 
+  const btn = form.querySelector('[type="submit"]');
+  if (btn) btn.disabled = true;
   try {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
@@ -5215,8 +5217,11 @@ async function handleLogin(e) {
       const err = await res.json().catch(() => ({}));
       _setAuthError(errEl, err.detail || 'Invalid username or password.');
     }
-  } catch (_) {
-    _setAuthError(errEl, 'Network error — please try again.');
+  } catch (e) {
+    console.error('[bible] login fetch error:', e);
+    _setAuthError(errEl, 'Network error: ' + (e?.message || e));
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -5452,7 +5457,7 @@ async function resumeSession(id) {
     }
 
     if (state.ref) {
-      currentRef = state.ref;
+      _activeRef = state.ref;
       // loadChapter is defined in part1/part2 — call if available
       if (typeof loadChapter === 'function') {
         await loadChapter(state.ref);
@@ -5534,7 +5539,7 @@ async function deleteSession(id) {
  */
 function _captureStateSnapshot() {
   return {
-    ref: currentRef,
+    ref: _activeRef,
     translation: currentTranslation,
     parallelMode,
     parallelTranslations: [...parallelTranslations],
@@ -6163,7 +6168,7 @@ async function initAuth() {
     notesArea.addEventListener('input', () => {
       clearTimeout(_notesDebounce);
       _notesDebounce = setTimeout(() => {
-        if (currentRef) saveNote(currentRef, notesArea.value);
+        if (_activeRef) saveNote(_activeRef, notesArea.value);
       }, 1500);
     });
   }
@@ -6182,6 +6187,18 @@ async function initAuth() {
   // --- Check auth last so the UI is wired before any redirect ---
   await checkAuth();
 }
+
+// Global error handler — surfaces JS crashes as a visible banner.
+window.onerror = function(msg, src, line, col, err) {
+  const b = document.getElementById('js-error-banner');
+  if (b) { b.textContent = 'JS Error: ' + msg + ' (' + (src||'').split('/').pop() + ':' + line + ')'; b.style.display = 'block'; }
+  console.error('[bible] uncaught:', msg, src, line, col, err);
+};
+window.onunhandledrejection = function(e) {
+  const b = document.getElementById('js-error-banner');
+  if (b) { b.textContent = 'Unhandled promise: ' + (e.reason?.message || e.reason || 'unknown'); b.style.display = 'block'; }
+  console.error('[bible] unhandled rejection:', e.reason);
+};
 
 // Kick everything off when the DOM is ready.
 if (document.readyState === 'loading') {
