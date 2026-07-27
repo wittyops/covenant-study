@@ -1230,7 +1230,7 @@ async def delete_session(
 @app.get("/api/bookmarks/check")
 async def check_bookmark(
     ref: str = Query(...),
-    request: Optional[Request] = None,
+    request: Request = None,  # type: ignore[assignment]
     authorization: Optional[str] = Header(None),
 ):
     if request is None:
