@@ -5166,15 +5166,15 @@ async function checkAuth() {
 function _showLoginScreen() {
   const loginScreen = document.getElementById('login-screen');
   const appShell = document.getElementById('app-shell');
-  if (loginScreen) loginScreen.style.display = '';
-  if (appShell) appShell.style.display = 'none';
+  if (loginScreen) loginScreen.classList.remove('hidden');
+  if (appShell) appShell.classList.add('hidden');
 }
 
 function _showAppShell() {
   const loginScreen = document.getElementById('login-screen');
   const appShell = document.getElementById('app-shell');
-  if (loginScreen) loginScreen.style.display = 'none';
-  if (appShell) appShell.style.display = '';
+  if (loginScreen) loginScreen.classList.add('hidden');
+  if (appShell) appShell.classList.remove('hidden');
 }
 
 // =============================================================================
