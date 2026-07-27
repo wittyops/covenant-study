@@ -6495,8 +6495,9 @@ async function loadChapter(book, chapter, verseHighlight = null) {
 }
 
 function normalizeVerses(data) {
-  if (Array.isArray(data)) return data;
-  if (data && data.verses) return data.verses;
+  const norm = v => ({ ...v, num: v.num ?? v.verse });
+  if (Array.isArray(data)) return data.map(norm);
+  if (data && data.verses) return data.verses.map(norm);
   if (data && data.text) return [{ num: 1, text: data.text }];
   return [];
 }
