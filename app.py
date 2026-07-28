@@ -2756,6 +2756,89 @@ img, svg {
 .hl-swatch[data-color="purple"] { background: #ab47bc; }
 .hl-swatch[data-color="clear"]  { background: var(--card2); border-color: var(--border); }
 
+/* Generic modal overlay (admin panel + others) */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-login);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.7);
+  backdrop-filter: blur(4px);
+  padding: 16px;
+}
+.modal-dialog {
+  background: var(--card);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  max-width: 560px;
+  width: 100%;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.modal-header h2 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+}
+.modal-close {
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 6px; color: var(--muted);
+  font-size: 16px; cursor: pointer;
+}
+.modal-close:hover { background: var(--card2); color: var(--text); }
+.modal-body {
+  overflow-y: auto;
+  padding: 16px 18px 20px;
+  flex: 1;
+}
+/* Admin user table */
+.admin-user-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.admin-user-table th {
+  text-align: left;
+  padding: 7px 10px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.admin-user-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+.admin-user-table tr:last-child td { border-bottom: none; }
+.btn-sm {
+  font-size: 11px;
+  padding: 4px 9px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  cursor: pointer;
+  background: var(--card2);
+  transition: all 0.15s;
+}
+.btn-sm:hover { border-color: var(--gold); color: var(--gold); }
+.admin-error { color: #e05555; font-size: 13px; }
+
 /* Help modal */
 #help-modal {
   position: fixed;
@@ -8787,6 +8870,23 @@ function init() {
     if (menuAdmin) menuAdmin.style.display = '';
     const oldAdminItem = $('#manage-users-item');
     if (oldAdminItem) oldAdminItem.style.display = '';
+  }
+
+  // User dropdown — event delegation on all data-action buttons
+  const userDropdown = $('#user-chip .user-dropdown') || document.querySelector('.user-dropdown');
+  if (userDropdown) {
+    userDropdown.addEventListener('click', e => {
+      const item = e.target.closest('[data-action]');
+      if (!item) return;
+      const action = item.dataset.action;
+      // Close the dropdown first
+      userDropdown.classList.remove('open');
+      if (action === 'sessions')      openSessionsPanel();
+      else if (action === 'bookmarks') openBookmarksPanel();
+      else if (action === 'history')   openHistoryPanel();
+      else if (action === 'manage-users') showAdminPanel();
+      else if (action === 'signout')   handleSignOut();
+    });
   }
 
   // Prev / Next chapter buttons
