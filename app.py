@@ -1266,6 +1266,66 @@ async def auth_me(request: Request, authorization: Optional[str] = Header(None))
     }
 
 
+def require_admin(request: Request, authorization: Optional[str] = None) -> UserRow:
+    """Returns authenticated UserRow if admin, else raises HTTP 403."""
+    user = get_current_user(request, authorization)
+    if user is None:
+        raise HTTPException(401, detail="Authentication required")
+    if user.role != "admin":
+        raise HTTPException(403, detail="Admin access required")
+    return user
+
+
+# ---------------------------------------------------------------------------
+# ADMIN ENDPOINTS
+# ---------------------------------------------------------------------------
+
+@app.get("/api/admin/users")
+async def admin_list_users(request: Request, authorization: Optional[str] = Header(None)):
+    """List all users. Admin only."""
+    require_admin(request, authorization)
+    conn = get_users_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, username, display_name, role FROM users ORDER BY id"
+        ).fetchall()
+        return [
+            {"id": r[0], "username": r[1], "display_name": r[2] or "", "role": r[3] or "user"}
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+class AdminResetPasswordBody(BaseModel):
+    password: str
+
+
+@app.post("/api/admin/users/{uid}/reset-password")
+async def admin_reset_password(
+    uid: int,
+    body: AdminResetPasswordBody,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Reset any user's password. Admin only."""
+    require_admin(request, authorization)
+    if not body.password or len(body.password) < 8:
+        raise HTTPException(400, detail="Password must be at least 8 characters")
+    hashed = bcrypt.hashpw(body.password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode()
+    conn = get_users_db()
+    try:
+        result = conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?", (hashed, uid)
+        )
+        conn.commit()
+        if result.rowcount == 0:
+            raise HTTPException(404, detail="User not found")
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # STUDY SESSIONS
 # ---------------------------------------------------------------------------
