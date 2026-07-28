@@ -11,7 +11,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Christ Pillar — Bible Study", docs_url=None)
+app = FastAPI(title="Covenant Study", docs_url=None)
 
 DATA      = Path("/app/data")      # Bible text DBs — baked into image, never volume-mounted
 USERDATA  = Path("/app/userdata")  # User accounts, sessions, bookmarks — persisted on named volume
@@ -1575,7 +1575,7 @@ INLINE_HTML = """
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>The Christ Pillar</title>
+  <title>Covenant Study</title>
   <style>
 /* ============================================================
    CUSTOM PROPERTIES
@@ -5053,7 +5053,7 @@ svg.leaflet-image-layer.leaflet-interactive path {
   <div class="login-card">
     <div class="login-logo">
       <div class="cross-mark">✝</div>
-      <h1>The Christ Pillar</h1>
+      <h1>Covenant Study</h1>
       <div class="tagline">Scripture Study Platform</div>
     </div>
 
@@ -5574,7 +5574,7 @@ svg.leaflet-image-layer.leaflet-interactive path {
 
 <script>
 /* =============================================================================
-   wn-bible-01 — Christ Pillar Bible App
+   wn-bible-01 — Covenant Study
    part3_auth.js — Auth, Session, Bookmark, History, Notes, Admin, Toast
    ============================================================================= */
 
@@ -6742,7 +6742,7 @@ if (document.readyState === 'loading') {
 <script>
 /* ============================================================
    part2_reader.js — Bible Reader UI Logic
-   wn-bible-01 · Christ Pillar · Wittycomp Lab
+   Covenant Study · wn-bible-01 · Wittycomp Lab
    ============================================================ */
 
 'use strict';

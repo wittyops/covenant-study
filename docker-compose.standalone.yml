@@ -1,7 +1,7 @@
 services:
-  bible:
+  covenant-study:
     image: ghcr.io/bearboss/wn-bible-01:latest
-    container_name: covenant-bible
+    container_name: covenant-study
     ports:
       - "8000:8000"
     volumes:

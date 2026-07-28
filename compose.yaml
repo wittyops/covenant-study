@@ -14,8 +14,8 @@ services:
         ipv4_address: ${APP_IP:-10.10.30.246}
     labels:
       - homepage.group=Christ Pillar
-      - homepage.name=Bible Study
-      - homepage.description=KJV + Strong's concordance + personal notes
+      - homepage.name=Covenant Study
+      - homepage.description=Bible study platform — Strong's, interlinear, maps, cross-references
       - homepage.icon=https://cdn.jsdelivr.net/npm/simple-icons@latest/icons/read-dot-cv.svg
 
 volumes:
