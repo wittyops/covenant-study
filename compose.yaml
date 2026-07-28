@@ -1,5 +1,5 @@
 services:
-  bible:
+  covenant-study:
     build: .
     image: ghcr.io/bearboss/wn-bible-01:latest
     container_name: wn-bible-01

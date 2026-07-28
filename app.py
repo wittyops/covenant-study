@@ -383,6 +383,28 @@ def init_users_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_history_user
                 ON reading_history(user_id, visited_at DESC);
+
+            CREATE TABLE IF NOT EXISTS highlights (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                ref        TEXT    NOT NULL,
+                color      TEXT    NOT NULL DEFAULT '#ffeb3b',
+                note       TEXT,
+                created_at INTEGER NOT NULL,
+                UNIQUE (user_id, ref)
+            );
+            CREATE INDEX IF NOT EXISTS idx_highlights_user ON highlights(user_id);
+
+            CREATE TABLE IF NOT EXISTS reading_plan_progress (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                plan_id     TEXT    NOT NULL,
+                day_index   INTEGER NOT NULL DEFAULT 0,
+                started_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                UNIQUE (user_id, plan_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_plan_progress_user ON reading_plan_progress(user_id);
         """)
 
         count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -605,6 +627,17 @@ class HistoryBody(BaseModel):
 
 class NoteBody(BaseModel):
     body: str = ""
+
+
+class HighlightCreateBody(BaseModel):
+    ref: str = Field(..., min_length=1)
+    color: str = "#ffeb3b"
+    note: Optional[str] = None
+
+
+class ReadingPlanProgressBody(BaseModel):
+    plan_id: str = Field(..., min_length=1)
+    day_index: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1566,6 +1599,178 @@ async def save_note_user(
 
 
 # ---------------------------------------------------------------------------
+# HIGHLIGHTS
+# ---------------------------------------------------------------------------
+
+@app.get("/api/highlights")
+async def list_highlights(request: Request, authorization: Optional[str] = Header(None)):
+    user = get_current_user(request, authorization)
+    if user is None:
+        return []
+    conn = get_users_db()
+    try:
+        rows = conn.execute(
+            "SELECT ref, color, note, created_at FROM highlights WHERE user_id = ? ORDER BY created_at DESC",
+            (user.id,)
+        ).fetchall()
+        return [{"ref": r[0], "color": r[1], "note": r[2], "created_at": r[3]} for r in rows]
+    finally:
+        conn.close()
+
+
+@app.post("/api/highlights", status_code=201)
+async def set_highlight(
+    body: HighlightCreateBody,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(request, authorization)
+    now = int(time.time())
+    conn = get_users_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO highlights(user_id, ref, color, note, created_at) VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, ref)
+            DO UPDATE SET color = excluded.color, note = excluded.note
+            """,
+            (user.id, body.ref, body.color, body.note, now)
+        )
+        conn.commit()
+        return {"ref": body.ref, "color": body.color, "note": body.note}
+    finally:
+        conn.close()
+
+
+@app.delete("/api/highlights/{ref:path}", status_code=204)
+async def delete_highlight(
+    ref: str,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(request, authorization)
+    conn = get_users_db()
+    try:
+        conn.execute(
+            "DELETE FROM highlights WHERE user_id = ? AND ref = ?",
+            (user.id, ref)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# READING PLANS
+# ---------------------------------------------------------------------------
+
+READING_PLANS_META = [
+    {
+        "id": "bible-in-a-year",
+        "name": "Bible in a Year",
+        "description": "Read the entire Bible in 365 days with balanced OT/NT daily readings.",
+        "days": 365,
+        "category": "Complete Bible",
+    },
+    {
+        "id": "nt-90-days",
+        "name": "New Testament in 90 Days",
+        "description": "Read the entire New Testament in 90 days (~3 chapters per day).",
+        "days": 90,
+        "category": "New Testament",
+    },
+    {
+        "id": "gospels-28",
+        "name": "Gospels Survey",
+        "description": "Matthew, Mark, Luke, and John in 28 days.",
+        "days": 28,
+        "category": "Gospels",
+    },
+    {
+        "id": "psalms-proverbs-30",
+        "name": "Psalms & Proverbs",
+        "description": "A Psalm and a chapter of Proverbs each day for 30 days.",
+        "days": 30,
+        "category": "Wisdom",
+    },
+    {
+        "id": "pauline-21",
+        "name": "Pauline Epistles",
+        "description": "Romans through Philemon — 13 letters in 21 days.",
+        "days": 21,
+        "category": "Epistles",
+    },
+]
+
+
+@app.get("/api/reading-plans")
+async def list_reading_plans():
+    return READING_PLANS_META
+
+
+@app.get("/api/reading-plans/progress")
+async def get_reading_plan_progress(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = get_current_user(request, authorization)
+    if user is None:
+        return []
+    conn = get_users_db()
+    try:
+        rows = conn.execute(
+            "SELECT plan_id, day_index, started_at, updated_at FROM reading_plan_progress WHERE user_id = ?",
+            (user.id,)
+        ).fetchall()
+        return [{"plan_id": r[0], "day_index": r[1], "started_at": r[2], "updated_at": r[3]} for r in rows]
+    finally:
+        conn.close()
+
+
+@app.post("/api/reading-plans/progress", status_code=200)
+async def update_reading_plan_progress(
+    body: ReadingPlanProgressBody,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(request, authorization)
+    now = int(time.time())
+    conn = get_users_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO reading_plan_progress(user_id, plan_id, day_index, started_at, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, plan_id)
+            DO UPDATE SET day_index = excluded.day_index, updated_at = excluded.updated_at
+            """,
+            (user.id, body.plan_id, body.day_index, now, now)
+        )
+        conn.commit()
+        return {"plan_id": body.plan_id, "day_index": body.day_index, "updated_at": now}
+    finally:
+        conn.close()
+
+
+@app.delete("/api/reading-plans/progress/{plan_id}", status_code=204)
+async def reset_reading_plan_progress(
+    plan_id: str,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(request, authorization)
+    conn = get_users_db()
+    try:
+        conn.execute(
+            "DELETE FROM reading_plan_progress WHERE user_id = ? AND plan_id = ?",
+            (user.id, plan_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # FRONTEND
 # ---------------------------------------------------------------------------
 
@@ -2494,6 +2699,175 @@ img, svg {
   background: rgba(185,150,46,0.1);
   border-left-color: rgba(185,150,46,0.25);
 }
+
+/* User highlight colors — applied via data-hl attribute */
+.verse-row[data-hl="yellow"] { background: rgba(255,235,59,0.12); border-left-color: rgba(255,235,59,0.5); }
+.verse-row[data-hl="green"]  { background: rgba(102,187,106,0.12); border-left-color: rgba(102,187,106,0.5); }
+.verse-row[data-hl="blue"]   { background: rgba(66,165,245,0.12); border-left-color: rgba(66,165,245,0.5); }
+.verse-row[data-hl="pink"]   { background: rgba(240,98,146,0.12); border-left-color: rgba(240,98,146,0.5); }
+.verse-row[data-hl="purple"] { background: rgba(171,71,188,0.12); border-left-color: rgba(171,71,188,0.5); }
+
+/* Verse context menu */
+#verse-context-menu {
+  position: fixed;
+  z-index: var(--z-dropdown);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-dropdown);
+  padding: 6px;
+  min-width: 180px;
+  display: none;
+}
+#verse-context-menu.open { display: block; }
+.ctx-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border-radius: 5px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-menu-item:hover { background: var(--card2); }
+.ctx-menu-divider { height: 1px; background: var(--border); margin: 4px 0; }
+.ctx-hl-swatches {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px 4px;
+}
+.hl-swatch {
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: border-color 0.15s, transform 0.15s;
+  flex-shrink: 0;
+}
+.hl-swatch:hover, .hl-swatch.active { border-color: var(--text); transform: scale(1.15); }
+.hl-swatch[data-color="yellow"] { background: #ffeb3b; }
+.hl-swatch[data-color="green"]  { background: #66bb6a; }
+.hl-swatch[data-color="blue"]   { background: #42a5f5; }
+.hl-swatch[data-color="pink"]   { background: #f06292; }
+.hl-swatch[data-color="purple"] { background: #ab47bc; }
+.hl-swatch[data-color="clear"]  { background: var(--card2); border-color: var(--border); }
+
+/* Help modal */
+#help-modal {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-login);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.7);
+  backdrop-filter: blur(4px);
+  padding: 16px;
+}
+#help-modal.open { display: flex; }
+.help-sheet {
+  background: var(--card);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  max-width: 600px;
+  width: 100%;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.help-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.help-title { font-size: 16px; font-weight: 600; color: var(--text); }
+.help-close {
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 6px; color: var(--muted);
+  font-size: 16px; cursor: pointer;
+}
+.help-close:hover { background: var(--card2); color: var(--text); }
+.help-body {
+  overflow-y: auto;
+  padding: 16px 18px 20px;
+  flex: 1;
+}
+.help-section { margin-bottom: 18px; }
+.help-section h3 {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--gold);
+  margin-bottom: 8px;
+}
+.help-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 5px 0;
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.help-key {
+  font-family: monospace;
+  font-size: 11px;
+  padding: 2px 6px;
+  background: var(--card2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Reading plans tab */
+.plans-list { display: flex; flex-direction: column; gap: 10px; padding: 12px 0; }
+.plan-card {
+  background: var(--card2);
+  border-radius: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.plan-card:hover { border-color: var(--gold); }
+.plan-card.active { border-color: var(--gold); }
+.plan-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.plan-card-name { font-size: 14px; font-weight: 600; color: var(--text); }
+.plan-card-category { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+.plan-card-desc { font-size: 12px; color: var(--text-dim); margin-bottom: 8px; line-height: 1.45; }
+.plan-progress-bar {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 5px;
+}
+.plan-progress-fill { height: 100%; background: var(--gold); border-radius: 2px; transition: width 0.3s; }
+.plan-progress-label { font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; }
+.plan-actions { display: flex; gap: 6px; margin-top: 8px; }
+.plan-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.15s;
+  background: var(--card);
+}
+.plan-btn:hover { border-color: var(--gold); color: var(--gold); }
+.plan-btn.primary { background: var(--gold); color: #000; border-color: var(--gold); font-weight: 600; }
+.plan-btn.primary:hover { background: var(--gold-light); }
 
 .verse-num {
   font-size: 11px;
@@ -5133,6 +5507,15 @@ svg.leaflet-image-layer.leaflet-interactive path {
       </svg>
     </button>
 
+    <!-- Help button -->
+    <button id="btn-help" aria-label="Help & guide" title="Help">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.4"/>
+        <path d="M6.2 6a2 2 0 113.6 1.2C9.5 7.7 8 8.5 8 9.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+        <circle cx="8" cy="11.5" r="0.75" fill="currentColor"/>
+      </svg>
+    </button>
+
     <!-- Search button -->
     <button id="btn-search-open" aria-label="Search scriptures" aria-controls="search-overlay">
       <svg width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true">
@@ -5318,6 +5701,8 @@ svg.leaflet-image-layer.leaflet-interactive path {
           <button class="tab-btn" role="tab" aria-selected="false" data-tab="commentary">Commentary</button>
           <button class="tab-btn" role="tab" aria-selected="false" data-tab="notes">Notes</button>
           <button class="tab-btn" role="tab" aria-selected="false" data-tab="maps">🗺 Maps</button>
+          <button class="tab-btn" role="tab" aria-selected="false" data-tab="plans">📅 Plans</button>
+          <button class="tab-btn" role="tab" aria-selected="false" data-tab="highlights">🖊 Highlights</button>
         </div>
       </div>
 
@@ -5363,6 +5748,24 @@ svg.leaflet-image-layer.leaflet-interactive path {
         </div>
       </div>
 
+      <div class="tab-content hidden" id="tab-plans" role="tabpanel">
+        <div class="plans-list" id="plans-list">
+          <div class="panel-empty">
+            <div class="panel-empty-icon" aria-hidden="true">📅</div>
+            <div class="panel-empty-text">Loading reading plans…</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-content hidden" id="tab-highlights" role="tabpanel">
+        <div id="highlights-list" style="padding:8px 0">
+          <div class="panel-empty">
+            <div class="panel-empty-icon" aria-hidden="true">🖊</div>
+            <div class="panel-empty-text">No highlights yet — right-click any verse</div>
+          </div>
+        </div>
+      </div>
+
     </aside><!-- /#study-panel -->
 
   </div><!-- /#layout-container -->
@@ -5401,6 +5804,88 @@ svg.leaflet-image-layer.leaflet-interactive path {
 
   <!-- BACKDROP OVERLAY (shared) -->
   <div class="backdrop" id="main-backdrop" aria-hidden="true"></div>
+
+  <!-- VERSE CONTEXT MENU -->
+  <div id="verse-context-menu" role="menu" aria-label="Verse options">
+    <div class="ctx-hl-swatches" aria-label="Highlight color">
+      <div class="hl-swatch" data-color="yellow" title="Yellow" role="button" tabindex="0"></div>
+      <div class="hl-swatch" data-color="green"  title="Green"  role="button" tabindex="0"></div>
+      <div class="hl-swatch" data-color="blue"   title="Blue"   role="button" tabindex="0"></div>
+      <div class="hl-swatch" data-color="pink"   title="Pink"   role="button" tabindex="0"></div>
+      <div class="hl-swatch" data-color="purple" title="Purple" role="button" tabindex="0"></div>
+      <div class="hl-swatch" data-color="clear"  title="Clear"  role="button" tabindex="0">✕</div>
+    </div>
+    <div class="ctx-menu-divider"></div>
+    <div class="ctx-menu-item" id="ctx-copy" role="menuitem" tabindex="0">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><rect x="1" y="3.5" width="8.5" height="8.5" rx="1.2" stroke="currentColor" stroke-width="1.2"/><path d="M3.5 3.5V2A1.2 1.2 0 014.7.8h6.1A1.2 1.2 0 0112 2v6.1a1.2 1.2 0 01-1.2 1.2H9.5" stroke="currentColor" stroke-width="1.2"/></svg>
+      Copy verse
+    </div>
+    <div class="ctx-menu-item" id="ctx-share" role="menuitem" tabindex="0">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><circle cx="10.5" cy="2.5" r="1.5" stroke="currentColor" stroke-width="1.2"/><circle cx="10.5" cy="10.5" r="1.5" stroke="currentColor" stroke-width="1.2"/><circle cx="2.5" cy="6.5" r="1.5" stroke="currentColor" stroke-width="1.2"/><path d="M4 7.3l5.1 2.5M9.1 3.2L4 5.7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+      Share verse
+    </div>
+    <div class="ctx-menu-item" id="ctx-bookmark" role="menuitem" tabindex="0">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M2 1.5h9v10l-4.5-2.7L2 11.5V1.5z" stroke="currentColor" stroke-width="1.2"/></svg>
+      Bookmark
+    </div>
+    <div class="ctx-menu-item" id="ctx-note" role="menuitem" tabindex="0">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><rect x="1" y="1" width="11" height="11" rx="1.5" stroke="currentColor" stroke-width="1.2"/><path d="M3.5 4.5h6M3.5 7h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+      Add note
+    </div>
+  </div>
+
+  <!-- HELP MODAL -->
+  <div id="help-modal" role="dialog" aria-modal="true" aria-label="Covenant Study Guide">
+    <div class="help-sheet">
+      <div class="help-header">
+        <span class="help-title">Covenant Study — Quick Guide</span>
+        <button class="help-close" id="btn-help-close" aria-label="Close help">✕</button>
+      </div>
+      <div class="help-body">
+        <div class="help-section">
+          <h3>Navigation</h3>
+          <div class="help-row"><span class="help-key">Book / Chapter</span><span>Tap the reference pill in the top bar to open the book &amp; chapter picker</span></div>
+          <div class="help-row"><span class="help-key">← →</span><span>Prev/Next chapter buttons in the top bar or the mobile bottom bar</span></div>
+          <div class="help-row"><span class="help-key">Translation</span><span>Tap the translation pill (e.g. KJV) to switch between 30+ versions</span></div>
+          <div class="help-row"><span class="help-key">Parallel</span><span>The parallel-columns icon shows two translations side by side</span></div>
+          <div class="help-row"><span class="help-key">Search</span><span>Tap the 🔍 icon or type a reference (John 3:16) or keyword</span></div>
+        </div>
+        <div class="help-section">
+          <h3>Study Tools</h3>
+          <div class="help-row"><span class="help-key">Verse click</span><span>Tap any verse to select it and load cross-references in the study panel</span></div>
+          <div class="help-row"><span class="help-key">Cross-refs</span><span>Linked verses from the Treasury of Scripture Knowledge — click any chip to navigate</span></div>
+          <div class="help-row"><span class="help-key">Strong's</span><span>Tap a gold-tinted word in Interlinear view to look up its Greek/Hebrew root</span></div>
+          <div class="help-row"><span class="help-key">Interlinear</span><span>Word-for-word Greek/Hebrew with morphology, sourced from STEPBible TAGNT/TAHOT</span></div>
+          <div class="help-row"><span class="help-key">Commentary</span><span>Classic commentaries (Matthew Henry, etc.) for the selected verse</span></div>
+          <div class="help-row"><span class="help-key">Maps</span><span>Biblical places mentioned in the current passage plotted on an interactive map</span></div>
+        </div>
+        <div class="help-section">
+          <h3>Highlights &amp; Notes</h3>
+          <div class="help-row"><span class="help-key">Right-click</span><span>Right-click (or long-press on mobile) any verse for highlight colors, copy, share, and bookmark</span></div>
+          <div class="help-row"><span class="help-key">Highlights tab</span><span>View all your highlighted verses in one place; click any to navigate</span></div>
+          <div class="help-row"><span class="help-key">Notes tab</span><span>Write personal notes per verse; notes are saved to your account</span></div>
+          <div class="help-row"><span class="help-key">Bookmarks</span><span>Bookmark any verse from the context menu; find them in the user menu → Bookmarks</span></div>
+        </div>
+        <div class="help-section">
+          <h3>Reading Plans</h3>
+          <div class="help-row"><span class="help-key">Plans tab</span><span>Choose from Bible in a Year, NT in 90 Days, Gospels, Psalms &amp; Proverbs, or Pauline Epistles</span></div>
+          <div class="help-row"><span class="help-key">Progress</span><span>Tap "Mark Read" to advance your daily progress; progress is saved to your account</span></div>
+          <div class="help-row"><span class="help-key">Reset</span><span>Tap "Reset" on any plan to start over from Day 1</span></div>
+        </div>
+        <div class="help-section">
+          <h3>Share &amp; Copy</h3>
+          <div class="help-row"><span class="help-key">Copy verse</span><span>Right-click a verse → Copy verse — copies formatted text with reference to clipboard</span></div>
+          <div class="help-row"><span class="help-key">Share verse</span><span>Right-click → Share verse — uses the Web Share API on mobile, falls back to clipboard copy</span></div>
+        </div>
+        <div class="help-section">
+          <h3>Account</h3>
+          <div class="help-row"><span class="help-key">User menu</span><span>Tap your name/initials in the top right for sessions, bookmarks, history, and sign-out</span></div>
+          <div class="help-row"><span class="help-key">Study Sessions</span><span>Save your current position and panel state as a named session to return to later</span></div>
+          <div class="help-row"><span class="help-key">Admin</span><span>Admins see a "Manage Users" option to add/remove accounts</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- SESSIONS PANEL (slide-in drawer) -->
   <div id="sessions-panel" class="slide-drawer" role="dialog" aria-modal="true" aria-label="Study Sessions" aria-hidden="true">
@@ -6859,6 +7344,7 @@ const state = {
   sidebarOpen:    false,
   bottomSheetOpen: false,
   expandedBooks:  new Set(),
+  highlights:     {},
   isDesktop:      () => window.innerWidth >= 768,
 };
 
@@ -7028,6 +7514,9 @@ async function loadChapter(book, chapter, verseHighlight = null) {
   } catch (err) {
     content.innerHTML = `<p class="error-msg">Failed to load chapter: ${escHtml(err.message)}</p>`;
   }
+
+  // Apply stored highlights to newly-rendered verse rows
+  applyHighlights();
 
   // Silent history POST
   postHistory(`${book} ${chapter}`);
@@ -7433,6 +7922,10 @@ function switchTab(tabName) {
 
   // Lazy-init map on first open
   if (tabName === 'maps') initMap();
+
+  // Lazy-load plans and highlights on first open
+  if (tabName === 'plans') loadReadingPlans();
+  if (tabName === 'highlights') renderHighlightsList();
 
   // Load data for newly-visible tab, falling back to verse 1 of current chapter
   const activeRef = state.currentVerse
@@ -7892,6 +8385,349 @@ function closeMenuDrawer() {
   if (drawer) { drawer.classList.remove('open'); drawer.setAttribute('aria-hidden','true'); }
 }
 
+// ── 12. HIGHLIGHTS ──────────────────────────────────────────────────────────
+
+const HL_HEX = { yellow:'#ffeb3b', green:'#66bb6a', blue:'#42a5f5', pink:'#f06292', purple:'#ab47bc' };
+const HL_HEX_INV = Object.fromEntries(Object.entries(HL_HEX).map(([k,v])=>[v,k]));
+
+// Apply stored highlights to verse rows in the current chapter
+function applyHighlights() {
+  const rows = $$('.verse-row[data-verse]');
+  for (const row of rows) {
+    const verseNum = row.getAttribute('data-verse');
+    const ref = `${state.currentBook} ${state.currentChapter}:${verseNum}`;
+    const color = state.highlights[ref];
+    if (color) {
+      row.setAttribute('data-hl', color);
+    } else {
+      row.removeAttribute('data-hl');
+    }
+  }
+}
+
+async function loadHighlights() {
+  try {
+    const data = await apiFetch('/api/highlights');
+    state.highlights = {};
+    for (const h of (data || [])) {
+      const colorName = HL_HEX_INV[h.color] || h.color;
+      state.highlights[h.ref] = colorName;
+    }
+    applyHighlights();
+    renderHighlightsList();
+  } catch (_) { /* not logged in or no data */ }
+}
+
+function renderHighlightsList() {
+  const container = $('#highlights-list');
+  if (!container) return;
+  const entries = Object.entries(state.highlights);
+  if (!entries.length) {
+    container.innerHTML = '<div class="panel-empty"><div class="panel-empty-icon">🖊</div><div class="panel-empty-text">No highlights yet — right-click any verse</div></div>';
+    return;
+  }
+  container.innerHTML = '';
+  for (const [ref, color] of entries.sort((a,b)=>a[0].localeCompare(b[0]))) {
+    const hex = HL_HEX[color] || '#ffeb3b';
+    const item = el('div', {
+      class: 'ctx-menu-item',
+      style: `border-left: 3px solid ${hex}; padding-left: 10px; cursor:pointer;`,
+      onclick: () => {
+        const parsed = parseRef(ref);
+        if (parsed) loadChapter(parsed.book, parsed.chapter, parsed.verse);
+      }
+    });
+    item.textContent = ref;
+    container.appendChild(item);
+  }
+}
+
+async function setHighlight(ref, colorName) {
+  const hex = HL_HEX[colorName];
+  if (!hex) return;
+  try {
+    await fetch('/api/highlights', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ ref, color: hex })
+    });
+    state.highlights[ref] = colorName;
+    applyHighlights();
+    renderHighlightsList();
+  } catch (_) { showToast('Sign in to save highlights'); }
+}
+
+async function clearHighlight(ref) {
+  try {
+    await fetch(`/api/highlights/${encodeURIComponent(ref)}`, { method: 'DELETE' });
+    delete state.highlights[ref];
+    applyHighlights();
+    renderHighlightsList();
+  } catch (_) {}
+}
+
+// ── 13. CONTEXT MENU ────────────────────────────────────────────────────────
+
+let _ctxRef = null;
+
+function showVerseContextMenu(ref, x, y) {
+  _ctxRef = ref;
+  const menu = $('#verse-context-menu');
+  if (!menu) return;
+
+  // Mark active swatch
+  const currentColor = state.highlights[ref];
+  menu.querySelectorAll('.hl-swatch').forEach(sw => {
+    sw.classList.toggle('active', sw.dataset.color === currentColor);
+  });
+
+  // Position: stay within viewport
+  menu.classList.add('open');
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const mw = menu.offsetWidth || 190, mh = menu.offsetHeight || 180;
+  menu.style.left = Math.min(x, vw - mw - 8) + 'px';
+  menu.style.top  = Math.min(y, vh - mh - 8) + 'px';
+}
+
+function closeVerseContextMenu() {
+  const menu = $('#verse-context-menu');
+  if (menu) menu.classList.remove('open');
+  _ctxRef = null;
+}
+
+// ── 14. SHARE / COPY ────────────────────────────────────────────────────────
+
+async function copyVerse(ref) {
+  try {
+    const parts = ref.match(/^(.+?)\\s+(\\d+):(\\d+)$/);
+    if (!parts) return;
+    const data = await apiFetch(`/api/verse?ref=${encodeURIComponent(ref)}&translation=${encodeURIComponent(state.currentTranslation)}`);
+    const verses = data.verses || data;
+    const verseNum = parseInt(parts[3]);
+    const verse = (verses || []).find(v => v.num === verseNum || v.verse === verseNum);
+    const text = verse ? (verse.text || verse.verse_text || '') : '';
+    const formatted = `"${text}" — ${ref} (${state.currentTranslation})`;
+    await navigator.clipboard.writeText(formatted);
+    showToast('Verse copied to clipboard');
+  } catch (_) {
+    showToast('Copy failed');
+  }
+}
+
+async function shareVerse(ref) {
+  try {
+    const parts = ref.match(/^(.+?)\\s+(\\d+):(\\d+)$/);
+    if (!parts) return;
+    const data = await apiFetch(`/api/verse?ref=${encodeURIComponent(ref)}&translation=${encodeURIComponent(state.currentTranslation)}`);
+    const verses = data.verses || data;
+    const verseNum = parseInt(parts[3]);
+    const verse = (verses || []).find(v => v.num === verseNum || v.verse === verseNum);
+    const text = verse ? (verse.text || verse.verse_text || '') : '';
+    const formatted = `"${text}" — ${ref} (${state.currentTranslation})`;
+    if (navigator.share) {
+      await navigator.share({ title: ref, text: formatted });
+    } else {
+      await navigator.clipboard.writeText(formatted);
+      showToast('Verse copied (share not supported on this device)');
+    }
+  } catch (_) {
+    showToast('Share failed');
+  }
+}
+
+function showToast(msg) {
+  let toast = $('#cs-toast');
+  if (!toast) {
+    toast = el('div', { id: 'cs-toast', style: 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:8px 16px;border-radius:20px;font-size:13px;z-index:var(--z-toast);pointer-events:none;transition:opacity 0.3s;' });
+    document.body.appendChild(toast);
+  }
+  toast.textContent = msg;
+  toast.style.opacity = '1';
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { toast.style.opacity = '0'; }, 2500);
+}
+
+// ── 15. READING PLANS ───────────────────────────────────────────────────────
+
+const PLAN_PASSAGES = {
+  'nt-90-days': [
+    // 90 entries — first chapter of each block for navigation purposes
+    // Matthew (28ch), Mark (16ch), Luke (24ch), John (21ch), Acts (28ch),
+    // Romans–Philemon, Hebrews–Revelation
+    ...Array.from({length:9}, (_,i)=>`Matthew ${i*3+1}`),
+    `Matthew 28`, `Mark 1`,
+    ...Array.from({length:5}, (_,i)=>`Mark ${i*3+2}`),
+    `Luke 1`,
+    ...Array.from({length:8}, (_,i)=>`Luke ${i*3+1}`),
+    `John 1`,
+    ...Array.from({length:7}, (_,i)=>`John ${i*3+1}`),
+    `Acts 1`,
+    ...Array.from({length:9}, (_,i)=>`Acts ${i*3+1}`),
+    `Romans 1`, `Romans 9`, `1 Corinthians 1`, `1 Corinthians 10`,
+    `2 Corinthians 1`, `Galatians 1`, `Ephesians 1`, `Philippians 1`,
+    `Colossians 1`, `1 Thessalonians 1`, `2 Thessalonians 1`, `1 Timothy 1`,
+    `2 Timothy 1`, `Titus 1`, `Philemon 1`, `Hebrews 1`, `Hebrews 8`,
+    `James 1`, `1 Peter 1`, `2 Peter 1`, `1 John 1`, `2 John 1`,
+    `3 John 1`, `Jude 1`, `Revelation 1`, `Revelation 11`, `Revelation 19`
+  ].slice(0, 90),
+  'gospels-28': [
+    `Matthew 1`,`Matthew 4`,`Matthew 7`,`Matthew 10`,`Matthew 13`,`Matthew 16`,`Matthew 19`,
+    `Matthew 22`,`Matthew 25`,`Matthew 28`,
+    `Mark 1`,`Mark 4`,`Mark 8`,`Mark 12`,`Mark 16`,
+    `Luke 1`,`Luke 4`,`Luke 7`,`Luke 10`,`Luke 13`,`Luke 16`,`Luke 19`,`Luke 22`,
+    `John 1`,`John 6`,`John 11`,`John 16`,`John 20`
+  ],
+  'psalms-proverbs-30': Array.from({length:30}, (_,i)=>`Psalms ${i*5+1}`),
+  'pauline-21': [
+    `Romans 1`,`Romans 5`,`Romans 9`,`Romans 13`,`1 Corinthians 1`,`1 Corinthians 6`,
+    `1 Corinthians 11`,`2 Corinthians 1`,`2 Corinthians 8`,`Galatians 1`,`Galatians 4`,
+    `Ephesians 1`,`Ephesians 4`,`Philippians 1`,`Colossians 1`,
+    `1 Thessalonians 1`,`2 Thessalonians 1`,`1 Timothy 1`,`2 Timothy 1`,
+    `Titus 1`,`Philemon 1`
+  ],
+  'bible-in-a-year': Array.from({length:365}, (_,i) => {
+    // Simplified sequential reading: OT + NT interleaved
+    // Genesis(50) + Exodus(40) + … distribute over 365 days
+    const OT = ['Genesis','Exodus','Leviticus','Numbers','Deuteronomy','Joshua','Judges','Ruth',
+      '1 Samuel','2 Samuel','1 Kings','2 Kings','1 Chronicles','2 Chronicles','Ezra','Nehemiah',
+      'Esther','Job','Psalms','Proverbs','Ecclesiastes','Song of Solomon','Isaiah','Jeremiah',
+      'Lamentations','Ezekiel','Daniel','Hosea','Joel','Amos','Obadiah','Jonah','Micah',
+      'Nahum','Habakkuk','Zephaniah','Haggai','Zechariah','Malachi'];
+    const NT = ['Matthew','Mark','Luke','John','Acts','Romans','1 Corinthians','2 Corinthians',
+      'Galatians','Ephesians','Philippians','Colossians','1 Thessalonians','2 Thessalonians',
+      '1 Timothy','2 Timothy','Titus','Philemon','Hebrews','James','1 Peter','2 Peter',
+      '1 John','2 John','3 John','Jude','Revelation'];
+    // Each day: approx one OT + one NT chapter
+    const ntIndex = Math.floor(i / 4) % NT.length;
+    const otIndex = Math.floor(i * 39 / 365);
+    return OT[Math.min(otIndex, OT.length - 1)] + ' 1';
+  })
+};
+
+let _planState = {}; // plan_id → day_index
+
+async function loadReadingPlans() {
+  const container = $('#plans-list');
+  if (!container) return;
+  try {
+    const [plans, progress] = await Promise.all([
+      apiFetch('/api/reading-plans'),
+      apiFetch('/api/reading-plans/progress').catch(() => [])
+    ]);
+    _planState = {};
+    for (const p of (progress || [])) _planState[p.plan_id] = p.day_index;
+    renderReadingPlans(plans || []);
+  } catch (_) {
+    if (container) container.innerHTML = '<div class="panel-empty"><div class="panel-empty-icon">📅</div><div class="panel-empty-text">Sign in to track reading plans</div></div>';
+  }
+}
+
+function renderReadingPlans(plans) {
+  const container = $('#plans-list');
+  if (!container) return;
+  container.innerHTML = '';
+  const list = el('div', { class: 'plans-list' });
+  for (const plan of plans) {
+    const dayIdx = _planState[plan.id] || 0;
+    const pct = Math.round((dayIdx / plan.days) * 100);
+    const passages = PLAN_PASSAGES[plan.id] || [];
+    const todayPassage = passages[Math.min(dayIdx, passages.length - 1)] || '';
+
+    const card = el('div', { class: 'plan-card' + (dayIdx > 0 ? ' active' : '') });
+    const header = el('div', { class: 'plan-card-header' });
+    header.appendChild(el('span', { class: 'plan-card-name' }, plan.name));
+    header.appendChild(el('span', { class: 'plan-card-category' }, plan.category));
+    card.appendChild(header);
+    card.appendChild(el('p', { class: 'plan-card-desc' }, plan.description));
+
+    const progBar = el('div', { class: 'plan-progress-bar' });
+    const fill = el('div', { class: 'plan-progress-fill', style: `width:${pct}%` });
+    progBar.appendChild(fill);
+    card.appendChild(progBar);
+
+    const progLabel = el('div', { class: 'plan-progress-label' });
+    progLabel.appendChild(el('span', {}, `Day ${dayIdx} of ${plan.days}`));
+    progLabel.appendChild(el('span', {}, `${pct}%`));
+    card.appendChild(progLabel);
+
+    if (todayPassage && dayIdx < plan.days) {
+      const today = el('p', { style: 'font-size:12px;color:var(--gold);margin-top:5px;' }, `Today: ${todayPassage}`);
+      card.appendChild(today);
+    } else if (dayIdx >= plan.days) {
+      const done = el('p', { style: 'font-size:12px;color:#66bb6a;margin-top:5px;' }, '✓ Complete!');
+      card.appendChild(done);
+    }
+
+    const actions = el('div', { class: 'plan-actions' });
+    if (todayPassage && dayIdx < plan.days) {
+      const readBtn = el('button', { class: 'plan-btn primary', onclick: async () => {
+        const parsed = parseRef(todayPassage + ':1');
+        if (parsed) loadChapter(parsed.book, parsed.chapter, null);
+        else {
+          // todayPassage is "Book Chapter" — parse manually
+          const m = todayPassage.match(/^(.+)\\s+(\\d+)$/);
+          if (m) {
+            const bk = ALL_BOOKS.find(b => b.name === m[1]);
+            if (bk) loadChapter(bk.name, parseInt(m[2]), null);
+          }
+        }
+      }}, 'Read Today');
+      actions.appendChild(readBtn);
+
+      const markBtn = el('button', { class: 'plan-btn', onclick: async () => {
+        const newDay = dayIdx + 1;
+        await fetch('/api/reading-plans/progress', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ plan_id: plan.id, day_index: newDay })
+        });
+        _planState[plan.id] = newDay;
+        renderReadingPlans(plans);
+        showToast(`Day ${newDay} marked — great work!`);
+      }}, 'Mark Read');
+      actions.appendChild(markBtn);
+    }
+
+    if (dayIdx > 0) {
+      const resetBtn = el('button', { class: 'plan-btn', onclick: async () => {
+        if (!confirm(`Reset "${plan.name}" progress?`)) return;
+        await fetch(`/api/reading-plans/progress/${encodeURIComponent(plan.id)}`, { method: 'DELETE' });
+        _planState[plan.id] = 0;
+        renderReadingPlans(plans);
+      }}, 'Reset');
+      actions.appendChild(resetBtn);
+    } else {
+      const startBtn = el('button', { class: 'plan-btn', onclick: async () => {
+        await fetch('/api/reading-plans/progress', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ plan_id: plan.id, day_index: 1 })
+        });
+        _planState[plan.id] = 1;
+        renderReadingPlans(plans);
+        showToast(`Started ${plan.name}!`);
+      }}, 'Start Plan');
+      actions.appendChild(startBtn);
+    }
+
+    card.appendChild(actions);
+    list.appendChild(card);
+  }
+  container.appendChild(list);
+}
+
+// ── 16. HELP MODAL ──────────────────────────────────────────────────────────
+
+function openHelpModal() {
+  const modal = $('#help-modal');
+  if (modal) modal.classList.add('open');
+}
+
+function closeHelpModal() {
+  const modal = $('#help-modal');
+  if (modal) modal.classList.remove('open');
+}
+
 // ── 12. INIT ───────────────────────────────────────────────────────────────
 
 function init() {
@@ -8091,6 +8927,90 @@ function init() {
     tabBar.addEventListener('scroll', updateFade, { passive: true });
     updateFade();
   }
+
+  // Help button
+  const helpBtn = $('#btn-help');
+  if (helpBtn) helpBtn.addEventListener('click', openHelpModal);
+  const helpClose = $('#btn-help-close');
+  if (helpClose) helpClose.addEventListener('click', closeHelpModal);
+  const helpModal = $('#help-modal');
+  if (helpModal) helpModal.addEventListener('click', e => {
+    if (e.target === helpModal) closeHelpModal();
+  });
+
+  // Context menu — right-click and long-press on verse rows
+  const verseArea = $('#verse-area') || $('#chapter-content') || document.querySelector('.chapter-content, #reader-pane, #reader');
+  document.addEventListener('contextmenu', e => {
+    const row = e.target.closest('.verse-row[data-verse]');
+    if (!row) { closeVerseContextMenu(); return; }
+    e.preventDefault();
+    const ref = `${state.currentBook} ${state.currentChapter}:${row.getAttribute('data-verse')}`;
+    showVerseContextMenu(ref, e.clientX + 4, e.clientY + 4);
+  });
+
+  // Long-press for mobile context menu
+  let _longPressTimer = null;
+  document.addEventListener('touchstart', e => {
+    const row = e.target.closest('.verse-row[data-verse]');
+    if (!row) return;
+    _longPressTimer = setTimeout(() => {
+      const ref = `${state.currentBook} ${state.currentChapter}:${row.getAttribute('data-verse')}`;
+      const touch = e.touches[0];
+      showVerseContextMenu(ref, touch.clientX, touch.clientY);
+    }, 600);
+  }, { passive: true });
+  document.addEventListener('touchend', () => clearTimeout(_longPressTimer), { passive: true });
+  document.addEventListener('touchmove', () => clearTimeout(_longPressTimer), { passive: true });
+
+  // Context menu actions
+  const ctxMenu = $('#verse-context-menu');
+  if (ctxMenu) {
+    ctxMenu.querySelectorAll('.hl-swatch').forEach(sw => {
+      sw.addEventListener('click', () => {
+        if (!_ctxRef) return;
+        if (sw.dataset.color === 'clear') clearHighlight(_ctxRef);
+        else setHighlight(_ctxRef, sw.dataset.color);
+        closeVerseContextMenu();
+      });
+    });
+    $('#ctx-copy').addEventListener('click', () => { if (_ctxRef) copyVerse(_ctxRef); closeVerseContextMenu(); });
+    $('#ctx-share').addEventListener('click', () => { if (_ctxRef) shareVerse(_ctxRef); closeVerseContextMenu(); });
+    $('#ctx-bookmark').addEventListener('click', () => {
+      if (!_ctxRef) return;
+      // Reuse existing bookmark toggle if available
+      if (window.BibleReader && window.BibleReader.toggleBookmark) {
+        window.BibleReader.toggleBookmark(_ctxRef);
+      } else {
+        fetch('/api/bookmarks', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ref: _ctxRef}) })
+          .then(() => showToast('Bookmarked!'))
+          .catch(() => showToast('Sign in to bookmark'));
+      }
+      closeVerseContextMenu();
+    });
+    $('#ctx-note').addEventListener('click', () => {
+      if (!_ctxRef) return;
+      switchTab('notes');
+      openBottomSheet();
+      closeVerseContextMenu();
+    });
+  }
+
+  // Close context menu on click outside
+  document.addEventListener('click', e => {
+    const menu = $('#verse-context-menu');
+    if (menu && !menu.contains(e.target)) closeVerseContextMenu();
+  });
+
+  // Escape key closes context menu and help modal
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      closeVerseContextMenu();
+      closeHelpModal();
+    }
+  }, true);
+
+  // Load highlights after init (if logged in)
+  loadHighlights();
 
   console.log('[bible-reader] init complete');
 }
