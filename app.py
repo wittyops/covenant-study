@@ -1790,6 +1790,8 @@ INLINE_HTML = """
   --gold-light: #c9a84c;
   --dark: #1a1a1a;
   --bg: #0f0f0f;
+  --bg-panel: #1a1a1a;
+  --bg-inset: #2a2a2a;
   --card: #1e1e1e;
   --card2: #252525;
   --text: #e8e4da;
