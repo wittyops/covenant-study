@@ -8925,6 +8925,16 @@ function init() {
   const menuAdmin = $('#menu-item-admin');
   if (menuAdmin) menuAdmin.addEventListener('click', () => { closeMenuDrawer(); showAdminPanel(); });
 
+  // Slide-drawer close buttons (×) — delegated so SVG child clicks resolve correctly
+  document.addEventListener('click', e => {
+    const btn = e.target.closest('.drawer-close-btn');
+    if (!btn) return;
+    const target = btn.dataset.close;
+    if (target === 'sessions-panel') closeSessionsPanel();
+    else if (target === 'bookmarks-panel') closeBookmarksPanel();
+    else if (target === 'history-panel') closeHistoryPanel();
+  });
+
   // Show admin menu item if admin
   if (isAdmin()) {
     if (menuAdmin) menuAdmin.style.display = '';
