@@ -45,8 +45,12 @@ RUN wget -q "https://raw.githubusercontent.com/tyndale/STEPBible-Data/master/Tra
 COPY build_data.py /app/build_data.py
 RUN python3 /app/build_data.py
 
-# Copy application last so code changes don't invalidate the data build cache
-COPY app.py /app/
+# Copy application last so code changes don't invalidate the data build cache.
+# app.py + supporting modules are all small; any change only re-runs from here.
+COPY app.py config.py database.py auth.py models.py /app/
+COPY routes/ /app/routes/
+COPY static/ /app/static/
+COPY templates/ /app/templates/
 
 # /app/notes preserved for legacy note migration at startup
 VOLUME ["/app/notes"]

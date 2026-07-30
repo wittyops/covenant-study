@@ -1,0 +1,1209 @@
+/*
+ * covenant.css — Covenant Study custom theme
+ *
+ * PURPOSE
+ * ───────
+ * This file layers the Covenant Study brand and application-specific
+ * components on top of Pico CSS (loaded before this file in index.html).
+ * Pico handles: typography, forms, buttons, focus rings, tables, color-scheme.
+ * This file handles: gold accent theme, layout, app-specific widgets.
+ *
+ * FILE LAYOUT
+ * ────────────
+ *  §1   CSS Custom Properties (theme tokens)
+ *  §2   Pico overrides (map Pico vars to our gold/dark palette)
+ *  §3   Layout (top-bar, content grid, sidebar, panels)
+ *  §4   Authentication overlay
+ *  §5   Book navigation tree
+ *  §6   Chapter + verse display
+ *  §7   Bottom tabs + sheet (cross-refs, interlinear, commentary, notes, map)
+ *  §8   Right tool panel
+ *  §9   Strong's lexicon card
+ *  §10  Cross-references
+ *  §11  Interlinear table
+ *  §12  Commentary
+ *  §13  Search overlay
+ *  §14  Nav picker modal
+ *  §15  Verse context menu
+ *  §16  Toast notifications
+ *  §17  Top bar component styles (pills, user chip, dropdown)
+ *  §18  Generic item lists (bookmarks, history, sessions)
+ *  §19  Reading plans
+ *  §20  Admin panel
+ *  §21  Highlight colour swatches
+ *  §22  Utility classes
+ */
+
+
+/* ===========================================================================
+   §1  CSS CUSTOM PROPERTIES
+   All brand colours and spacing live here.  Changing a value here updates
+   every component that references it — no grep-and-replace needed.
+   =========================================================================== */
+
+:root {
+  /* Gold palette — the Covenant Study accent colour */
+  --gold:        #c9a227;   /* primary accent (buttons, links, active states) */
+  --gold-light:  #e8c553;   /* hover state */
+  --gold-dark:   #8a6d16;   /* pressed / active state */
+  --gold-muted:  #6b531a;   /* subtle tinted backgrounds */
+  --gold-faint:  rgba(201, 162, 39, 0.08);  /* very subtle highlight */
+
+  /* Background layers — ordered from darkest to brightest */
+  --bg-base:     #0d0d0e;   /* body / page background */
+  --bg-surface:  #15151a;   /* cards, panels, sidebars */
+  --bg-elevated: #1e1e28;   /* modals, drawers, dropdowns */
+  --bg-input:    #1a1a22;   /* text inputs, textareas */
+  --bg-selected: #2a2520;   /* selected / active items */
+  --bg-hover:    #1f1f2a;   /* hover rows */
+
+  /* Text colours */
+  --text-primary:   #f0e8d0;
+  --text-secondary: #a09070;
+  --text-muted:     #5a5060;
+  --text-inverse:   #0d0d0e;  /* text on gold backgrounds */
+
+  /* Semantic status colours */
+  --color-success: #4caf50;
+  --color-error:   #ef5350;
+  --color-warning: #ff9800;
+  --color-info:    #42a5f5;
+
+  /* Layout dimensions */
+  --topbar-height:  52px;
+  --sidebar-width:  220px;
+  --panel-width:    320px;
+
+  /* Reusable border and shape tokens */
+  --border:  1px solid rgba(201, 162, 39, 0.15);
+  --radius:  6px;
+
+  /* Transition timing */
+  --trans:  0.18s ease;
+}
+
+
+/* ===========================================================================
+   §2  PICO CSS OVERRIDES
+   Pico CSS is built around CSS custom properties (--pico-*).  Override them
+   here to inject the gold theme without touching Pico's source.  The result
+   is that all Pico components (buttons, inputs, tables, etc.) automatically
+   inherit the Covenant Study colour scheme.
+   =========================================================================== */
+
+:root[data-theme="dark"],
+:root {
+  /* Primary accent → gold */
+  --pico-primary:               var(--gold);
+  --pico-primary-hover:         var(--gold-light);
+  --pico-primary-focus:         rgba(201, 162, 39, 0.3);
+  --pico-primary-underline:     rgba(201, 162, 39, 0.5);
+  --pico-primary-inverse:       var(--text-inverse);
+
+  /* Backgrounds */
+  --pico-background-color:      var(--bg-base);
+  --pico-card-background-color: var(--bg-surface);
+
+  /* Typography */
+  --pico-color:                 var(--text-primary);
+  --pico-secondary-color:       var(--text-secondary);
+  --pico-muted-color:           var(--text-muted);
+  --pico-font-family:           -apple-system, BlinkMacSystemFont, "Segoe UI",
+                                Helvetica, Arial, sans-serif;
+  --pico-font-size:             15px;
+  --pico-line-height:           1.7;
+
+  /* Forms */
+  --pico-form-element-background-color:     var(--bg-input);
+  --pico-form-element-border-color:         var(--gold-muted);
+  --pico-form-element-color:                var(--text-primary);
+  --pico-form-element-placeholder-color:    var(--text-muted);
+
+  /* Borders */
+  --pico-border-color:          rgba(201, 162, 39, 0.15);
+}
+
+/* Remove Pico's default body padding so our app layout fills the viewport */
+body {
+  margin:  0;
+  padding: 0;
+  background: var(--bg-base);
+  color:      var(--text-primary);
+  overflow-x: hidden;
+}
+
+/* Heading colour overrides (Pico defaults to the primary accent) */
+h1, h2, h3, h4, h5, h6 { color: var(--gold-light); }
+h3, h4 {
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+
+/* ===========================================================================
+   §3  LAYOUT
+   Fixed top bar + three-column content grid (sidebar | reader | right panel).
+   On screens < 768px the sidebar becomes a slide-in overlay.
+   On screens < 1024px the right tool panel becomes a fixed overlay too.
+   =========================================================================== */
+
+/* ── Icon / ghost button ─────────────────────────────────────────────────── */
+.icon-btn {
+  background: none;
+  border:     none;
+  color:      var(--text-secondary);
+  padding:    6px;
+  display:    flex;
+  align-items: center;
+  justify-content: center;
+  cursor:     pointer;
+  border-radius: var(--radius);
+  transition: color var(--trans);
+}
+.icon-btn:hover { color: var(--gold); }
+
+.btn-secondary {
+  background:   transparent;
+  border:       var(--border);
+  color:        var(--text-secondary);
+  padding:      4px 10px;
+  font-size:    0.8em;
+  border-radius: var(--radius);
+  cursor:       pointer;
+  transition:   border-color var(--trans), color var(--trans);
+}
+.btn-secondary:hover { border-color: var(--gold); color: var(--gold); }
+
+/* ── Top bar ─────────────────────────────────────────────────────────────── */
+.top-bar {
+  position:     fixed;
+  top: 0; left: 0; right: 0;
+  height:       var(--topbar-height);
+  background:   var(--bg-surface);
+  border-bottom: var(--border);
+  display:      flex;
+  align-items:  center;
+  gap:          6px;
+  padding:      0 10px;
+  z-index:      100;
+}
+.topbar-gap { flex: 1; }  /* pushes right-side items to the right */
+
+/* The app shell fills the remaining viewport below the top bar */
+.app-shell { padding-top: var(--topbar-height); height: 100vh; }
+
+/* ── Three-column grid ───────────────────────────────────────────────────── */
+.content-layout {
+  display:  flex;
+  height:   calc(100vh - var(--topbar-height));
+  overflow: hidden;
+}
+
+/* ── Left sidebar ────────────────────────────────────────────────────────── */
+.book-sidebar {
+  width:       var(--sidebar-width);
+  flex-shrink: 0;
+  background:  var(--bg-surface);
+  border-right: var(--border);
+  overflow-y:  auto;
+  overflow-x:  hidden;
+  transition:  transform var(--trans);
+}
+.sidebar-header {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  padding:         12px 14px 8px;
+  border-bottom:   var(--border);
+}
+.sidebar-header h2 {
+  font-size:      0.7em;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color:          var(--text-muted);
+  margin:         0;
+}
+
+/* Mobile: sidebar is an absolutely-positioned overlay */
+@media (max-width: 768px) {
+  .book-sidebar {
+    position:  fixed;
+    top:       var(--topbar-height);
+    left: 0; bottom: 0;
+    z-index:   90;
+    transform: translateX(-100%);
+    width:     260px;
+    box-shadow: 4px 0 20px rgba(0,0,0,0.4);
+  }
+  .book-sidebar.open { transform: translateX(0); }
+}
+
+/* ── Reader main ─────────────────────────────────────────────────────────── */
+.reader-main {
+  flex:      1;
+  min-width: 0;         /* allow flex child to shrink below content size */
+  display:   flex;
+  flex-direction: column;
+  overflow:  hidden;
+}
+
+/* ── Right tool panel ────────────────────────────────────────────────────── */
+.tool-panel {
+  width:        var(--panel-width);
+  flex-shrink:  0;
+  background:   var(--bg-surface);
+  border-left:  var(--border);
+  display:      flex;
+  flex-direction: column;
+  overflow:     hidden;
+}
+.panel-header {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  padding:         12px 14px;
+  border-bottom:   var(--border);
+  background:      var(--bg-elevated);
+  flex-shrink:     0;
+}
+.panel-title { margin: 0; font-size: 0.8em; }
+
+/* Scrollable body inside each panel (x-show'd div children should overflow-y) */
+.tool-panel > [x-show] {
+  flex:      1;
+  overflow-y: auto;
+  padding:   14px;
+}
+
+/* Narrow viewport: tool panel becomes a fixed right-side overlay */
+@media (max-width: 1024px) {
+  .tool-panel {
+    position:   fixed;
+    top:        var(--topbar-height);
+    right: 0; bottom: 0;
+    width:      min(var(--panel-width), 100vw);
+    z-index:    85;
+    box-shadow: -4px 0 20px rgba(0,0,0,0.4);
+  }
+}
+
+
+/* ===========================================================================
+   §4  AUTHENTICATION OVERLAY
+   Full-page overlay shown when the user is not logged in.
+   =========================================================================== */
+
+.auth-overlay {
+  position: fixed;
+  inset:    0;
+  background: var(--bg-base);
+  display:    flex;
+  align-items: center;
+  justify-content: center;
+  z-index:    200;
+  padding:    20px;
+}
+
+.auth-card {
+  width:        100%;
+  max-width:    380px;
+  background:   var(--bg-elevated);
+  border:       var(--border);
+  border-radius: 12px;
+  padding:      32px 28px;
+}
+
+.auth-logo { text-align: center; margin-bottom: 28px; }
+
+.cross-mark {
+  font-size:   2.4em;
+  color:       var(--gold);
+  line-height: 1;
+  margin-bottom: 6px;
+}
+
+.auth-logo h1 {
+  font-size: 1.5em;
+  margin:    6px 0 4px;
+  color:     var(--gold-light);
+}
+
+.auth-tagline { color: var(--text-muted); font-size: 0.85em; margin: 0; }
+
+.auth-error {
+  background: rgba(239, 83, 80, 0.12);
+  border:     1px solid rgba(239, 83, 80, 0.3);
+  color:      #ef9a9a;
+  border-radius: var(--radius);
+  padding:    8px 12px;
+  font-size:  0.85em;
+  margin-bottom: 12px;
+}
+
+.auth-switch {
+  text-align: center;
+  font-size:  0.85em;
+  color:      var(--text-muted);
+  margin-top: 12px;
+}
+.auth-switch button {
+  background: none;
+  border:     none;
+  color:      var(--gold);
+  padding:    0;
+  font-size:  inherit;
+  text-decoration: underline;
+  cursor:     pointer;
+}
+.auth-switch button:hover { color: var(--gold-light); }
+
+
+/* ===========================================================================
+   §5  BOOK NAVIGATION TREE
+   Server-rendered by /fragments/books; styled here.
+   =========================================================================== */
+
+/* Pico adds padding/background to <details> — remove them for the sidebar tree */
+.book-tree details {
+  border:     none;
+  background: none;
+  padding:    0;
+  margin:     0;
+}
+
+.testament-header {
+  font-size:      0.68em;
+  font-weight:    700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color:          var(--text-muted);
+  padding:        10px 14px 4px;
+  cursor:         pointer;
+  user-select:    none;
+}
+.testament-header:hover { color: var(--gold); }
+
+/* 3-column compact grid of abbreviated book buttons */
+.book-grid {
+  display:               grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap:    2px;
+  padding: 4px 8px 8px;
+}
+
+.book-btn {
+  display:        flex;
+  flex-direction: column;
+  align-items:    center;
+  gap:     1px;
+  padding: 6px 4px;
+  background: none;
+  border:     1px solid transparent;
+  border-radius: 4px;
+  color:      var(--text-secondary);
+  font-size:  0.7em;
+  cursor:     pointer;
+  transition: background var(--trans), color var(--trans), border-color var(--trans);
+}
+.book-btn:hover {
+  background:   var(--bg-selected);
+  color:        var(--gold-light);
+  border-color: var(--gold-muted);
+}
+.book-btn.active {
+  background:   var(--gold-faint);
+  color:        var(--gold);
+  border-color: var(--gold-muted);
+}
+.book-abbr { font-weight: 700; font-size: 1.15em; }
+.book-name { font-size: 0.8em; color: var(--text-muted); display: none; }
+
+/* Wide sidebar: switch from grid to single-column full-name list */
+@media (min-width: 1200px) {
+  .book-grid { grid-template-columns: 1fr; }
+  .book-btn  { flex-direction: row; gap: 8px; padding: 7px 12px; justify-content: flex-start; }
+  .book-name { display: inline; }
+}
+
+
+/* ===========================================================================
+   §6  CHAPTER + VERSE DISPLAY
+   =========================================================================== */
+
+.chapter-display-container {
+  flex:       1;
+  overflow-y: auto;
+  padding:    0 20px 80px;
+}
+
+/* Sticky chapter header (title + prev/next navigation) */
+.chapter-header {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  padding:         16px 0 12px;
+  border-bottom:   var(--border);
+  margin-bottom:   16px;
+  position:        sticky;
+  top:             0;
+  background:      var(--bg-base);
+  z-index:         10;
+}
+.chapter-title {
+  font-size:  1.1em;
+  color:      var(--gold-light);
+  margin:     0;
+  text-align: center;
+  flex:       1;
+}
+.translation-badge {
+  font-size:   0.65em;
+  color:       var(--text-muted);
+  font-weight: 400;
+  margin-left: 8px;
+}
+.chapter-nav-btn {
+  background: none;
+  border:     var(--border);
+  color:      var(--text-secondary);
+  width:  32px;
+  height: 32px;
+  display:    flex;
+  align-items: center;
+  justify-content: center;
+  font-size:  1.2em;
+  border-radius: 50%;
+  cursor:     pointer;
+  transition: color var(--trans), border-color var(--trans);
+}
+.chapter-nav-btn:hover { color: var(--gold); border-color: var(--gold); }
+.chapter-nav-btn[disabled] { opacity: 0.25; cursor: not-allowed; }
+
+/* Verse row */
+.verse {
+  display:       flex;
+  gap:           12px;
+  padding:       6px 4px;
+  border-radius: 4px;
+  transition:    background var(--trans);
+  position:      relative;
+}
+.verse:hover { background: var(--bg-hover); }
+
+/* Highlight colour applied by htmx:afterSwap in app.js */
+.verse.highlighted {
+  background: color-mix(in srgb, var(--highlight-color) 25%, transparent);
+}
+
+.verse-num {
+  flex-shrink: 0;
+  width:       28px;
+  text-align:  right;
+  font-size:   0.72em;
+  font-weight: 700;
+  color:       var(--gold-muted);
+  padding-top: 3px;
+  user-select: none;
+}
+
+.verse-text { line-height: 1.85; font-size: 1.05em; }
+
+/* Tagged words (Strong's numbers) — dotted underline indicates clickability */
+.word.tagged {
+  cursor:         pointer;
+  border-bottom:  1px dotted var(--gold-muted);
+  transition:     color var(--trans), border-color var(--trans);
+}
+.word.tagged:hover {
+  color:         var(--gold-light);
+  border-color:  var(--gold);
+}
+
+/* htmx loading bar (shown while a chapter request is in flight) */
+.htmx-indicator         { display: none; }
+.htmx-request .htmx-indicator,
+.htmx-indicator.htmx-request { display: block; }
+
+.loading-bar {
+  height:  2px;
+  background: linear-gradient(90deg, transparent, var(--gold), transparent);
+  background-size: 40% 100%;
+  animation: loading-sweep 1s infinite linear;
+}
+@keyframes loading-sweep {
+  0%   { background-position: -40% 0; }
+  100% { background-position: 140% 0; }
+}
+
+
+/* ===========================================================================
+   §7  BOTTOM TABS + SHEET
+   =========================================================================== */
+
+.bottom-tabs {
+  border-top: var(--border);
+  background: var(--bg-surface);
+  flex-shrink: 0;
+}
+
+.tab-strip {
+  display:    flex;
+  overflow-x: auto;
+  scrollbar-width: none;
+  gap:        0;
+}
+.tab-strip::-webkit-scrollbar { display: none; }
+
+.tab-btn {
+  background:    none;
+  border:        none;
+  border-bottom: 2px solid transparent;
+  color:         var(--text-muted);
+  padding:       10px 14px;
+  font-size:     0.8em;
+  white-space:   nowrap;
+  border-radius: 0;
+  cursor:        pointer;
+  transition:    color var(--trans), border-color var(--trans);
+}
+.tab-btn:hover { color: var(--text-secondary); }
+.tab-btn.active {
+  color:         var(--gold);
+  border-bottom-color: var(--gold);
+}
+
+.bottom-sheet {
+  max-height: 300px;
+  overflow-y: auto;
+  padding:    12px 16px;
+  position:   relative;
+}
+
+.sheet-close {
+  position: absolute;
+  top: 8px; right: 10px;
+  background: none;
+  border:     none;
+  color:      var(--text-muted);
+  font-size:  0.85em;
+  padding:    4px;
+  cursor:     pointer;
+  line-height: 1;
+}
+.sheet-close:hover { color: var(--gold); }
+
+.notes-textarea {
+  width:       100%;
+  min-height:  120px;
+  resize:      vertical;
+  background:  var(--bg-input);
+  border:      var(--border);
+  border-radius: var(--radius);
+  color:       var(--text-primary);
+  padding:     10px;
+  font-family: inherit;
+  font-size:   0.9em;
+  line-height: 1.6;
+}
+.notes-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.saved-indicator { color: var(--color-success); font-size: 0.8em; }
+
+
+/* ===========================================================================
+   §8  STRONG'S LEXICON CARD
+   Filled by htmx.ajax() in app.js handleWordClick / openStrongs.
+   =========================================================================== */
+
+.strongs-card { padding: 6px 0; }
+
+.strongs-header {
+  display:     flex;
+  align-items: baseline;
+  flex-wrap:   wrap;
+  gap:         8px;
+  margin-bottom: 8px;
+}
+.strongs-number {
+  font-size:   0.75em;
+  font-weight: 700;
+  background:  var(--gold-muted);
+  color:       var(--gold-light);
+  padding:     2px 7px;
+  border-radius: 4px;
+}
+.strongs-original { font-size: 1.3em; color: var(--gold); }
+.strongs-translit  { color: var(--text-secondary); font-style: italic; }
+.strongs-pronunc   { color: var(--text-muted); font-size: 0.85em; }
+.strongs-testament {
+  font-size:      0.72em;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color:          var(--text-muted);
+  margin:         0 0 8px;
+}
+.strongs-def { color: var(--text-primary); line-height: 1.6; }
+
+/* <details> blocks for the expanded Strong's / KJV usage sections */
+.strongs-more { border: none; padding: 0; background: none; margin-top: 8px; }
+.strongs-more summary {
+  font-size:      0.78em;
+  color:          var(--gold);
+  cursor:         pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding:        4px 0;
+}
+.strongs-more p { font-size: 0.85em; color: var(--text-secondary); line-height: 1.5; }
+
+
+/* ===========================================================================
+   §9  CROSS-REFERENCES
+   =========================================================================== */
+
+.crossrefs-panel h3    { margin-bottom: 8px; }
+.crossrefs-list { list-style: none; margin: 0; padding: 0; }
+
+.xref-item {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  padding:         5px 0;
+  border-bottom:   1px solid rgba(255,255,255,0.04);
+}
+.xref-link {
+  background: none;
+  border:     none;
+  color:      var(--gold);
+  text-align: left;
+  font-size:  0.85em;
+  padding:    2px 0;
+  cursor:     pointer;
+}
+.xref-link:hover { color: var(--gold-light); text-decoration: underline; }
+.votes { color: var(--text-muted); font-size: 0.72em; }
+
+
+/* ===========================================================================
+   §10  INTERLINEAR TABLE
+   =========================================================================== */
+
+.interlinear-panel h3 { margin-bottom: 8px; }
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+.interlinear-table {
+  width:           100%;
+  font-size:       0.8em;
+  border-collapse: collapse;
+}
+.interlinear-table th {
+  background:     var(--bg-elevated);
+  color:          var(--text-muted);
+  font-weight:    600;
+  text-transform: uppercase;
+  font-size:      0.72em;
+  letter-spacing: 0.05em;
+  padding:        6px 10px;
+  text-align:     left;
+}
+.interlinear-table td {
+  padding:        5px 10px;
+  border-bottom:  1px solid rgba(255,255,255,0.04);
+  vertical-align: middle;
+}
+.interlinear-table .original { font-size: 1.1em; }
+.interlinear-table .morph    { color: var(--text-muted); font-size: 0.8em; }
+
+.strongs-link {
+  background: none;
+  border:     none;
+  color:      var(--gold);
+  font-size:  0.85em;
+  padding:    0;
+  cursor:     pointer;
+}
+.strongs-link:hover { color: var(--gold-light); text-decoration: underline; }
+
+
+/* ===========================================================================
+   §11  COMMENTARY
+   =========================================================================== */
+
+.commentary-panel h3   { margin-bottom: 12px; }
+.commentary-entry      { margin-bottom: 16px; }
+.commentary-author {
+  font-size:      0.78em;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color:          var(--gold-muted);
+  margin-bottom:  4px;
+}
+
+
+/* ===========================================================================
+   §12  SEARCH OVERLAY
+   =========================================================================== */
+
+.search-overlay {
+  position: fixed;
+  inset:    0;
+  background: rgba(0, 0, 0, 0.7);
+  display:    flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding:    60px 16px 16px;
+  z-index:    150;
+}
+
+.search-modal {
+  background:    var(--bg-elevated);
+  border:        var(--border);
+  border-radius: 10px;
+  width:         100%;
+  max-width:     600px;
+  max-height:    70vh;
+  display:       flex;
+  flex-direction: column;
+  overflow:      hidden;
+}
+
+.search-bar {
+  display:     flex;
+  align-items: center;
+  padding:     10px 12px;
+  border-bottom: var(--border);
+  gap:         8px;
+}
+.search-bar input[type="search"] {
+  flex:       1;
+  background: none;
+  border:     none;
+  color:      var(--text-primary);
+  font-size:  1em;
+  outline:    none;
+  padding:    0;
+}
+
+.search-results-container { flex: 1; overflow-y: auto; padding: 10px; }
+.result-count { font-size: 0.78em; color: var(--text-muted); margin-bottom: 8px; }
+.result-list  { list-style: none; margin: 0; padding: 0; }
+
+.search-result { border-bottom: 1px solid rgba(255,255,255,0.04); }
+.search-ref-btn {
+  width:          100%;
+  background:     none;
+  border:         none;
+  color:          var(--text-primary);
+  text-align:     left;
+  padding:        10px 6px;
+  cursor:         pointer;
+  display:        flex;
+  flex-direction: column;
+  gap:            3px;
+}
+.search-ref-btn:hover { background: var(--bg-hover); }
+.search-ref     { color: var(--gold); font-size: 0.8em; }
+.search-snippet { font-size: 0.85em; color: var(--text-secondary); line-height: 1.5; }
+
+mark {
+  background: rgba(201, 162, 39, 0.28);
+  color:      var(--gold-light);
+  border-radius: 2px;
+  padding:    0 1px;
+}
+
+
+/* ===========================================================================
+   §13  NAV PICKER MODAL
+   =========================================================================== */
+
+.nav-picker-overlay {
+  position: fixed;
+  inset:    0;
+  background: rgba(0, 0, 0, 0.6);
+  display:    flex;
+  align-items: center;
+  justify-content: center;
+  padding:    20px;
+  z-index:    140;
+}
+
+.nav-picker-modal {
+  background:    var(--bg-elevated);
+  border:        var(--border);
+  border-radius: 10px;
+  width:         100%;
+  max-width:     540px;
+  max-height:    80vh;
+  overflow-y:    auto;
+  padding:       16px;
+}
+
+.nav-picker-header {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  margin-bottom:   12px;
+}
+.nav-picker-header h2 { margin: 0; font-size: 0.9em; }
+
+.chapter-picker {
+  border-top: var(--border);
+  padding-top: 12px;
+  margin-top:  12px;
+  display:     flex;
+  align-items: center;
+  gap:         10px;
+}
+.chapter-picker input[type="number"] {
+  width:         80px;
+  background:    var(--bg-input);
+  border:        var(--border);
+  border-radius: var(--radius);
+  color:         var(--text-primary);
+  padding:       6px 10px;
+  text-align:    center;
+}
+
+
+/* ===========================================================================
+   §14  VERSE CONTEXT MENU
+   =========================================================================== */
+
+.verse-context-menu {
+  position:      fixed;
+  z-index:       160;
+  background:    var(--bg-elevated);
+  border:        var(--border);
+  border-radius: 8px;
+  min-width:     180px;
+  box-shadow:    0 8px 24px rgba(0,0,0,0.5);
+  overflow:      hidden;
+}
+.verse-context-menu button {
+  display:     flex;
+  align-items: center;
+  gap:         8px;
+  width:       100%;
+  background:  none;
+  border:      none;
+  color:       var(--text-secondary);
+  text-align:  left;
+  padding:     9px 14px;
+  font-size:   0.85em;
+  border-radius: 0;
+  cursor:      pointer;
+}
+.verse-context-menu button:hover { background: var(--bg-hover); color: var(--text-primary); }
+.verse-context-menu hr { margin: 4px 0; border-color: rgba(255,255,255,0.05); }
+
+
+/* ===========================================================================
+   §15  TOAST NOTIFICATIONS
+   =========================================================================== */
+
+.toast-container {
+  position:      fixed;
+  bottom:        24px;
+  right:         20px;
+  display:       flex;
+  flex-direction: column;
+  gap:           8px;
+  z-index:       180;
+  pointer-events: none;
+}
+
+.toast {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  gap:             12px;
+  min-width:       240px;
+  max-width:       380px;
+  padding:         10px 14px;
+  border-radius:   8px;
+  font-size:       0.85em;
+  pointer-events:  all;
+  background:      var(--bg-elevated);
+  border-left:     3px solid var(--color-info);
+  box-shadow:      0 4px 16px rgba(0,0,0,0.4);
+}
+.toast-success { border-left-color: var(--color-success); }
+.toast-error   { border-left-color: var(--color-error); }
+.toast-warning { border-left-color: var(--color-warning); }
+
+.toast-dismiss {
+  background: none;
+  border:     none;
+  color:      var(--text-muted);
+  font-size:  0.85em;
+  padding:    2px 4px;
+  cursor:     pointer;
+  flex-shrink: 0;
+}
+.toast-dismiss:hover { color: var(--text-primary); }
+
+
+/* ===========================================================================
+   §16  TOP BAR COMPONENT STYLES (pills, user chip, dropdown)
+   =========================================================================== */
+
+/* Reference + translation pills */
+.ref-pill, .trans-pill {
+  display:     flex;
+  align-items: center;
+  gap:         5px;
+  background:  var(--bg-selected);
+  border:      var(--border);
+  border-radius: 20px;
+  padding:     5px 12px;
+  color:       var(--text-primary);
+  font-size:   0.85em;
+  cursor:      pointer;
+  transition:  border-color var(--trans), background var(--trans);
+}
+.ref-pill:hover, .trans-pill:hover {
+  border-color: var(--gold);
+  background:   var(--gold-faint);
+}
+.pill-chevron { color: var(--text-muted); flex-shrink: 0; }
+
+/* User chip (avatar + name) */
+.user-area   { position: relative; }
+.user-chip {
+  display:     flex;
+  align-items: center;
+  gap:         6px;
+  background:  none;
+  border:      var(--border);
+  border-radius: 20px;
+  padding:     4px 10px 4px 4px;
+  color:       var(--text-secondary);
+  cursor:      pointer;
+  transition:  border-color var(--trans), color var(--trans);
+}
+.user-chip:hover { border-color: var(--gold); color: var(--text-primary); }
+
+.user-initials {
+  width:       26px;
+  height:      26px;
+  border-radius: 50%;
+  background:  var(--gold-muted);
+  color:       var(--gold-light);
+  font-size:   0.7em;
+  font-weight: 700;
+  display:     flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.user-display-name {
+  font-size:     0.8em;
+  max-width:     80px;
+  overflow:      hidden;
+  text-overflow: ellipsis;
+  white-space:   nowrap;
+}
+.user-caret { font-size: 0.7em; color: var(--text-muted); }
+
+/* Dropdown menu */
+.user-dropdown {
+  position:      absolute;
+  top:           calc(100% + 6px);
+  right:         0;
+  min-width:     190px;
+  background:    var(--bg-elevated);
+  border:        var(--border);
+  border-radius: 8px;
+  overflow:      hidden;
+  box-shadow:    0 8px 24px rgba(0,0,0,0.5);
+  z-index:       110;
+}
+.dropdown-item {
+  display:     flex;
+  align-items: center;
+  gap:         8px;
+  width:       100%;
+  background:  none;
+  border:      none;
+  color:       var(--text-secondary);
+  text-align:  left;
+  padding:     9px 14px;
+  font-size:   0.85em;
+  border-radius: 0;
+  cursor:      pointer;
+}
+.dropdown-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+.dropdown-item.danger { color: #ef9a9a; }
+.dropdown-item.danger:hover { color: var(--color-error); background: rgba(239,83,80,0.06); }
+.user-dropdown hr { margin: 4px 0; border-color: rgba(255,255,255,0.05); }
+
+
+/* ===========================================================================
+   §17  GENERIC ITEM LIST  (bookmarks, history, sessions, translations)
+   =========================================================================== */
+
+.item-list { list-style: none; margin: 0; padding: 0; }
+
+.item-row {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  gap:             8px;
+  padding:         8px 0;
+  border-bottom:   1px solid rgba(255,255,255,0.04);
+}
+.item-link {
+  flex:       1;
+  background: none;
+  border:     none;
+  color:      var(--gold);
+  text-align: left;
+  font-size:  0.85em;
+  padding:    0;
+  cursor:     pointer;
+}
+.item-link:hover  { color: var(--gold-light); text-decoration: underline; }
+.item-link.active { font-weight: 700; }
+.item-meta  { color: var(--text-muted); font-size: 0.78em; flex-shrink: 0; }
+.item-name  { font-size: 0.85em; color: var(--text-secondary); flex: 1; }
+
+.item-actions { display: flex; gap: 6px; }
+.item-action {
+  background: none;
+  border:     var(--border);
+  color:      var(--gold);
+  padding:    3px 8px;
+  font-size:  0.78em;
+  border-radius: 4px;
+  cursor:     pointer;
+}
+.item-action:hover { background: var(--gold-faint); }
+
+.item-remove {
+  background: none;
+  border:     none;
+  color:      var(--text-muted);
+  padding:    2px 4px;
+  cursor:     pointer;
+  font-size:  0.8em;
+  flex-shrink: 0;
+}
+.item-remove:hover { color: var(--color-error); }
+
+.sessions-save-row { display: flex; gap: 8px; margin-bottom: 12px; }
+.sessions-save-row input { flex: 1; }
+
+
+/* ===========================================================================
+   §18  READING PLANS
+   =========================================================================== */
+
+.plans-list { list-style: none; margin: 0; padding: 0; }
+.plan-item {
+  padding:       12px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+.plan-header {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  margin-bottom:   4px;
+}
+.plan-header strong { font-size: 0.9em; color: var(--gold-light); }
+.plan-header small  { color: var(--text-muted); font-size: 0.75em; }
+.plan-desc    { font-size: 0.82em; color: var(--text-secondary); margin-bottom: 8px; line-height: 1.5; }
+.plan-progress {
+  display:     flex;
+  align-items: center;
+  gap:         8px;
+  font-size:   0.8em;
+  color:       var(--text-muted);
+}
+
+
+/* ===========================================================================
+   §19  ADMIN PANEL
+   =========================================================================== */
+
+.admin-table { width: 100%; font-size: 0.82em; border-collapse: collapse; }
+.admin-table th {
+  color:          var(--text-muted);
+  font-weight:    600;
+  font-size:      0.78em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding:        6px 8px;
+  border-bottom:  var(--border);
+  text-align:     left;
+}
+.admin-table td {
+  padding:       7px 8px;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+  vertical-align: middle;
+}
+.role-badge {
+  font-size:      0.72em;
+  font-weight:    700;
+  text-transform: uppercase;
+  background:     var(--gold-muted);
+  color:          var(--gold-light);
+  padding:        2px 6px;
+  border-radius:  4px;
+}
+
+
+/* ===========================================================================
+   §20  HIGHLIGHT COLOUR SWATCHES
+   =========================================================================== */
+
+.highlight-swatches {
+  display:   flex;
+  flex-wrap: wrap;
+  gap:       8px;
+  padding:   8px 0;
+}
+.highlight-swatch {
+  width:         32px;
+  height:        32px;
+  border-radius: 50%;
+  border:        2px solid transparent;
+  cursor:        pointer;
+  transition:    transform var(--trans), border-color var(--trans);
+}
+.highlight-swatch:hover  { transform: scale(1.15); }
+.highlight-swatch.active { border-color: rgba(255,255,255,0.7); }
+
+.clear-swatch {
+  background:  var(--bg-elevated);
+  border:      var(--border);
+  color:       var(--text-muted);
+  font-size:   0.9em;
+  display:     flex;
+  align-items: center;
+  justify-content: center;
+}
+.clear-swatch:hover { color: var(--color-error); border-color: var(--color-error); }
+
+
+/* ===========================================================================
+   §21  UTILITY CLASSES
+   =========================================================================== */
+
+.loading-msg {
+  color:      var(--text-muted);
+  font-size:  0.85em;
+  text-align: center;
+  padding:    20px 0;
+}
+
+.muted { color: var(--text-muted); font-size: 0.85em; }
+
+.error-msg {
+  background: rgba(239, 83, 80, 0.1);
+  border:     1px solid rgba(239, 83, 80, 0.3);
+  color:      #ef9a9a;
+  border-radius: var(--radius);
+  padding:    10px 14px;
+  font-size:  0.85em;
+}

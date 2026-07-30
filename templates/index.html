@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<!--
+  index.html — Covenant Study single-page application shell
+  ──────────────────────────────────────────────────────────
+  This file is the skeleton that Alpine.js and htmx animate at runtime.
+  It intentionally contains very little logic — almost everything is
+  handled by either:
+    - Alpine.js x-* directives (reactive state, show/hide, event binding)
+    - htmx hx-* attributes (server-driven content swaps)
+    - app.js Alpine stores (shared state accessed via $store.*)
+
+  TEMPLATE VARIABLE
+    {{ request }} — injected by FastAPI's Jinja2Templates; currently unused
+    but required by TemplateResponse so it is present as a comment here.
+
+  SCRIPT LOAD ORDER (important — see app.js §14 for explanation)
+    1. htmx        — processes hx-* attributes at runtime (no defer needed)
+    2. app.js      — registers Alpine stores and component factories (defer, FIRST)
+    3. alpine.min.js — starts Alpine and fires alpine:init (defer, AFTER app.js)
+    4. Leaflet is loaded separately so initMap() can reference L.
+
+  CONTENT SECURITY
+    All user-generated content displayed in this template comes from Alpine.js
+    store values (x-text, not x-html) or from server-rendered fragments that
+    escape their output via _esc() in fragments.py.  The only x-html usage is
+    intentional and documented in-line.
+-->
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Covenant Study</title>
+
+  <!--
+    Pico CSS — semantic, classless dark-mode-first base styles.
+    Handles typography, forms, buttons, focus rings, and color-scheme
+    without requiring class names on every element.
+    Our covenant.css loads after and overrides Pico's defaults with
+    the application's gold theme and custom components.
+  -->
+  <link rel="stylesheet" href="/static/css/pico.min.css">
+  <link rel="stylesheet" href="/static/css/covenant.css">
+
+  <!-- Leaflet CSS — self-hosted copy; no CDN dependency at runtime. -->
+  <link rel="stylesheet" href="/static/css/leaflet.css">
+
+  <!-- Prevent flash of unstyled Alpine content (elements with x-cloak are
+       hidden by CSS until Alpine removes the attribute after init). -->
+  <style>[x-cloak] { display: none !important; }</style>
+</head>
+
+<body x-data
+      @keydown.escape.window="$store.ui.closeAll()"
+      @click.window="$store.ui.userMenuOpen && !$event.target.closest('.user-area') && $store.ui.closeUserMenu()">
+
+<!-- ============================================================
+     AUTHENTICATION SCREEN
+     Shown when $store.auth.user is null (not logged in).
+     Hidden by Alpine x-show once login succeeds.
+     ============================================================ -->
+<!--
+  Auth overlay: x-cloak hides it during Alpine boot to prevent FOUC.
+  One x-data scope on the wrapper owns `authMode` so both forms share it
+  without needing nested scopes or $root references.
+-->
+<div class="auth-overlay"
+     x-data="{ authMode: 'login' }"
+     x-show="!$store.auth.user"
+     x-cloak
+     x-transition>
+
+  <div class="auth-card">
+    <div class="auth-logo">
+      <div class="cross-mark" aria-hidden="true">✝</div>
+      <h1>Covenant Study</h1>
+      <p class="auth-tagline">Scripture Study Platform</p>
+    </div>
+
+    <!-- Error banner — same element for login + register errors -->
+    <p class="auth-error" role="alert" aria-live="polite"
+       x-show="$store.auth.error" x-text="$store.auth.error"></p>
+
+    <!-- LOGIN FORM -->
+    <form x-show="authMode === 'login'"
+          @submit.prevent="$store.auth.login($el)">
+      <div>
+        <label for="login-username">Username</label>
+        <input id="login-username" type="text" name="username"
+               autocomplete="username" required placeholder="Your username">
+      </div>
+      <div>
+        <label for="login-password">Password</label>
+        <input id="login-password" type="password" name="password"
+               autocomplete="current-password" required placeholder="Your password">
+      </div>
+      <button type="submit" :disabled="$store.auth.loading">
+        <span x-text="$store.auth.loading ? 'Signing in…' : 'Sign In'"></span>
+      </button>
+      <p class="auth-switch">
+        No account yet?
+        <button type="button" @click.prevent="authMode = 'register'">Create one</button>
+      </p>
+    </form>
+
+    <!-- REGISTER FORM -->
+    <form x-show="authMode === 'register'"
+          @submit.prevent="$store.auth.register($el)">
+      <div>
+        <label for="reg-name">Display Name</label>
+        <input id="reg-name" type="text" name="display_name"
+               autocomplete="name" required placeholder="Your name">
+      </div>
+      <div>
+        <label for="reg-username">Username</label>
+        <input id="reg-username" type="text" name="username"
+               autocomplete="username" required placeholder="Choose a username">
+      </div>
+      <div>
+        <label for="reg-password">Password</label>
+        <input id="reg-password" type="password" name="password"
+               autocomplete="new-password" required minlength="8" placeholder="Min 8 characters">
+      </div>
+      <button type="submit" :disabled="$store.auth.loading">
+        <span x-text="$store.auth.loading ? 'Creating…' : 'Create Account'"></span>
+      </button>
+      <p class="auth-switch">
+        Already have an account?
+        <button type="button" @click.prevent="authMode = 'login'">Sign in</button>
+      </p>
+    </form>
+  </div>
+
+</div><!-- /.auth-overlay -->
+
+
+<!-- ============================================================
+     APPLICATION SHELL
+     Shown once $store.auth.user is populated.
+     ============================================================ -->
+<div class="app-shell" x-data x-show="$store.auth.user" x-cloak x-transition>
+
+  <!--
+    Hidden inputs mirror Alpine reader state so htmx can read them via
+    hx-include="[name='book'],[name='chapter'],[name='translation']".
+    When Alpine updates the store and dispatches "chapter-change", htmx
+    picks up these current values without any custom glue code.
+  -->
+  <input type="hidden" name="book"        :value="$store.reader.book">
+  <input type="hidden" name="chapter"     :value="$store.reader.chapter">
+  <input type="hidden" name="translation" :value="$store.reader.translation">
+
+  <!-- ──────────────────────────────────────────────────────────
+       TOP NAVIGATION BAR
+       ────────────────────────────────────────────────────────── -->
+  <header class="top-bar" role="banner">
+
+    <!-- Hamburger: opens the left sidebar (book navigation) -->
+    <button class="icon-btn"
+            aria-label="Open book navigation"
+            :aria-expanded="$store.ui.sidebarOpen"
+            @click="$store.ui.toggleSidebar()">
+      <svg width="18" height="14" viewBox="0 0 18 14" fill="none" aria-hidden="true">
+        <path d="M1 1h16M1 7h16M1 13h16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+    </button>
+
+    <!-- Reference pill — shows current book + chapter; opens nav picker on click -->
+    <button class="ref-pill"
+            aria-label="Navigate to book and chapter"
+            aria-haspopup="dialog"
+            @click="$store.ui.openNavPicker()">
+      <span x-text="$store.reader.ref"></span>
+      <svg class="pill-chevron" width="10" height="6" viewBox="0 0 10 6" fill="none" aria-hidden="true">
+        <path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
+
+    <div class="topbar-gap"></div>
+
+    <!-- Translation pill — shows active translation; opens picker on click -->
+    <button class="trans-pill"
+            aria-label="Select translation"
+            aria-haspopup="dialog"
+            @click="$store.ui.openPanel('translations')">
+      <span x-text="$store.reader.translation"></span>
+      <svg class="pill-chevron" width="8" height="5" viewBox="0 0 8 5" fill="none" aria-hidden="true">
+        <path d="M1 1l3 3 3-3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
+
+    <!-- Search button -->
+    <button class="icon-btn"
+            aria-label="Search scriptures"
+            @click="$store.ui.openSearch()">
+      <svg width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true">
+        <circle cx="7" cy="7" r="5.2" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M10.5 10.5L15 15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+    </button>
+
+    <!-- User area — avatar chip + dropdown menu -->
+    <div class="user-area" @click.stop>
+
+      <button class="user-chip"
+              aria-label="User menu"
+              :aria-expanded="$store.ui.userMenuOpen"
+              aria-haspopup="menu"
+              @click="$store.ui.toggleUserMenu()">
+        <!-- Initials avatar — computed from display name -->
+        <span class="user-initials" aria-hidden="true"
+              x-text="($store.auth.displayName.charAt(0) + ($store.auth.displayName.split(' ')[1]?.charAt(0) || '')).toUpperCase()"></span>
+        <span class="user-display-name" x-text="$store.auth.displayName"></span>
+        <span class="user-caret" aria-hidden="true">▾</span>
+      </button>
+
+      <nav class="user-dropdown"
+           role="menu"
+           aria-label="User options"
+           x-show="$store.ui.userMenuOpen"
+           x-transition>
+
+        <button class="dropdown-item" role="menuitem"
+                @click="$store.ui.openPanel('sessions'); $store.ui.closeUserMenu()">
+          📁 Study Sessions
+        </button>
+        <button class="dropdown-item" role="menuitem"
+                @click="$store.ui.openPanel('bookmarks'); $store.ui.closeUserMenu()">
+          🔖 Bookmarks
+        </button>
+        <button class="dropdown-item" role="menuitem"
+                @click="$store.ui.openPanel('history'); $store.ui.closeUserMenu()">
+          🕐 Reading History
+        </button>
+        <button class="dropdown-item" role="menuitem"
+                @click="$store.ui.openPanel('plans'); $store.ui.closeUserMenu()">
+          📅 Reading Plans
+        </button>
+        <button class="dropdown-item" role="menuitem"
+                @click="$store.ui.openPanel('highlights'); $store.ui.closeUserMenu()">
+          🎨 Highlights
+        </button>
+
+        <!-- Admin menu item — only visible when the user has the admin role -->
+        <button class="dropdown-item" role="menuitem"
+                x-show="$store.auth.isAdmin"
+                @click="$store.ui.openPanel('admin'); $store.ui.closeUserMenu()">
+          ⚙️ Manage Users
+        </button>
+
+        <hr>
+
+        <button class="dropdown-item danger" role="menuitem"
+                @click="$store.auth.logout()">
+          Sign Out
+        </button>
+      </nav>
+
+    </div><!-- /.user-area -->
+
+  </header><!-- /.top-bar -->
+
+
+  <!-- ──────────────────────────────────────────────────────────
+       MAIN CONTENT AREA
+       Three-column layout on desktop (sidebar | reader | panels).
+       Single column on mobile (sidebar is an overlay drawer).
+       ────────────────────────────────────────────────────────── -->
+  <div class="content-layout">
+
+    <!-- LEFT SIDEBAR — book navigation tree (server-rendered via htmx) -->
+    <aside class="book-sidebar"
+           role="navigation"
+           aria-label="Book navigation"
+           :class="{ 'open': $store.ui.sidebarOpen }"
+           @click.outside="$store.ui.closeSidebar()">
+
+      <div class="sidebar-header">
+        <h2>Books</h2>
+        <button class="icon-btn" aria-label="Close sidebar"
+                @click="$store.ui.closeSidebar()">✕</button>
+      </div>
+
+      <!--
+        hx-trigger="load" fires once on page load (after the user logs in
+        and this element is revealed via x-show).
+        The books fragment is static HTML with htmx attributes on each button,
+        so it only needs to be fetched once per session.
+      -->
+      <div hx-get="/fragments/books"
+           hx-trigger="load"
+           hx-swap="innerHTML">
+        <p class="loading-msg">Loading books…</p>
+      </div>
+
+    </aside><!-- /.book-sidebar -->
+
+
+    <!-- MAIN READER — chapter display updated by htmx -->
+    <main class="reader-main" role="main">
+
+      <!--
+        #chapter-display is the htmx swap target for chapter content.
+
+        hx-trigger listens for three events:
+          "chapter-change from:body" — fired by reader store when navigation changes
+          "load"                      — fires once on page load / login
+
+        hx-include reads the hidden <input> elements above to build the query string.
+        The server at /fragments/chapter returns a full chapter with optional tagging.
+
+        @click on this container uses Alpine.js event delegation for word clicks:
+        any click on a [data-strongs] word is caught here and triggers the Strong's panel.
+        One listener instead of potentially thousands of per-word listeners.
+      -->
+      <div id="chapter-display"
+           class="chapter-display-container"
+           hx-get="/fragments/chapter"
+           hx-include="[name='book'],[name='chapter'],[name='translation']"
+           hx-trigger="chapter-change from:body, load"
+           hx-swap="innerHTML"
+           hx-indicator="#chapter-loading">
+        <p class="loading-msg">Loading…</p>
+      </div>
+
+      <!-- Loading indicator shown by htmx while a chapter request is in flight. -->
+      <div id="chapter-loading" class="htmx-indicator loading-bar" aria-hidden="true"></div>
+
+      <!-- BOTTOM TOOL TABS — cross-refs, interlinear, commentary, map -->
+      <div class="bottom-tabs">
+
+        <div class="tab-strip" role="tablist">
+          <button role="tab" class="tab-btn"
+                  :class="{ active: $store.ui.activePanel === 'crossrefs' }"
+                  @click="$store.ui.openPanel('crossrefs')">
+            Cross-refs
+          </button>
+          <button role="tab" class="tab-btn"
+                  :class="{ active: $store.ui.activePanel === 'interlinear' }"
+                  @click="$store.ui.openPanel('interlinear')">
+            Interlinear
+          </button>
+          <button role="tab" class="tab-btn"
+                  :class="{ active: $store.ui.activePanel === 'commentary' }"
+                  @click="$store.ui.openPanel('commentary')">
+            Commentary
+          </button>
+          <button role="tab" class="tab-btn"
+                  :class="{ active: $store.ui.activePanel === 'map' }"
+                  @click="$store.ui.openPanel('map')">
+            Map
+          </button>
+          <button role="tab" class="tab-btn"
+                  :class="{ active: $store.ui.activePanel === 'notes' }"
+                  @click="$store.ui.openPanel('notes')">
+            Notes
+          </button>
+        </div>
+
+        <!-- Bottom sheet content area — shows the active tool panel -->
+        <div class="bottom-sheet" x-show="$store.ui.activePanel !== null" x-transition>
+          <button class="sheet-close" aria-label="Close panel"
+                  @click="$store.ui.closePanel()">✕</button>
+
+          <!-- CROSS-REFERENCES -->
+          <!--
+            hx-trigger="panel-open from:body" fires when the user opens this tab.
+            The reader store would dispatch "panel-open" with the current ref,
+            but here we use a simpler pattern: the tab button itself fires the
+            htmx request by also being the trigger source.
+
+            In practice: clicking the Cross-refs tab opens the panel AND the
+            htmx GET fires automatically because x-show makes the element visible
+            and the trigger is "intersect" (htmx loads it when it enters view).
+          -->
+          <div id="crossrefs-content"
+               x-show="$store.ui.activePanel === 'crossrefs'"
+               hx-get="/fragments/crossrefs"
+               hx-vals="js:{ref: `${$store.reader.book} ${$store.reader.chapter}:1`}"
+               hx-trigger="intersect once"
+               hx-swap="innerHTML">
+            <p class="loading-msg">Loading cross-references…</p>
+          </div>
+
+          <!-- INTERLINEAR -->
+          <div id="interlinear-content"
+               x-show="$store.ui.activePanel === 'interlinear'"
+               hx-get="/fragments/interlinear"
+               hx-vals="js:{ref: `${$store.reader.book} ${$store.reader.chapter}:1`}"
+               hx-trigger="intersect once"
+               hx-swap="innerHTML">
+            <p class="loading-msg">Loading interlinear…</p>
+          </div>
+
+          <!-- COMMENTARY -->
+          <div id="commentary-content"
+               x-show="$store.ui.activePanel === 'commentary'"
+               hx-get="/fragments/commentary"
+               hx-vals="js:{ref: `${$store.reader.book} ${$store.reader.chapter}:1`}"
+               hx-trigger="intersect once"
+               hx-swap="innerHTML">
+            <p class="loading-msg">Loading commentary…</p>
+          </div>
+
+          <!-- NOTES — Alpine component with load/save -->
+          <div x-show="$store.ui.activePanel === 'notes'"
+               x-data="notesPanel()"
+               x-init="init()">
+            <h3>Notes for <span x-text="ref"></span></h3>
+            <textarea
+              rows="8"
+              x-model="body"
+              @input="dirty = true"
+              placeholder="Type your study notes here…"
+              class="notes-textarea"></textarea>
+            <div class="notes-actions">
+              <button @click="save()" :disabled="saving || !dirty">
+                <span x-text="saving ? 'Saving…' : 'Save Note'"></span>
+              </button>
+              <small x-show="!dirty && body" class="saved-indicator">Saved ✓</small>
+            </div>
+          </div>
+
+          <!-- MAP — Leaflet map initialised once the panel becomes visible -->
+          <div x-show="$store.ui.activePanel === 'map'"
+               x-init="$watch('$store.ui.activePanel', v => v === 'map' && initMap())">
+            <div id="map-container" style="height: 320px;"></div>
+          </div>
+
+        </div><!-- /.bottom-sheet -->
+
+      </div><!-- /.bottom-tabs -->
+
+    </main><!-- /.reader-main -->
+
+
+    <!-- RIGHT PANEL — Strong's, bookmarks, history, sessions, plans, admin -->
+    <aside class="tool-panel"
+           x-show="['strongs','bookmarks','history','sessions','plans','admin','highlights','translations'].includes($store.ui.activePanel)"
+           x-transition>
+
+      <div class="panel-header">
+        <h2 class="panel-title" x-text="{
+          strongs:      'Strong\'s Lexicon',
+          bookmarks:    'Bookmarks',
+          history:      'Reading History',
+          sessions:     'Study Sessions',
+          plans:        'Reading Plans',
+          admin:        'User Management',
+          highlights:   'Highlights',
+          translations: 'Translations',
+        }[$store.ui.activePanel] || ''"></h2>
+        <button class="icon-btn" aria-label="Close panel"
+                @click="$store.ui.closePanel()">✕</button>
+      </div>
+
+      <!-- STRONG'S PANEL — filled by htmx.ajax() from app.js handleWordClick -->
+      <div id="strongs-panel"
+           x-show="$store.ui.activePanel === 'strongs'">
+        <p class="muted">Click a highlighted word in the text to view its lexicon entry.</p>
+      </div>
+
+      <!-- BOOKMARKS PANEL -->
+      <div x-show="$store.ui.activePanel === 'bookmarks'"
+           x-data="bookmarksPanel()">
+        <template x-if="bookmarks.length === 0">
+          <p class="muted">No bookmarks yet.  Right-click any verse to bookmark it.</p>
+        </template>
+        <ul class="item-list">
+          <template x-for="bm in bookmarks" :key="bm.ref">
+            <li class="item-row">
+              <button class="item-link" @click="navigate(bm.ref)" x-text="bm.ref"></button>
+              <button class="item-remove" aria-label="Remove bookmark"
+                      @click="remove(bm.ref)">✕</button>
+            </li>
+          </template>
+        </ul>
+      </div>
+
+      <!-- HISTORY PANEL -->
+      <div x-show="$store.ui.activePanel === 'history'"
+           x-data="historyPanel()"
+           x-init="init()">
+        <template x-if="loading">
+          <p class="loading-msg">Loading…</p>
+        </template>
+        <ul class="item-list">
+          <template x-for="entry in entries" :key="entry.id">
+            <li class="item-row">
+              <button class="item-link" @click="navigate(entry.ref)" x-text="entry.ref"></button>
+              <small class="item-meta" x-text="relTime(entry.visited_at)"></small>
+            </li>
+          </template>
+        </ul>
+      </div>
+
+      <!-- SESSIONS PANEL -->
+      <div x-show="$store.ui.activePanel === 'sessions'"
+           x-data="sessionsPanel()"
+           x-init="init()">
+        <div class="sessions-save-row">
+          <input type="text" x-model="newName" placeholder="Session name…"
+                 @keydown.enter="save()">
+          <button @click="save()" :disabled="saving || !newName.trim()">Save</button>
+        </div>
+        <ul class="item-list">
+          <template x-for="s in sessions" :key="s.id">
+            <li class="item-row">
+              <span class="item-name" x-text="s.name"></span>
+              <div class="item-actions">
+                <button class="item-action" @click="resume(s)">Resume</button>
+                <button class="item-remove" @click="remove(s.id)">✕</button>
+              </div>
+            </li>
+          </template>
+        </ul>
+      </div>
+
+      <!-- READING PLANS PANEL -->
+      <div x-show="$store.ui.activePanel === 'plans'"
+           x-data="plansPanel()"
+           x-init="init()">
+        <template x-if="loading">
+          <p class="loading-msg">Loading plans…</p>
+        </template>
+        <ul class="plans-list">
+          <template x-for="plan in plans" :key="plan.id">
+            <li class="plan-item">
+              <div class="plan-header">
+                <strong x-text="plan.name"></strong>
+                <small x-text="plan.duration_days + ' days'"></small>
+              </div>
+              <p class="plan-desc" x-text="plan.description"></p>
+              <template x-if="getProgress(plan.id)">
+                <div class="plan-progress">
+                  <span>Day <span x-text="getProgress(plan.id).day_index + 1"></span>
+                  of <span x-text="plan.duration_days"></span></span>
+                  <button @click="advance(plan.id)">Mark Done</button>
+                  <button @click="reset(plan.id)" class="btn-secondary">Reset</button>
+                </div>
+              </template>
+              <template x-if="!getProgress(plan.id)">
+                <button @click="advance(plan.id)">Start Plan</button>
+              </template>
+            </li>
+          </template>
+        </ul>
+      </div>
+
+      <!-- HIGHLIGHTS PANEL — colour swatches for the context-menu verse -->
+      <div x-show="$store.ui.activePanel === 'highlights'"
+           x-data="highlightsPanel()"
+           x-init="init()">
+        <p>Highlighting: <strong x-text="ref"></strong></p>
+        <div class="highlight-swatches">
+          <template x-for="c in colors" :key="c.hex">
+            <button class="highlight-swatch"
+                    :style="'background: ' + c.hex"
+                    :class="{ active: currentColor() === c.hex }"
+                    :aria-label="'Highlight ' + c.name"
+                    @click="apply(c.hex)"></button>
+          </template>
+          <button class="highlight-swatch clear-swatch"
+                  aria-label="Remove highlight"
+                  @click="clear()">✕</button>
+        </div>
+      </div>
+
+      <!-- TRANSLATIONS PANEL — list of available translations -->
+      <div x-show="$store.ui.activePanel === 'translations'">
+        <ul class="item-list">
+          <template x-for="tr in $store.reader.translations" :key="tr">
+            <li>
+              <button class="item-link"
+                      :class="{ active: $store.reader.translation === tr }"
+                      @click="$store.reader.setTranslation(tr); $store.ui.closePanel()"
+                      x-text="tr"></button>
+            </li>
+          </template>
+        </ul>
+      </div>
+
+      <!-- ADMIN PANEL — user list with password reset -->
+      <div x-show="$store.ui.activePanel === 'admin'"
+           x-data="adminPanel()"
+           x-init="init()">
+        <template x-if="loading">
+          <p class="loading-msg">Loading users…</p>
+        </template>
+        <table class="admin-table">
+          <thead>
+            <tr><th>Username</th><th>Display Name</th><th>Role</th><th></th></tr>
+          </thead>
+          <tbody>
+            <template x-for="u in users" :key="u.id">
+              <tr>
+                <td x-text="u.username"></td>
+                <td x-text="u.display_name"></td>
+                <td><span class="role-badge" x-text="u.role"></span></td>
+                <td>
+                  <button class="btn-secondary" @click="resetPassword(u)">Reset PW</button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+
+    </aside><!-- /.tool-panel -->
+
+  </div><!-- /.content-layout -->
+
+</div><!-- /.app-shell -->
+
+
+<!-- ============================================================
+     SEARCH OVERLAY
+     Full-screen search with htmx results.
+     ============================================================ -->
+<div class="search-overlay"
+     role="dialog"
+     aria-label="Search scriptures"
+     aria-modal="true"
+     x-data
+     x-show="$store.ui.searchOpen"
+     x-transition
+     @click.self="$store.ui.closeSearch()">
+
+  <div class="search-modal">
+    <div class="search-bar">
+      <input type="search"
+             id="search-input"
+             placeholder="Search scriptures…"
+             autocomplete="off"
+             autofocus
+             x-ref="searchInput"
+             @input.debounce.400ms="
+               $el.value.length >= 2 &&
+               htmx.ajax('GET',
+                 '/fragments/search?q=' + encodeURIComponent($el.value) +
+                 '&translation=' + $store.reader.translation,
+                 '#search-results')
+             "
+             @keydown.escape="$store.ui.closeSearch()">
+      <button class="icon-btn" aria-label="Close search"
+              @click="$store.ui.closeSearch()">✕</button>
+    </div>
+
+    <!-- Results populated by htmx.ajax() above -->
+    <div id="search-results" class="search-results-container">
+      <p class="muted">Type at least 2 characters to search.</p>
+    </div>
+  </div>
+
+</div><!-- /.search-overlay -->
+
+
+<!-- ============================================================
+     NAV PICKER MODAL
+     Quick jump to any book + chapter.
+     ============================================================ -->
+<div class="nav-picker-overlay"
+     role="dialog"
+     aria-label="Go to passage"
+     aria-modal="true"
+     x-data
+     x-show="$store.ui.navPickerOpen"
+     x-transition
+     @click.self="$store.ui.closeNavPicker()">
+
+  <div class="nav-picker-modal">
+    <div class="nav-picker-header">
+      <h2>Go to Passage</h2>
+      <button class="icon-btn" @click="$store.ui.closeNavPicker()">✕</button>
+    </div>
+
+    <!--
+      The book navigation tree is already rendered in the sidebar.
+      The nav picker loads the same fragment independently so it works
+      even when the sidebar is collapsed.
+    -->
+    <div hx-get="/fragments/books"
+         hx-trigger="intersect once"
+         hx-swap="innerHTML">
+      <p class="loading-msg">Loading…</p>
+    </div>
+
+    <div class="chapter-picker" x-data="{ chapter: 1 }">
+      <label>Chapter:
+        <input type="number" x-model.number="chapter" min="1" max="150">
+      </label>
+      <button @click="
+        $store.reader.setChapter(chapter);
+        $store.ui.closeNavPicker()
+      ">Go</button>
+    </div>
+  </div>
+
+</div><!-- /.nav-picker-overlay -->
+
+
+<!-- ============================================================
+     VERSE CONTEXT MENU
+     Right-click / long-press on any verse.
+     ============================================================ -->
+<div class="verse-context-menu"
+     role="menu"
+     aria-label="Verse actions"
+     x-data
+     x-show="$store.reader.verseMenuOpen"
+     x-transition
+     :style="`top: ${$store.reader.verseMenuY}px; left: ${$store.reader.verseMenuX}px`"
+     @click.outside="$store.reader.closeVerseMenu()">
+
+  <button role="menuitem"
+          @click="$store.reader.copyVerse($store.reader.verseMenuRef)">
+    📋 Copy Verse
+  </button>
+  <button role="menuitem"
+          @click="$store.reader.shareVerse($store.reader.verseMenuRef)">
+    📤 Share
+  </button>
+  <button role="menuitem"
+          @click="$store.ui.toggleBookmark($store.reader.verseMenuRef); $store.reader.closeVerseMenu()"
+          x-text="$store.ui.isBookmarked($store.reader.verseMenuRef) ? '🔖 Remove Bookmark' : '🔖 Add Bookmark'">
+  </button>
+  <button role="menuitem"
+          @click="$store.ui.openPanel('notes'); $store.reader.closeVerseMenu()">
+    📝 Edit Note
+  </button>
+  <button role="menuitem"
+          @click="$store.ui.openPanel('highlights'); $store.reader.closeVerseMenu()">
+    🎨 Highlight
+  </button>
+  <hr>
+  <button role="menuitem"
+          class="context-menu-item"
+          @click="
+            htmx.ajax('GET',
+              '/fragments/crossrefs?ref=' + encodeURIComponent($store.reader.verseMenuRef),
+              '#crossrefs-content');
+            $store.ui.openPanel('crossrefs');
+            $store.reader.closeVerseMenu()
+          ">
+    🔗 Cross-references
+  </button>
+  <button role="menuitem"
+          @click="
+            htmx.ajax('GET',
+              '/fragments/interlinear?ref=' + encodeURIComponent($store.reader.verseMenuRef),
+              '#interlinear-content');
+            $store.ui.openPanel('interlinear');
+            $store.reader.closeVerseMenu()
+          ">
+    📖 Interlinear
+  </button>
+  <button role="menuitem"
+          @click="
+            htmx.ajax('GET',
+              '/fragments/commentary?ref=' + encodeURIComponent($store.reader.verseMenuRef),
+              '#commentary-content');
+            $store.ui.openPanel('commentary');
+            $store.reader.closeVerseMenu()
+          ">
+    💬 Commentary
+  </button>
+
+</div><!-- /.verse-context-menu -->
+
+
+<!-- ============================================================
+     TOAST NOTIFICATIONS
+     Rendered from $store.ui.toasts via x-for.
+     ============================================================ -->
+<div class="toast-container" aria-live="polite" aria-atomic="false" x-data>
+  <template x-for="toast in $store.ui.toasts" :key="toast.id">
+    <div class="toast"
+         :class="'toast-' + toast.type"
+         role="status"
+         x-transition>
+      <span x-text="toast.message"></span>
+      <button class="toast-dismiss" aria-label="Dismiss"
+              @click="$store.ui.dismissToast(toast.id)">✕</button>
+    </div>
+  </template>
+</div><!-- /.toast-container -->
+
+
+<!-- ============================================================
+     SCRIPTS
+     Load order matters — see comments in app.js §14.
+
+     htmx:     no defer (processes attributes at runtime)
+     app.js:   defer + FIRST (registers Alpine stores before Alpine starts)
+     alpine:   defer + SECOND (reads stores registered by app.js)
+     leaflet:  defer (only needed when the map panel opens)
+     ============================================================ -->
+<script src="/static/js/htmx.min.js"></script>
+
+<script defer src="/static/js/app.js"></script>
+<script defer src="/static/js/alpine.min.js"></script>
+
+<script defer src="/static/js/leaflet.min.js"></script>
+<script defer>
+  /* Set Leaflet's default marker image directory after the library loads. */
+  document.addEventListener('DOMContentLoaded', function () {
+    if (typeof L !== 'undefined') {
+      L.Icon.Default.imagePath = '/static/js/';
+    }
+  });
+</script>
+
+</body>
+</html>
