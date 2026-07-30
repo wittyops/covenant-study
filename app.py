@@ -21,7 +21,7 @@ import time
 
 import bcrypt
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -68,9 +68,27 @@ app.include_router(fragments.router)
 # ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    """Serve the single-page application shell."""
-    return templates.TemplateResponse("index.html", {"request": request})
+async def index(_request: Request) -> FileResponse:
+    """Serve the React SPA entry point.
+
+    In production the React build lives at /app/static/dist/index.html.
+    FastAPI's /static mount already serves the JS/CSS assets at /static/dist/assets/*.
+    """
+    return FileResponse("/app/static/dist/index.html")
+
+
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+async def spa_fallback(_request: Request, full_path: str) -> FileResponse:
+    """Catch-all that returns the React shell for any non-API path.
+
+    React Router handles the actual routing on the client.  Without this,
+    refreshing on any sub-path (e.g. /study/genesis-1) would 404 from FastAPI.
+    API routes registered before this handler take priority because FastAPI
+    evaluates routes in declaration order.
+    """
+    # Suppress the unused parameter warning — full_path is consumed by routing
+    _ = full_path
+    return FileResponse("/app/static/dist/index.html")
 
 
 # ---------------------------------------------------------------------------

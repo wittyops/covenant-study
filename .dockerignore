@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+
+# Node / frontend dev artifacts — node_modules is re-installed inside the builder stage
+frontend/node_modules/
+frontend/.vite/
+frontend/dist/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# Docs / misc
+*.md

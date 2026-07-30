@@ -1,0 +1,54 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Base overrides ─────────────────────────────────────────────────────── */
+@layer base {
+  :root {
+    --scrollbar-thumb: #3a2e0d;
+    --scrollbar-track: #15151a;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  }
+
+  *::-webkit-scrollbar        { width: 6px; height: 6px; }
+  *::-webkit-scrollbar-track  { background: var(--scrollbar-track); }
+  *::-webkit-scrollbar-thumb  { background: var(--scrollbar-thumb); border-radius: 3px; }
+
+  body { @apply font-sans antialiased; }
+
+  /* Scripture text uses a serifed face for readability */
+  .scripture-text { @apply font-scripture; }
+}
+
+/* ── Component utilities ────────────────────────────────────────────────── */
+@layer components {
+  /* Tagged Strong's word — dotted underline signals clickability */
+  .word-tagged {
+    @apply cursor-pointer border-b border-dotted border-gold-muted
+           hover:border-gold hover:text-gold transition-colors duration-100;
+  }
+
+  /* Verse highlight overlay — colour comes from a CSS custom property set inline */
+  .verse-highlighted {
+    background: color-mix(in srgb, var(--highlight-color, #ffe066) 28%, transparent);
+    border-radius: 3px;
+    padding: 1px 2px;
+  }
+
+  /* Loading shimmer used while chapter or search results are fetching */
+  .loading-shimmer {
+    @apply rounded bg-bg-elevated animate-pulse;
+    background: linear-gradient(
+      90deg,
+      theme('colors.bg.elevated') 25%,
+      theme('colors.bg.overlay') 50%,
+      theme('colors.bg.elevated') 75%
+    );
+    background-size: 200% 100%;
+    animation: loading-sweep 1.5s linear infinite;
+  }
+}

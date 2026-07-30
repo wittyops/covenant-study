@@ -1,3 +1,20 @@
+# ─── Stage 1: Build the React frontend ────────────────────────────────────
+# This stage is completely independent of the Python/data layer.
+# Docker's layer cache keeps it fast: only re-runs when frontend/ changes.
+FROM node:22-alpine AS frontend-builder
+WORKDIR /frontend
+
+# Install deps first (separate layer so package.json changes don't re-download)
+COPY frontend/package.json frontend/package-lock.json* ./
+# npm install generates the lockfile on first build; switch to npm ci after committing package-lock.json
+RUN npm install --legacy-peer-deps
+
+# Copy source and build
+COPY frontend/ ./
+RUN npm run build
+# Output: /frontend/dist/ (Vite build with base=/static/dist/)
+
+# ─── Stage 2: Python application with baked-in Bible data ─────────────────
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -45,12 +62,19 @@ RUN wget -q "https://raw.githubusercontent.com/tyndale/STEPBible-Data/master/Tra
 COPY build_data.py /app/build_data.py
 RUN python3 /app/build_data.py
 
-# Copy application last so code changes don't invalidate the data build cache.
-# app.py + supporting modules are all small; any change only re-runs from here.
+# ── Application code ──────────────────────────────────────────────────────
+# Copied last so code changes only invalidate layers from here down.
 COPY app.py config.py database.py auth.py models.py /app/
 COPY routes/ /app/routes/
 COPY static/ /app/static/
 COPY templates/ /app/templates/
+
+# ── React dist — copied from Stage 1 ─────────────────────────────────────
+# FastAPI's /static mount serves /app/static, so the built React app lives at
+# /app/static/dist/ and is served at /static/dist/... in the browser.
+# The Vite build sets base='/static/dist/' so all asset URLs align.
+RUN mkdir -p /app/static/dist
+COPY --from=frontend-builder /frontend/dist/ /app/static/dist/
 
 # /app/notes preserved for legacy note migration at startup
 VOLUME ["/app/notes"]
