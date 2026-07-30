@@ -1893,6 +1893,10 @@ INLINE_HTML = """
   --z-search-overlay: 700;
   --z-toast: 800;
   --z-login: 1000;
+
+  /* Missing tokens — caused undefined-var fallback to transparent */
+  --gold-dark: #9a7a1e;
+  --bg-selected: rgba(185,150,46,0.18);
 }
 
 /* ============================================================
@@ -2858,6 +2862,7 @@ img, svg {
   display: flex; align-items: center; justify-content: center;
   border-radius: 6px; color: var(--muted);
   font-size: 16px; cursor: pointer;
+  background: none; border: none;
 }
 .modal-close:hover { background: var(--card2); color: var(--text); }
 .modal-body {
@@ -2937,6 +2942,7 @@ img, svg {
   display: flex; align-items: center; justify-content: center;
   border-radius: 6px; color: var(--muted);
   font-size: 16px; cursor: pointer;
+  background: none; border: none;
 }
 .help-close:hover { background: var(--card2); color: var(--text); }
 .help-body {
@@ -3697,6 +3703,8 @@ img, svg {
   color: var(--muted);
   transition: color var(--t-fast), background var(--t-fast);
   cursor: pointer;
+  background: none;
+  border: none;
 }
 
 .drawer-close-btn:hover {
@@ -6500,7 +6508,7 @@ function toggleUserDropdown() {
 
 function _closeUserDropdownOnOutsideClick(e) {
   const dropdown = document.querySelector('.user-dropdown');
-  const chip = document.querySelector('.user-chip');
+  const chip = document.querySelector('#user-chip');
   if (dropdown && !dropdown.contains(e.target) && chip && !chip.contains(e.target)) {
     dropdown.classList.remove('open');
   }
@@ -7285,7 +7293,7 @@ async function initAuth() {
   });
 
   // --- User chip ---
-  const userChip = document.querySelector('.user-chip');
+  const userChip = document.querySelector('#user-chip');
   if (userChip) userChip.addEventListener('click', toggleUserDropdown);
 
   document.querySelectorAll('.sign-out-btn').forEach(el => {
