@@ -8,7 +8,7 @@ import { Label } from '@/components/ui/label'
 
 const registerSchema = z.object({
   username:    z.string().min(3, 'Min 3 characters').max(32, 'Max 32 characters'),
-  displayName: z.string().optional(),
+  displayName: z.string(),
   password:    z.string().min(8, 'Min 8 characters'),
   confirm:     z.string(),
 }).refine((d) => d.password === d.confirm, {
@@ -53,7 +53,7 @@ export function RegisterForm({ onSwitchToLogin }: Props) {
               onChange={(e) => field.handleChange(e.target.value)}
             />
             {field.state.meta.errors.length > 0 && (
-              <p className="text-xs text-red-400">{field.state.meta.errors[0]?.toString()}</p>
+              <p className="text-xs text-red-400">{field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}</p>
             )}
           </div>
         )}
@@ -87,7 +87,7 @@ export function RegisterForm({ onSwitchToLogin }: Props) {
               onChange={(e) => field.handleChange(e.target.value)}
             />
             {field.state.meta.errors.length > 0 && (
-              <p className="text-xs text-red-400">{field.state.meta.errors[0]?.toString()}</p>
+              <p className="text-xs text-red-400">{field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}</p>
             )}
           </div>
         )}
@@ -106,7 +106,7 @@ export function RegisterForm({ onSwitchToLogin }: Props) {
               onChange={(e) => field.handleChange(e.target.value)}
             />
             {field.state.meta.errors.length > 0 && (
-              <p className="text-xs text-red-400">{field.state.meta.errors[0]?.toString()}</p>
+              <p className="text-xs text-red-400">{field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}</p>
             )}
           </div>
         )}
