@@ -5,9 +5,8 @@ FROM node:22-alpine AS frontend-builder
 WORKDIR /frontend
 
 # Install deps first (separate layer so package.json changes don't re-download)
-COPY frontend/package.json frontend/package-lock.json* ./
-# npm install generates the lockfile on first build; switch to npm ci after committing package-lock.json
-RUN npm install --legacy-peer-deps
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --legacy-peer-deps
 
 # Copy source and build
 COPY frontend/ ./

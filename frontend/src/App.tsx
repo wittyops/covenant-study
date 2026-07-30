@@ -20,11 +20,17 @@ import { ChapterView } from '@/components/reader/ChapterView'
 import { BookPicker } from '@/components/reader/BookPicker'
 import { TranslationPicker } from '@/components/reader/TranslationPicker'
 import { AuthGate } from '@/components/auth/AuthGate'
+import { BookmarksPanel } from '@/components/panels/BookmarksPanel'
+import { NotesPanel } from '@/components/panels/NotesPanel'
+import { HighlightsPanel } from '@/components/panels/HighlightsPanel'
+import { HistoryPanel } from '@/components/panels/HistoryPanel'
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Button } from '@/components/ui/button'
 import {
   BookOpen, ChevronLeft, ChevronRight, Bookmark, StickyNote,
   Highlighter, Clock, Map, LogOut, User as UserIcon,
 } from 'lucide-react'
+import type { PanelId } from '@/lib/types'
 
 export default function App() {
   return (
@@ -144,10 +150,10 @@ function ReaderShell() {
         </aside>
       </div>
 
-      {/* ── Panels ─────────────────────────────────────────────────── */}
-      {/* Each panel is rendered lazily only when first opened.
-          They render as Sheets on the right side.
-          Add full panel components here in follow-up work. */}
+      {/* ── Tool panels ────────────────────────────────────────────── */}
+      {/* Each panel slides in from the right as a Sheet.
+          activePanel drives which content component is rendered inside. */}
+      <ToolSheet />
 
       {/* Book picker sheet (left side) */}
       <BookPicker open={bookPickerOpen} onClose={() => setBookPickerOpen(false)} />
@@ -155,6 +161,40 @@ function ReaderShell() {
       {/* Toast stack */}
       <ToastStack />
     </div>
+  )
+}
+
+// Panel titles shown in the Sheet header
+const PANEL_META: Record<string, string> = {
+  bookmarks:  'Bookmarks',
+  notes:      'Notes',
+  highlights: 'Highlights',
+  history:    'Reading History',
+}
+
+// Renders the correct panel content inside the Sheet
+function PanelContent({ id }: { id: PanelId }) {
+  if (id === 'bookmarks')  return <BookmarksPanel />
+  if (id === 'notes')      return <NotesPanel />
+  if (id === 'highlights') return <HighlightsPanel />
+  if (id === 'history')    return <HistoryPanel />
+  return null
+}
+
+// Slide-in Sheet that houses all tool panels
+function ToolSheet() {
+  const { activePanel, sidebarOpen, closePanel } = useUiStore()
+  return (
+    <Sheet open={sidebarOpen} onOpenChange={(open) => { if (!open) closePanel() }}>
+      <SheetContent side="right" className="w-[340px] overflow-y-auto pb-10">
+        <SheetHeader>
+          <SheetTitle>{activePanel ? (PANEL_META[activePanel] ?? 'Tools') : 'Tools'}</SheetTitle>
+        </SheetHeader>
+        <div className="mt-4">
+          <PanelContent id={activePanel} />
+        </div>
+      </SheetContent>
+    </Sheet>
   )
 }
 

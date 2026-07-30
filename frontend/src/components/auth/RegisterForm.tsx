@@ -1,5 +1,4 @@
 import { useForm } from '@tanstack/react-form'
-import { zodValidator } from '@tanstack/zod-form-adapter'
 import { z } from 'zod'
 import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
@@ -25,7 +24,6 @@ export function RegisterForm({ onSwitchToLogin }: Props) {
 
   const form = useForm({
     defaultValues: { username: '', displayName: '', password: '', confirm: '' },
-    validatorAdapter: zodValidator(),
     validators: { onChange: registerSchema },
     onSubmit: async ({ value }) => {
       try {
