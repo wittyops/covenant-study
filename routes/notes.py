@@ -51,3 +51,26 @@ async def save_note(
         return {"status": "ok", "ref": ref, "updated_at": now}
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# REACT SPA COMPAT — /api/notes/* (plural path + PUT method)
+# ---------------------------------------------------------------------------
+
+@router.get("/api/notes/{ref:path}")
+async def get_note_plural(
+    ref: str,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    return await get_note(ref=ref, request=request, authorization=authorization)
+
+
+@router.put("/api/notes/{ref:path}")
+async def save_note_plural(
+    ref: str,
+    body: NoteBody,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    return await save_note(ref=ref, body=body, request=request, authorization=authorization)

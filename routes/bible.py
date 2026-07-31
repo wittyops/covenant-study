@@ -544,3 +544,246 @@ async def get_commentary(ref: str = Query(...)):
         }
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# REACT SPA COMPAT — /api/bible/* routes
+#
+# The React frontend uses /api/bible/chapter, /api/bible/books, etc. with
+# numeric params and typed response shapes.  These endpoints wrap the same
+# SQLite logic as the legacy /api/* routes but speak the frontend's dialect.
+# ---------------------------------------------------------------------------
+
+# Reverse-lookup: book name → number (used to parse crossref results from DB)
+_BOOK_NUMS: dict[str, int] = {v: k for k, v in BOOKS.items()}
+
+# Testament assignment (OT=1-39, NT=40-66) and canonical chapter counts
+_TESTAMENT: dict[int, str] = {**{i: "OT" for i in range(1, 40)}, **{i: "NT" for i in range(40, 67)}}
+_CHAPTERS: dict[int, int] = {
+    1: 50, 2: 40, 3: 27, 4: 36, 5: 34, 6: 24, 7: 21, 8: 4, 9: 31, 10: 24,
+    11: 22, 12: 25, 13: 29, 14: 36, 15: 10, 16: 13, 17: 10, 18: 42, 19: 150,
+    20: 31, 21: 12, 22: 8,  23: 66, 24: 52, 25: 5,  26: 48, 27: 12, 28: 14,
+    29: 3,  30: 9,  31: 1,  32: 4,  33: 7,  34: 3,  35: 3,  36: 3,  37: 2,
+    38: 14, 39: 4,  40: 28, 41: 16, 42: 24, 43: 21, 44: 28, 45: 16, 46: 16,
+    47: 13, 48: 6,  49: 6,  50: 4,  51: 4,  52: 5,  53: 3,  54: 6,  55: 4,
+    56: 3,  57: 1,  58: 13, 59: 5,  60: 5,  61: 3,  62: 5,  63: 1,  64: 1,
+    65: 1,  66: 22,
+}
+
+
+@router.get("/api/bible/books")
+async def react_books():
+    """Book list for the React SPA — returns BookInfo[] directly (no wrapper object)."""
+    return [
+        {
+            "book":      k,
+            "name":      v,
+            "testament": _TESTAMENT.get(k, "OT"),
+            "chapters":  _CHAPTERS.get(k, 1),
+        }
+        for k, v in BOOKS.items()
+    ]
+
+
+@router.get("/api/bible/translations")
+async def react_translations():
+    """Translation list for the React SPA — returns Translation[] (id + name) directly."""
+    conn, multi = get_db()
+    if not conn:
+        return [{"id": "KJV", "name": "King James Version"}]
+    try:
+        if multi:
+            rows = conn.execute(
+                "SELECT DISTINCT translation FROM verses ORDER BY translation"
+            ).fetchall()
+            return [{"id": r[0], "name": r[0]} for r in rows]
+        return [{"id": "KJV", "name": "King James Version"}]
+    finally:
+        conn.close()
+
+
+@router.get("/api/bible/chapter")
+async def react_chapter(
+    book:        int = Query(..., ge=1, le=66),
+    chapter:     int = Query(..., ge=1),
+    translation: str = Query("KJV"),
+):
+    """Chapter text for the React SPA — takes numeric book/chapter params.
+
+    Returns ChapterResponse shape: {book, book_name, chapter, translation, verses[]}.
+    """
+    conn, multi = get_db()
+    if not conn:
+        raise HTTPException(503, "Bible database not loaded")
+    try:
+        book_name = BOOKS.get(book, str(book))
+        cur = conn.cursor()
+        if multi:
+            cur.execute(
+                "SELECT v, t FROM verses WHERE translation=? AND b=? AND c=? ORDER BY v",
+                (translation, book, chapter),
+            )
+        else:
+            cur.execute(
+                "SELECT v, t FROM t_kjv WHERE b=? AND c=? ORDER BY v",
+                (book, chapter),
+            )
+            translation = "KJV"
+        rows = cur.fetchall()
+        if not rows:
+            raise HTTPException(404, f"No verses found for book {book} chapter {chapter}")
+        verses = [
+            {
+                "book":        book,
+                "book_name":   book_name,
+                "chapter":     chapter,
+                "verse":       r[0],
+                "text":        r[1],
+                "translation": translation,
+            }
+            for r in rows
+        ]
+        return {
+            "book":        book,
+            "book_name":   book_name,
+            "chapter":     chapter,
+            "translation": translation,
+            "verses":      verses,
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/api/bible/search")
+async def react_search(
+    q:           str = Query(..., min_length=3),
+    translation: str = Query("KJV"),
+    limit:       int = Query(20, ge=1, le=100),
+):
+    """Search for the React SPA — returns Verse[] directly."""
+    conn, multi = get_db()
+    if not conn:
+        raise HTTPException(503, "Bible database not loaded")
+    try:
+        cur = conn.cursor()
+        if multi:
+            cur.execute(
+                "SELECT b, c, v, t FROM verses WHERE translation=? AND t LIKE ? LIMIT ?",
+                (translation, f"%{q}%", limit),
+            )
+        else:
+            cur.execute("SELECT b, c, v, t FROM t_kjv WHERE t LIKE ? LIMIT ?", (f"%{q}%", limit))
+            translation = "KJV"
+        rows = cur.fetchall()
+        return [
+            {
+                "book":        r[0],
+                "book_name":   BOOKS.get(r[0], str(r[0])),
+                "chapter":     r[1],
+                "verse":       r[2],
+                "text":        r[3],
+                "translation": translation,
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+@router.get("/api/bible/strongs/{number}")
+async def react_strongs(number: str):
+    """Strong's entry for the React SPA — field names mapped to StrongsEntry type."""
+    db = get_strongs_db()
+    if not db:
+        raise HTTPException(503, "Strong's database not loaded")
+    try:
+        row = None
+        for key in normalize_strongs(number):
+            row = db.execute(
+                "SELECT number, language, original, transliteration, pronunciation,"
+                " definition, kjv_usage FROM strongs WHERE number=?",
+                (key,),
+            ).fetchone()
+            if row:
+                break
+        if not row:
+            raise HTTPException(404, f"Strong's {number} not found")
+        return {
+            "number":          row[0],
+            "word":            row[2],   # original → word
+            "transliteration": row[3],
+            "pronunciation":   row[4],
+            "definition":      row[5],
+            "derivation":      row[6] or "",  # kjv_usage → derivation
+            "language":        row[1],
+        }
+    finally:
+        db.close()
+
+
+@router.get("/api/bible/crossrefs")
+async def react_crossrefs(
+    book:    int = Query(..., ge=1, le=66),
+    chapter: int = Query(..., ge=1),
+    verse:   int = Query(..., ge=1),
+    limit:   int = Query(25, ge=1, le=200),
+):
+    """Cross-references for the React SPA — numeric params, CrossRef[] response."""
+    book_name = BOOKS.get(book, str(book))
+    db = get_crossrefs_db()
+    if not db:
+        raise HTTPException(503, "Cross-references database not loaded")
+    try:
+        rows = db.execute(
+            "SELECT to_book, to_chapter, to_verse_start, votes"
+            " FROM cross_refs"
+            " WHERE from_book = ? AND from_chapter = ? AND from_verse = ?"
+            " ORDER BY votes DESC LIMIT ?",
+            (book_name, chapter, verse, limit),
+        ).fetchall()
+        return [
+            {
+                "from_book":    book,
+                "from_chapter": chapter,
+                "from_verse":   verse,
+                "to_book":      _BOOK_NUMS.get(r["to_book"], 0),
+                "to_chapter":   r["to_chapter"],
+                "to_verse":     r["to_verse_start"],
+                "to_book_name": r["to_book"],
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+
+@router.get("/api/bible/interlinear")
+async def react_interlinear(
+    book:    int = Query(..., ge=1, le=66),
+    chapter: int = Query(..., ge=1),
+):
+    """Interlinear for the React SPA — takes numeric book/chapter, returns InterlinearWord[]."""
+    db = get_interlinear_db()
+    if not db:
+        raise HTTPException(503, "Interlinear database not loaded")
+    try:
+        rows = db.execute(
+            "SELECT word_num, original_word, transliteration, strongs_num,"
+            "       morphology, english_gloss"
+            " FROM interlinear WHERE book = ? AND chapter = ?"
+            " ORDER BY verse, word_num",
+            (book, chapter),
+        ).fetchall()
+        return [
+            {
+                "position": r["word_num"],
+                "original": r["original_word"],
+                "translit": r["transliteration"],
+                "strongs":  r["strongs_num"],
+                "morph":    r["morphology"],
+                "english":  r["english_gloss"],
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
