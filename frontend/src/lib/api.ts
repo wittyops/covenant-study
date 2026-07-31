@@ -211,6 +211,19 @@ export const admin = {
   users(token: string) {
     return apiFetch<User[]>('/api/admin/users', { token })
   },
+  createUser(
+    username: string,
+    password: string,
+    displayName: string | null,
+    role: 'user' | 'admin',
+    token: string,
+  ) {
+    return apiFetch<User>('/api/admin/users', {
+      method: 'POST',
+      body: JSON.stringify({ username, password, display_name: displayName, role }),
+      token,
+    })
+  },
   resetPassword(uid: number, password: string, token: string) {
     return apiFetch<{ ok: boolean }>(`/api/admin/users/${uid}/reset-password`, {
       method: 'POST',
