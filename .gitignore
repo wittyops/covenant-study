@@ -1,4 +1,16 @@
+# Python
 .venv/
-staging/
 __pycache__/
 *.pyc
+*.pyo
+pyrightconfig.json
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+
+# Secrets — never commit
+.env
+
+# Legacy scratch (not part of the app)
+staging/
