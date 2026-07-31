@@ -30,6 +30,7 @@ import { AuthGate } from '@/components/auth/AuthGate'
 import { BookmarksPanel } from '@/components/panels/BookmarksPanel'
 import { HighlightsPanel } from '@/components/panels/HighlightsPanel'
 import { HistoryPanel } from '@/components/panels/HistoryPanel'
+import { MapsPanel } from '@/components/panels/MapsPanel'
 import { NotesPanel } from '@/components/panels/NotesPanel'
 import { BookPicker } from '@/components/reader/BookPicker'
 import { ChapterView } from '@/components/reader/ChapterView'
@@ -183,6 +184,7 @@ const PANEL_META: Record<string, string> = {
   notes: 'Notes',
   highlights: 'Highlights',
   history: 'Reading History',
+  map: 'Bible Map',
 }
 
 // Renders the correct panel content inside the Sheet
@@ -191,6 +193,7 @@ function PanelContent({ id }: { id: PanelId }) {
   if (id === 'notes') return <NotesPanel />
   if (id === 'highlights') return <HighlightsPanel />
   if (id === 'history') return <HistoryPanel />
+  if (id === 'map') return <MapsPanel />
   return null
 }
 
