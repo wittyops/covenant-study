@@ -22,11 +22,13 @@ import {
   Highlighter,
   LogOut,
   Map as MapIcon,
+  Shield,
   StickyNote,
   User as UserIcon,
 } from 'lucide-react'
 import { useState } from 'react'
 import { AuthGate } from '@/components/auth/AuthGate'
+import { AdminPanel } from '@/components/panels/AdminPanel'
 import { BookmarksPanel } from '@/components/panels/BookmarksPanel'
 import { HighlightsPanel } from '@/components/panels/HighlightsPanel'
 import { HistoryPanel } from '@/components/panels/HistoryPanel'
@@ -161,6 +163,24 @@ function ReaderShell() {
               <Icon className="h-4 w-4" />
             </button>
           ))}
+          {user?.role === 'admin' && (
+            <>
+              <div className="my-1 w-5 border-t border-bg-overlay" />
+              <button
+                type="button"
+                title="Administration"
+                onClick={() => togglePanel('admin')}
+                className={`flex h-9 w-9 items-center justify-center rounded transition-colors
+                  ${
+                    activePanel === 'admin'
+                      ? 'bg-gold-subtle text-gold'
+                      : 'text-text-muted hover:text-text-primary hover:bg-bg-elevated'
+                  }`}
+              >
+                <Shield className="h-4 w-4" />
+              </button>
+            </>
+          )}
         </aside>
       </div>
 
@@ -185,6 +205,7 @@ const PANEL_META: Record<string, string> = {
   highlights: 'Highlights',
   history: 'Reading History',
   map: 'Bible Map',
+  admin: 'Administration',
 }
 
 // Renders the correct panel content inside the Sheet
@@ -194,6 +215,7 @@ function PanelContent({ id }: { id: PanelId }) {
   if (id === 'highlights') return <HighlightsPanel />
   if (id === 'history') return <HistoryPanel />
   if (id === 'map') return <MapsPanel />
+  if (id === 'admin') return <AdminPanel />
   return null
 }
 

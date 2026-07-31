@@ -211,4 +211,11 @@ export const admin = {
   users(token: string) {
     return apiFetch<User[]>('/api/admin/users', { token })
   },
+  resetPassword(uid: number, password: string, token: string) {
+    return apiFetch<{ ok: boolean }>(`/api/admin/users/${uid}/reset-password`, {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+      token,
+    })
+  },
 }
