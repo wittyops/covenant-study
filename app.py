@@ -67,28 +67,24 @@ app.include_router(fragments.router)
 # ROOT ROUTE
 # ---------------------------------------------------------------------------
 
+_SPA_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(_request: Request) -> FileResponse:
-    """Serve the React SPA entry point.
-
-    In production the React build lives at /app/static/dist/index.html.
-    FastAPI's /static mount already serves the JS/CSS assets at /static/dist/assets/*.
-    """
-    return FileResponse("/app/static/dist/index.html")
+    """Serve the React SPA entry point."""
+    return FileResponse("/app/static/dist/index.html", headers=_SPA_HEADERS)
 
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 async def spa_fallback(_request: Request, full_path: str) -> FileResponse:
-    """Catch-all that returns the React shell for any non-API path.
-
-    React Router handles the actual routing on the client.  Without this,
-    refreshing on any sub-path (e.g. /study/genesis-1) would 404 from FastAPI.
-    API routes registered before this handler take priority because FastAPI
-    evaluates routes in declaration order.
-    """
-    # Suppress the unused parameter warning — full_path is consumed by routing
+    """Catch-all SPA fallback — API routes registered before this handler take priority."""
     _ = full_path
-    return FileResponse("/app/static/dist/index.html")
+    return FileResponse("/app/static/dist/index.html", headers=_SPA_HEADERS)
 
 
 # ---------------------------------------------------------------------------
