@@ -11,8 +11,20 @@
  */
 
 import type {
-  BookInfo, ChapterResponse, StrongsEntry, CrossRef, InterlinearWord,
-  Bookmark, Highlight, HistoryEntry, StudySession, Place, Translation, User, Verse, TaggedWord,
+  BookInfo,
+  Bookmark,
+  ChapterResponse,
+  CrossRef,
+  Highlight,
+  HistoryEntry,
+  InterlinearWord,
+  Place,
+  StrongsEntry,
+  StudySession,
+  TaggedWord,
+  Translation,
+  User,
+  Verse,
 } from './types'
 
 // ─── Core fetch wrapper ────────────────────────────────────────────────────
@@ -31,7 +43,10 @@ async function apiFetch<T>(
 
   if (!res.ok) {
     let message = `${res.status} ${res.statusText}`
-    try { const body = await res.json(); message = body.detail ?? message } catch (_) {}
+    try {
+      const body = await res.json()
+      message = body.detail ?? message
+    } catch (_) {}
     throw new Error(message)
   }
 
@@ -92,7 +107,11 @@ export const bible = {
   },
 
   crossrefs(book: number, chapter: number, verse: number, token?: string | null) {
-    const qs = new URLSearchParams({ book: String(book), chapter: String(chapter), verse: String(verse) })
+    const qs = new URLSearchParams({
+      book: String(book),
+      chapter: String(chapter),
+      verse: String(verse),
+    })
     return apiFetch<CrossRef[]>(`/api/bible/crossrefs?${qs}`, { token })
   },
 
@@ -114,44 +133,82 @@ export const bible = {
 // ─── User data ─────────────────────────────────────────────────────────────
 
 export const bookmarks = {
-  list(token: string)                            { return apiFetch<Bookmark[]>('/api/bookmarks', { token }) },
-  add(ref: string, label: string | null, color: string, token: string) {
-    return apiFetch<Bookmark>('/api/bookmarks', { method: 'POST', body: JSON.stringify({ ref, label, color }), token })
+  list(token: string) {
+    return apiFetch<Bookmark[]>('/api/bookmarks', { token })
   },
-  remove(id: number, token: string)             { return apiFetch<void>(`/api/bookmarks/${id}`, { method: 'DELETE', token }) },
+  add(ref: string, label: string | null, color: string, token: string) {
+    return apiFetch<Bookmark>('/api/bookmarks', {
+      method: 'POST',
+      body: JSON.stringify({ ref, label, color }),
+      token,
+    })
+  },
+  remove(id: number, token: string) {
+    return apiFetch<void>(`/api/bookmarks/${id}`, { method: 'DELETE', token })
+  },
 }
 
 export const highlights = {
-  list(token: string)                            { return apiFetch<Highlight[]>('/api/highlights', { token }) },
+  list(token: string) {
+    return apiFetch<Highlight[]>('/api/highlights', { token })
+  },
   set(ref: string, color: string, note: string | null, token: string) {
     return apiFetch<Highlight>(`/api/highlights/${encodeURIComponent(ref)}`, {
-      method: 'PUT', body: JSON.stringify({ color, note }), token,
+      method: 'PUT',
+      body: JSON.stringify({ color, note }),
+      token,
     })
   },
-  remove(ref: string, token: string)            { return apiFetch<void>(`/api/highlights/${encodeURIComponent(ref)}`, { method: 'DELETE', token }) },
+  remove(ref: string, token: string) {
+    return apiFetch<void>(`/api/highlights/${encodeURIComponent(ref)}`, { method: 'DELETE', token })
+  },
 }
 
 export const history = {
-  list(token: string)                            { return apiFetch<HistoryEntry[]>('/api/history', { token }) },
-  log(ref: string, token: string)               { return apiFetch<void>('/api/history', { method: 'POST', body: JSON.stringify({ ref }), token }) },
+  list(token: string) {
+    return apiFetch<HistoryEntry[]>('/api/history', { token })
+  },
+  log(ref: string, token: string) {
+    return apiFetch<void>('/api/history', { method: 'POST', body: JSON.stringify({ ref }), token })
+  },
 }
 
 export const notes = {
-  get(ref: string, token: string)               { return apiFetch<{ ref: string; body: string }>(`/api/notes/${encodeURIComponent(ref)}`, { token }) },
+  get(ref: string, token: string) {
+    return apiFetch<{ ref: string; body: string }>(`/api/notes/${encodeURIComponent(ref)}`, {
+      token,
+    })
+  },
   save(ref: string, body: string, token: string) {
-    return apiFetch<void>(`/api/notes/${encodeURIComponent(ref)}`, { method: 'PUT', body: JSON.stringify({ body }), token })
+    return apiFetch<void>(`/api/notes/${encodeURIComponent(ref)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ body }),
+      token,
+    })
   },
 }
 
 export const sessions = {
-  list(token: string)                            { return apiFetch<StudySession[]>('/api/sessions', { token }) },
-  save(name: string, state: object, token: string) {
-    return apiFetch<StudySession>('/api/sessions', { method: 'POST', body: JSON.stringify({ name, state_json: JSON.stringify(state) }), token })
+  list(token: string) {
+    return apiFetch<StudySession[]>('/api/sessions', { token })
   },
-  load(id: number, token: string)               { return apiFetch<StudySession>(`/api/sessions/${id}`, { token }) },
-  remove(id: number, token: string)             { return apiFetch<void>(`/api/sessions/${id}`, { method: 'DELETE', token }) },
+  save(name: string, state: object, token: string) {
+    return apiFetch<StudySession>('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ name, state_json: JSON.stringify(state) }),
+      token,
+    })
+  },
+  load(id: number, token: string) {
+    return apiFetch<StudySession>(`/api/sessions/${id}`, { token })
+  },
+  remove(id: number, token: string) {
+    return apiFetch<void>(`/api/sessions/${id}`, { method: 'DELETE', token })
+  },
 }
 
 export const admin = {
-  users(token: string)                          { return apiFetch<User[]>('/api/admin/users', { token }) },
+  users(token: string) {
+    return apiFetch<User[]>('/api/admin/users', { token })
+  },
 }

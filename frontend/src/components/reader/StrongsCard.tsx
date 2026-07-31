@@ -3,15 +3,19 @@
  * Opened by clicking a tagged word in ChapterView.
  */
 import { useQuery } from '@tanstack/react-query'
-import { useAuthStore } from '@/stores/auth'
-import { bible } from '@/lib/api'
 import { Badge } from '@/components/ui/badge'
 import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
 } from '@/components/ui/dialog'
+import { bible } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth'
 
 interface Props {
-  number:  string
+  number: string
   onClose: () => void
 }
 
@@ -25,7 +29,12 @@ export function StrongsCard({ number, onClose }: Props) {
   })
 
   return (
-    <Dialog open onOpenChange={(open) => { if (!open) onClose() }}>
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose()
+      }}
+    >
       <DialogContent className="max-w-lg">
         <DialogHeader>
           <div className="flex items-center gap-3">
@@ -33,9 +42,7 @@ export function StrongsCard({ number, onClose }: Props) {
               {number}
             </Badge>
             <div>
-              <DialogTitle className="text-xl">
-                {isLoading ? '…' : data?.word}
-              </DialogTitle>
+              <DialogTitle className="text-xl">{isLoading ? '…' : data?.word}</DialogTitle>
               {data && (
                 <DialogDescription className="font-mono text-sm text-text-secondary">
                   {data.transliteration} · {data.pronunciation}

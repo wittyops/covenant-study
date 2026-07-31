@@ -6,18 +6,18 @@ import { create } from 'zustand'
 import type { PanelId } from '@/lib/types'
 
 export interface Toast {
-  id:      number
+  id: number
   message: string
-  type:    'info' | 'success' | 'error' | 'warning'
+  type: 'info' | 'success' | 'error' | 'warning'
 }
 
 interface UiState {
-  activePanel:   PanelId
-  sidebarOpen:   boolean
-  searchOpen:    boolean
-  userMenuOpen:  boolean
-  toasts:        Toast[]
-  _toastSeq:     number
+  activePanel: PanelId
+  sidebarOpen: boolean
+  searchOpen: boolean
+  userMenuOpen: boolean
+  toasts: Toast[]
+  _toastSeq: number
 
   openPanel(id: PanelId): void
   closePanel(): void
@@ -32,15 +32,19 @@ interface UiState {
 }
 
 export const useUiStore = create<UiState>()((set, get) => ({
-  activePanel:   null,
-  sidebarOpen:   false,
-  searchOpen:    false,
-  userMenuOpen:  false,
-  toasts:        [],
-  _toastSeq:     0,
+  activePanel: null,
+  sidebarOpen: false,
+  searchOpen: false,
+  userMenuOpen: false,
+  toasts: [],
+  _toastSeq: 0,
 
-  openPanel(id)        { set({ activePanel: id, sidebarOpen: true }) },
-  closePanel()         { set({ activePanel: null, sidebarOpen: false }) },
+  openPanel(id) {
+    set({ activePanel: id, sidebarOpen: true })
+  },
+  closePanel() {
+    set({ activePanel: null, sidebarOpen: false })
+  },
   togglePanel(id) {
     const { activePanel, sidebarOpen } = get()
     if (activePanel === id && sidebarOpen) {
@@ -49,9 +53,15 @@ export const useUiStore = create<UiState>()((set, get) => ({
       set({ activePanel: id, sidebarOpen: true })
     }
   },
-  setSidebarOpen(v)    { set({ sidebarOpen: v }) },
-  setSearchOpen(v)     { set({ searchOpen: v }) },
-  setUserMenuOpen(v)   { set({ userMenuOpen: v }) },
+  setSidebarOpen(v) {
+    set({ sidebarOpen: v })
+  },
+  setSearchOpen(v) {
+    set({ searchOpen: v })
+  },
+  setUserMenuOpen(v) {
+    set({ userMenuOpen: v })
+  },
 
   toast(message, type = 'info', ms = 3500) {
     const id = get()._toastSeq + 1

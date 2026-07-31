@@ -12,13 +12,13 @@ import type { User } from '@/lib/types'
 
 interface AuthState {
   // ── State ──────────────────────────────────────────────────────────────
-  user:    User | null
-  token:   string | null
+  user: User | null
+  token: string | null
   loading: boolean
-  error:   string | null
+  error: string | null
 
   // ── Computed ───────────────────────────────────────────────────────────
-  isAdmin:     boolean
+  isAdmin: boolean
   displayName: string
 
   // ── Actions ───────────────────────────────────────────────────────────
@@ -32,13 +32,17 @@ interface AuthState {
 export const useAuthStore = create<AuthState>()(
   persist(
     (set, get) => ({
-      user:    null,
-      token:   null,
+      user: null,
+      token: null,
       loading: false,
-      error:   null,
+      error: null,
 
-      get isAdmin()     { return get().user?.role === 'admin' },
-      get displayName() { return get().user?.display_name ?? get().user?.username ?? '' },
+      get isAdmin() {
+        return get().user?.role === 'admin'
+      },
+      get displayName() {
+        return get().user?.display_name ?? get().user?.username ?? ''
+      },
 
       async login(username, password) {
         set({ loading: true, error: null })
@@ -80,7 +84,9 @@ export const useAuthStore = create<AuthState>()(
         }
       },
 
-      clearError() { set({ error: null }) },
+      clearError() {
+        set({ error: null })
+      },
     }),
     {
       name: 'covenant-auth',

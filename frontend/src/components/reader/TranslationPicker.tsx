@@ -2,13 +2,14 @@
  * TranslationPicker — Radix Select for switching Bible translation.
  * Populates from /api/bible/translations.
  */
-import { useQuery } from '@tanstack/react-query'
+
 import * as SelectPrimitive from '@radix-ui/react-select'
-import { ChevronDown, Check } from 'lucide-react'
-import { useReaderStore } from '@/stores/reader'
-import { useAuthStore } from '@/stores/auth'
+import { useQuery } from '@tanstack/react-query'
+import { Check, ChevronDown } from 'lucide-react'
 import { bible } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth'
+import { useReaderStore } from '@/stores/reader'
 
 export function TranslationPicker() {
   const { translation, setTranslation } = useReaderStore()

@@ -32,7 +32,6 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex min-h-screen items-center justify-center bg-bg-base px-4">
       <div className="w-full max-w-sm space-y-6">
-
         {/* Wordmark */}
         <div className="text-center">
           <h1 className="text-3xl font-bold tracking-tight text-gold">Covenant Study</h1>
@@ -41,12 +40,12 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
 
         {/* Form card */}
         <div className="rounded-lg border border-bg-overlay bg-bg-surface p-6 shadow-xl">
-          {mode === 'login'
-            ? <LoginForm onSwitchToRegister={() => setMode('register')} />
-            : <RegisterForm onSwitchToLogin={() => setMode('login')} />
-          }
+          {mode === 'login' ? (
+            <LoginForm onSwitchToRegister={() => setMode('register')} />
+          ) : (
+            <RegisterForm onSwitchToLogin={() => setMode('login')} />
+          )}
         </div>
-
       </div>
     </div>
   )

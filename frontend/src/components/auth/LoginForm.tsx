@@ -7,11 +7,11 @@
  */
 import { useForm } from '@tanstack/react-form'
 import { z } from 'zod'
-import { useAuthStore } from '@/stores/auth'
-import { useUiStore } from '@/stores/ui'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { useAuthStore } from '@/stores/auth'
+import { useUiStore } from '@/stores/ui'
 
 const loginSchema = z.object({
   username: z.string().min(1, 'Username is required'),
@@ -40,16 +40,16 @@ export function LoginForm({ onSwitchToRegister }: Props) {
 
   return (
     <form
-      onSubmit={(e) => { e.preventDefault(); form.handleSubmit() }}
+      onSubmit={(e) => {
+        e.preventDefault()
+        form.handleSubmit()
+      }}
       className="space-y-4"
     >
       <h2 className="text-xl font-semibold text-text-primary">Sign in</h2>
 
       {/* Username */}
-      <form.Field
-        name="username"
-        validators={{ onChange: z.string().min(1, 'Required') }}
-      >
+      <form.Field name="username" validators={{ onChange: z.string().min(1, 'Required') }}>
         {(field) => (
           <div className="space-y-1">
             <Label htmlFor="username">Username</Label>
@@ -62,17 +62,16 @@ export function LoginForm({ onSwitchToRegister }: Props) {
               onChange={(e) => field.handleChange(e.target.value)}
             />
             {field.state.meta.errors.length > 0 && (
-              <p className="text-xs text-red-400">{field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}</p>
+              <p className="text-xs text-red-400">
+                {field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}
+              </p>
             )}
           </div>
         )}
       </form.Field>
 
       {/* Password */}
-      <form.Field
-        name="password"
-        validators={{ onChange: z.string().min(1, 'Required') }}
-      >
+      <form.Field name="password" validators={{ onChange: z.string().min(1, 'Required') }}>
         {(field) => (
           <div className="space-y-1">
             <Label htmlFor="password">Password</Label>
@@ -85,7 +84,9 @@ export function LoginForm({ onSwitchToRegister }: Props) {
               onChange={(e) => field.handleChange(e.target.value)}
             />
             {field.state.meta.errors.length > 0 && (
-              <p className="text-xs text-red-400">{field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}</p>
+              <p className="text-xs text-red-400">
+                {field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}
+              </p>
             )}
           </div>
         )}
@@ -97,11 +98,7 @@ export function LoginForm({ onSwitchToRegister }: Props) {
 
       <p className="text-center text-sm text-text-muted">
         No account?{' '}
-        <button
-          type="button"
-          onClick={onSwitchToRegister}
-          className="text-gold hover:underline"
-        >
+        <button type="button" onClick={onSwitchToRegister} className="text-gold hover:underline">
           Register
         </button>
       </p>

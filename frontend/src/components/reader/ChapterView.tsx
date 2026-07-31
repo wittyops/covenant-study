@@ -18,17 +18,17 @@
  */
 import { useQuery } from '@tanstack/react-query'
 import { useCallback, useMemo, useRef } from 'react'
-import { useReaderStore } from '@/stores/reader'
-import { useAuthStore } from '@/stores/auth'
-import { useUiStore } from '@/stores/ui'
 import { bible, highlights as highlightsApi } from '@/lib/api'
+import { useAuthStore } from '@/stores/auth'
+import { useReaderStore } from '@/stores/reader'
+import { useUiStore } from '@/stores/ui'
 import { StrongsCard } from './StrongsCard'
 
 export function ChapterView() {
   const { book, chapter, translation, setVerse, openStrongs, activeStrongs } = useReaderStore()
   const { token } = useAuthStore()
   const { toast } = useUiStore()
-  const containerRef = useRef<HTMLDivElement>(null)
+  const containerRef = useRef<HTMLElement>(null)
 
   // ── Verse text ────────────────────────────────────────────────────────────
   const { data, isLoading, isError } = useQuery({
@@ -49,7 +49,7 @@ export function ChapterView() {
   // ── User highlights (load once, filter per chapter) ───────────────────────
   const { data: allHighlights } = useQuery({
     queryKey: ['highlights'],
-    queryFn: () => highlightsApi.list(token!),
+    queryFn: () => highlightsApi.list(token ?? ''),
     staleTime: 60 * 1000,
     enabled: !!token,
   })
@@ -62,15 +62,17 @@ export function ChapterView() {
     for (const h of allHighlights) {
       if (h.ref.startsWith(prefix)) {
         const n = parseInt(h.ref.slice(prefix.length), 10)
-        if (!isNaN(n)) m.set(n, h.color)
+        if (!Number.isNaN(n)) m.set(n, h.color)
       }
     }
     return m
   }, [allHighlights, data?.book_name, chapter])
 
-  // ── Delegated click — catches [data-verse] and [data-strongs] ────────────
+  // ── Delegated handler — catches [data-verse] and [data-strongs] ──────────
+  // Shared by onClick + onKeyDown so keyboard users can select verses and words.
   const handleContainerClick = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
+    (e: React.MouseEvent<HTMLElement> | React.KeyboardEvent<HTMLElement>) => {
+      if ('key' in e && e.key !== 'Enter' && e.key !== ' ') return
       const verseEl = (e.target as Element).closest('[data-verse]') as HTMLElement | null
       if (verseEl) setVerse(Number(verseEl.dataset.verse))
 
@@ -85,7 +87,9 @@ export function ChapterView() {
     toast('Failed to load chapter', 'error')
     return (
       <div className="flex flex-col items-center justify-center py-20 text-text-muted">
-        <p>Could not load {book} {chapter}.</p>
+        <p>
+          Could not load {book} {chapter}.
+        </p>
       </div>
     )
   }
@@ -101,13 +105,15 @@ export function ChapterView() {
       </header>
 
       {/* Verse list — delegated click for verse selection and Strong's */}
-      <div
+      <section
         ref={containerRef}
+        aria-label="Scripture text"
         className="scripture-text space-y-2 leading-8 text-text-primary"
         onClick={handleContainerClick}
+        onKeyDown={handleContainerClick}
       >
         {data?.verses.map((v) => {
-          const words  = wordData?.[String(v.verse)]
+          const words = wordData?.[String(v.verse)]
           const hlColor = highlightMap.get(v.verse)
 
           return (
@@ -115,32 +121,34 @@ export function ChapterView() {
               key={v.verse}
               data-verse={v.verse}
               className={`cursor-pointer rounded px-0.5 transition-colors hover:bg-bg-elevated${hlColor ? ' verse-highlighted' : ''}`}
-              style={hlColor ? { '--highlight-color': hlColor } as React.CSSProperties : undefined}
+              style={
+                hlColor ? ({ '--highlight-color': hlColor } as React.CSSProperties) : undefined
+              }
             >
-              <sup className="mr-1 text-xs font-bold text-gold-muted select-none">
-                {v.verse}
-              </sup>
+              <sup className="mr-1 text-xs font-bold text-gold-muted select-none">{v.verse}</sup>
               {words?.length
                 ? words.map((w, i) =>
-                    w.strongs
-                      ? <span key={i} className="word-tagged" data-strongs={w.strongs} data-morph={w.morph}>{w.text} </span>
-                      : <span key={i}>{w.text} </span>
+                    w.strongs ? (
+                      <span
+                        key={i}
+                        className="word-tagged"
+                        data-strongs={w.strongs}
+                        data-morph={w.morph}
+                      >
+                        {w.text}{' '}
+                      </span>
+                    ) : (
+                      <span key={i}>{w.text} </span>
+                    ),
                   )
-                : v.text
-              }
-              {' '}
+                : v.text}{' '}
             </span>
           )
         })}
-      </div>
+      </section>
 
       {/* Strong's lexicon dialog — opens when a tagged word is clicked */}
-      {activeStrongs && (
-        <StrongsCard
-          number={activeStrongs}
-          onClose={() => openStrongs(null)}
-        />
-      )}
+      {activeStrongs && <StrongsCard number={activeStrongs} onClose={() => openStrongs(null)} />}
     </>
   )
 }
@@ -150,7 +158,11 @@ function ChapterSkeleton() {
     <div className="space-y-3 py-4">
       <div className="loading-shimmer h-8 w-48 rounded" />
       {Array.from({ length: 12 }, (_, i) => (
-        <div key={i} className="loading-shimmer h-5 rounded" style={{ width: `${60 + (i % 5) * 8}%` }} />
+        <div
+          key={i}
+          className="loading-shimmer h-5 rounded"
+          style={{ width: `${60 + (i % 5) * 8}%` }}
+        />
       ))}
     </div>
   )

@@ -9,101 +9,101 @@ export interface User {
 }
 
 export interface BookInfo {
-  book:      number
-  name:      string
+  book: number
+  name: string
   testament: 'OT' | 'NT'
-  chapters:  number
+  chapters: number
 }
 
 export interface Verse {
-  book:        number
-  book_name:   string
-  chapter:     number
-  verse:       number
-  text:        string
+  book: number
+  book_name: string
+  chapter: number
+  verse: number
+  text: string
   translation: string
 }
 
 export interface ChapterResponse {
-  book:        number
-  book_name:   string
-  chapter:     number
+  book: number
+  book_name: string
+  chapter: number
   translation: string
-  verses:      Verse[]
+  verses: Verse[]
 }
 
 export interface StrongsEntry {
-  number:      string
-  word:        string
+  number: string
+  word: string
   transliteration: string
-  pronunciation:   string
-  definition:  string
-  derivation:  string
-  language:    'Hebrew' | 'Greek'
+  pronunciation: string
+  definition: string
+  derivation: string
+  language: 'Hebrew' | 'Greek'
 }
 
 export interface CrossRef {
-  from_book:    number
+  from_book: number
   from_chapter: number
-  from_verse:   number
-  to_book:      number
-  to_chapter:   number
-  to_verse:     number
+  from_verse: number
+  to_book: number
+  to_chapter: number
+  to_verse: number
   to_book_name: string
 }
 
 export interface TaggedWord {
-  text:    string
+  text: string
   strongs: string
-  morph:   string
+  morph: string
 }
 
 export interface InterlinearWord {
-  position:   number
-  original:   string
-  translit:   string
-  morph:      string
-  strongs:    string
-  english:    string
+  position: number
+  original: string
+  translit: string
+  morph: string
+  strongs: string
+  english: string
 }
 
 export interface Bookmark {
-  id:         number
-  ref:        string
-  label:      string | null
-  color:      string
+  id: number
+  ref: string
+  label: string | null
+  color: string
   created_at: number
 }
 
 export interface Highlight {
-  ref:   string
+  ref: string
   color: string
-  note:  string | null
+  note: string | null
 }
 
 export interface HistoryEntry {
-  ref:        string
+  ref: string
   visited_at: number
 }
 
 export interface StudySession {
-  id:         number
-  name:       string
+  id: number
+  name: string
   state_json: string
   created_at: number
   updated_at: number
 }
 
 export interface Place {
-  id:        number
-  name:      string
-  latitude:  number
+  id: number
+  name: string
+  latitude: number
   longitude: number
   reference: string | null
 }
 
 export interface Translation {
-  id:   string
+  id: string
   name: string
 }
 

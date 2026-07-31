@@ -1,4 +1,4 @@
-import { clsx, type ClassValue } from 'clsx'
+import { type ClassValue, clsx } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 
 /** Merge Tailwind class names safely — handles conflicts, conditionals, arrays. */
@@ -26,7 +26,7 @@ export function truncate(s: string, maxLen: number) {
 /** Convert a Unix timestamp to a human-readable relative string. */
 export function relativeTime(unix: number) {
   const diff = Date.now() / 1000 - unix
-  if (diff < 60)   return 'just now'
+  if (diff < 60) return 'just now'
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
   return `${Math.floor(diff / 86400)}d ago`

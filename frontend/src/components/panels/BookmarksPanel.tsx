@@ -1,14 +1,14 @@
 /**
  * BookmarksPanel — lists the user's bookmarks, navigate or delete each one.
  */
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Bookmark, Trash2, ChevronRight } from 'lucide-react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Bookmark, ChevronRight, Trash2 } from 'lucide-react'
+import { bookmarks as bookmarksApi } from '@/lib/api'
+import type { Bookmark as BookmarkType } from '@/lib/types'
+import { relativeTime } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth'
 import { useReaderStore } from '@/stores/reader'
 import { useUiStore } from '@/stores/ui'
-import { bookmarks as bookmarksApi } from '@/lib/api'
-import { relativeTime } from '@/lib/utils'
-import type { Bookmark as BookmarkType } from '@/lib/types'
 
 export function BookmarksPanel() {
   const { token } = useAuthStore()
@@ -18,12 +18,12 @@ export function BookmarksPanel() {
 
   const { data = [], isLoading } = useQuery({
     queryKey: ['bookmarks'],
-    queryFn: () => bookmarksApi.list(token!),
+    queryFn: () => bookmarksApi.list(token ?? ''),
     enabled: !!token,
   })
 
   const remove = useMutation({
-    mutationFn: (id: number) => bookmarksApi.remove(id, token!),
+    mutationFn: (id: number) => bookmarksApi.remove(id, token ?? ''),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['bookmarks'] }),
     onError: () => toast('Could not remove bookmark', 'error'),
   })
@@ -31,31 +31,33 @@ export function BookmarksPanel() {
   function goTo(bm: BookmarkType) {
     // ref format: "BookName chapter:verse"
     const m = bm.ref.match(/^(.+)\s+(\d+):(\d+)$/)
-    if (m) navigate(parseInt(m[2]), parseInt(m[3]))   // book num not in ref — chapter nav sufficient
+    if (m) navigate(parseInt(m[2], 10), parseInt(m[3], 10)) // book num not in ref — chapter nav sufficient
     closePanel()
   }
 
   if (isLoading) return <PanelSkeleton />
 
-  if (!data.length) return (
-    <div className="flex flex-col items-center justify-center gap-3 py-12 text-text-muted">
-      <Bookmark className="h-10 w-10 opacity-30" />
-      <p className="text-sm">No bookmarks yet.</p>
-      <p className="text-xs">Long-press a verse to bookmark it.</p>
-    </div>
-  )
+  if (!data.length)
+    return (
+      <div className="flex flex-col items-center justify-center gap-3 py-12 text-text-muted">
+        <Bookmark className="h-10 w-10 opacity-30" />
+        <p className="text-sm">No bookmarks yet.</p>
+        <p className="text-xs">Long-press a verse to bookmark it.</p>
+      </div>
+    )
 
   return (
     <ul className="space-y-1">
       {data.map((bm) => (
-        <li key={bm.id}
+        <li
+          key={bm.id}
           className="flex items-center gap-2 rounded-lg px-3 py-2.5 hover:bg-bg-elevated group"
         >
           {/* Colour swatch */}
           <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: bm.color }} />
 
           {/* Ref + timestamp */}
-          <button className="flex-1 text-left" onClick={() => goTo(bm)}>
+          <button type="button" className="flex-1 text-left" onClick={() => goTo(bm)}>
             <p className="text-sm font-medium text-text-primary">{bm.ref}</p>
             {bm.label && <p className="text-xs text-text-muted truncate">{bm.label}</p>}
             <p className="text-xs text-text-muted">{relativeTime(bm.created_at)}</p>
@@ -66,6 +68,7 @@ export function BookmarksPanel() {
 
           {/* Delete */}
           <button
+            type="button"
             onClick={() => remove.mutate(bm.id)}
             className="text-text-muted hover:text-red-400 transition-colors"
             title="Remove bookmark"
@@ -81,7 +84,7 @@ export function BookmarksPanel() {
 function PanelSkeleton() {
   return (
     <div className="space-y-2">
-      {[1,2,3,4].map(i => (
+      {[1, 2, 3, 4].map((i) => (
         <div key={i} className="loading-shimmer h-14 rounded-lg" />
       ))}
     </div>

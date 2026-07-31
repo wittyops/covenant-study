@@ -1,22 +1,26 @@
 import { useForm } from '@tanstack/react-form'
 import { z } from 'zod'
-import { useAuthStore } from '@/stores/auth'
-import { useUiStore } from '@/stores/ui'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { useAuthStore } from '@/stores/auth'
+import { useUiStore } from '@/stores/ui'
 
-const registerSchema = z.object({
-  username:    z.string().min(3, 'Min 3 characters').max(32, 'Max 32 characters'),
-  displayName: z.string(),
-  password:    z.string().min(8, 'Min 8 characters'),
-  confirm:     z.string(),
-}).refine((d) => d.password === d.confirm, {
-  message: 'Passwords do not match',
-  path: ['confirm'],
-})
+const registerSchema = z
+  .object({
+    username: z.string().min(3, 'Min 3 characters').max(32, 'Max 32 characters'),
+    displayName: z.string(),
+    password: z.string().min(8, 'Min 8 characters'),
+    confirm: z.string(),
+  })
+  .refine((d) => d.password === d.confirm, {
+    message: 'Passwords do not match',
+    path: ['confirm'],
+  })
 
-interface Props { onSwitchToLogin: () => void }
+interface Props {
+  onSwitchToLogin: () => void
+}
 
 export function RegisterForm({ onSwitchToLogin }: Props) {
   const { register, loading } = useAuthStore()
@@ -36,7 +40,10 @@ export function RegisterForm({ onSwitchToLogin }: Props) {
 
   return (
     <form
-      onSubmit={(e) => { e.preventDefault(); form.handleSubmit() }}
+      onSubmit={(e) => {
+        e.preventDefault()
+        form.handleSubmit()
+      }}
       className="space-y-4"
     >
       <h2 className="text-xl font-semibold text-text-primary">Create account</h2>
@@ -53,7 +60,9 @@ export function RegisterForm({ onSwitchToLogin }: Props) {
               onChange={(e) => field.handleChange(e.target.value)}
             />
             {field.state.meta.errors.length > 0 && (
-              <p className="text-xs text-red-400">{field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}</p>
+              <p className="text-xs text-red-400">
+                {field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}
+              </p>
             )}
           </div>
         )}
@@ -62,7 +71,9 @@ export function RegisterForm({ onSwitchToLogin }: Props) {
       <form.Field name="displayName">
         {(field) => (
           <div className="space-y-1">
-            <Label htmlFor="reg-display">Display name <span className="text-text-muted">(optional)</span></Label>
+            <Label htmlFor="reg-display">
+              Display name <span className="text-text-muted">(optional)</span>
+            </Label>
             <Input
               id="reg-display"
               autoComplete="name"
@@ -87,7 +98,9 @@ export function RegisterForm({ onSwitchToLogin }: Props) {
               onChange={(e) => field.handleChange(e.target.value)}
             />
             {field.state.meta.errors.length > 0 && (
-              <p className="text-xs text-red-400">{field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}</p>
+              <p className="text-xs text-red-400">
+                {field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}
+              </p>
             )}
           </div>
         )}
@@ -106,7 +119,9 @@ export function RegisterForm({ onSwitchToLogin }: Props) {
               onChange={(e) => field.handleChange(e.target.value)}
             />
             {field.state.meta.errors.length > 0 && (
-              <p className="text-xs text-red-400">{field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}</p>
+              <p className="text-xs text-red-400">
+                {field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}
+              </p>
             )}
           </div>
         )}

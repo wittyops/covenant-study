@@ -10,10 +10,10 @@ import { persist } from 'zustand/middleware'
 
 interface ReaderState {
   // ── Persisted position ────────────────────────────────────────────────
-  book:        number       // 1–66
-  chapter:     number       // 1–150
-  verse:       number | null
-  translation: string       // translation key, e.g. 'KJV'
+  book: number // 1–66
+  chapter: number // 1–150
+  verse: number | null
+  translation: string // translation key, e.g. 'KJV'
 
   // ── Active Strong's word (session-only) ───────────────────────────────
   activeStrongs: string | null
@@ -30,20 +30,30 @@ interface ReaderState {
 export const useReaderStore = create<ReaderState>()(
   persist(
     (set) => ({
-      book:          1,
-      chapter:       1,
-      verse:         null,
-      translation:   'KJV',
+      book: 1,
+      chapter: 1,
+      verse: null,
+      translation: 'KJV',
       activeStrongs: null,
 
-      setBook(book)           { set({ book, chapter: 1, verse: null, activeStrongs: null }) },
-      setChapter(chapter)     { set({ chapter, verse: null, activeStrongs: null }) },
-      setVerse(verse)         { set({ verse }) },
-      setTranslation(t)       { set({ translation: t }) },
+      setBook(book) {
+        set({ book, chapter: 1, verse: null, activeStrongs: null })
+      },
+      setChapter(chapter) {
+        set({ chapter, verse: null, activeStrongs: null })
+      },
+      setVerse(verse) {
+        set({ verse })
+      },
+      setTranslation(t) {
+        set({ translation: t })
+      },
       navigate(book, chapter, verse?) {
         set({ book, chapter, verse: verse ?? null, activeStrongs: null })
       },
-      openStrongs(number)     { set({ activeStrongs: number }) },
+      openStrongs(number) {
+        set({ activeStrongs: number })
+      },
     }),
     {
       name: 'covenant-reader',

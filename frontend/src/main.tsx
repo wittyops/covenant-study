@@ -4,9 +4,10 @@
  * Sets up React Query's query client (manages all server-state caching)
  * before mounting the app tree.
  */
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import App from './App'
 import './index.css'
 

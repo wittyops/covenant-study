@@ -12,25 +12,34 @@
  *
  * Tool panels (bookmarks, notes, etc.) slide in from the right via Sheet.
  */
+
+import {
+  Bookmark,
+  BookOpen,
+  ChevronLeft,
+  ChevronRight,
+  Clock,
+  Highlighter,
+  LogOut,
+  Map as MapIcon,
+  StickyNote,
+  User as UserIcon,
+} from 'lucide-react'
 import { useState } from 'react'
-import { useReaderStore } from '@/stores/reader'
-import { useAuthStore } from '@/stores/auth'
-import { useUiStore } from '@/stores/ui'
-import { ChapterView } from '@/components/reader/ChapterView'
-import { BookPicker } from '@/components/reader/BookPicker'
-import { TranslationPicker } from '@/components/reader/TranslationPicker'
 import { AuthGate } from '@/components/auth/AuthGate'
 import { BookmarksPanel } from '@/components/panels/BookmarksPanel'
-import { NotesPanel } from '@/components/panels/NotesPanel'
 import { HighlightsPanel } from '@/components/panels/HighlightsPanel'
 import { HistoryPanel } from '@/components/panels/HistoryPanel'
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { NotesPanel } from '@/components/panels/NotesPanel'
+import { BookPicker } from '@/components/reader/BookPicker'
+import { ChapterView } from '@/components/reader/ChapterView'
+import { TranslationPicker } from '@/components/reader/TranslationPicker'
 import { Button } from '@/components/ui/button'
-import {
-  BookOpen, ChevronLeft, ChevronRight, Bookmark, StickyNote,
-  Highlighter, Clock, Map, LogOut, User as UserIcon,
-} from 'lucide-react'
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import type { PanelId } from '@/lib/types'
+import { useAuthStore } from '@/stores/auth'
+import { useReaderStore } from '@/stores/reader'
+import { useUiStore } from '@/stores/ui'
 
 export default function App() {
   return (
@@ -49,8 +58,12 @@ function ReaderShell() {
 
   // Look up chapter count from books query — for now cap nav at 150
   // (TODO: pull from useQuery(['books']) and find the matching book)
-  function prevChapter() { if (chapter > 1) setChapter(chapter - 1) }
-  function nextChapter() { setChapter(chapter + 1) }
+  function prevChapter() {
+    if (chapter > 1) setChapter(chapter - 1)
+  }
+  function nextChapter() {
+    setChapter(chapter + 1)
+  }
 
   async function handleLogout() {
     await logout()
@@ -59,7 +72,6 @@ function ReaderShell() {
 
   return (
     <div className="flex h-screen flex-col bg-bg-base overflow-hidden">
-
       {/* ── Header ─────────────────────────────────────────────────── */}
       <header className="flex items-center gap-2 border-b border-bg-overlay bg-bg-surface px-4 py-2 shrink-0">
         {/* Book picker trigger */}
@@ -101,17 +113,17 @@ function ReaderShell() {
             className="gap-1.5"
           >
             <UserIcon className="h-4 w-4" />
-            <span className="hidden sm:inline text-sm">
-              {user?.display_name ?? user?.username}
-            </span>
+            <span className="hidden sm:inline text-sm">{user?.display_name ?? user?.username}</span>
           </Button>
 
           {userMenuOpen && (
             <div
+              role="menu"
               className="absolute right-0 top-full z-50 mt-1 w-44 rounded-lg border border-bg-overlay bg-bg-surface py-1 shadow-xl"
               onMouseLeave={() => setUserMenuOpen(false)}
             >
               <button
+                type="button"
                 className="flex w-full items-center gap-2 px-3 py-2 text-sm text-text-secondary hover:bg-bg-elevated hover:text-text-primary"
                 onClick={handleLogout}
               >
@@ -125,7 +137,6 @@ function ReaderShell() {
 
       {/* ── Body ───────────────────────────────────────────────────── */}
       <div className="flex flex-1 overflow-hidden">
-
         {/* Chapter content */}
         <main className="flex-1 overflow-y-auto px-6 py-8 max-w-3xl mx-auto w-full">
           <ChapterView />
@@ -136,12 +147,14 @@ function ReaderShell() {
           {TOOL_BUTTONS.map(({ id, icon: Icon, label }) => (
             <button
               key={id}
+              type="button"
               title={label}
               onClick={() => togglePanel(id)}
               className={`flex h-9 w-9 items-center justify-center rounded transition-colors
-                ${activePanel === id
-                  ? 'bg-gold-subtle text-gold'
-                  : 'text-text-muted hover:text-text-primary hover:bg-bg-elevated'
+                ${
+                  activePanel === id
+                    ? 'bg-gold-subtle text-gold'
+                    : 'text-text-muted hover:text-text-primary hover:bg-bg-elevated'
                 }`}
             >
               <Icon className="h-4 w-4" />
@@ -166,18 +179,18 @@ function ReaderShell() {
 
 // Panel titles shown in the Sheet header
 const PANEL_META: Record<string, string> = {
-  bookmarks:  'Bookmarks',
-  notes:      'Notes',
+  bookmarks: 'Bookmarks',
+  notes: 'Notes',
   highlights: 'Highlights',
-  history:    'Reading History',
+  history: 'Reading History',
 }
 
 // Renders the correct panel content inside the Sheet
 function PanelContent({ id }: { id: PanelId }) {
-  if (id === 'bookmarks')  return <BookmarksPanel />
-  if (id === 'notes')      return <NotesPanel />
+  if (id === 'bookmarks') return <BookmarksPanel />
+  if (id === 'notes') return <NotesPanel />
   if (id === 'highlights') return <HighlightsPanel />
-  if (id === 'history')    return <HistoryPanel />
+  if (id === 'history') return <HistoryPanel />
   return null
 }
 
@@ -185,7 +198,12 @@ function PanelContent({ id }: { id: PanelId }) {
 function ToolSheet() {
   const { activePanel, sidebarOpen, closePanel } = useUiStore()
   return (
-    <Sheet open={sidebarOpen} onOpenChange={(open) => { if (!open) closePanel() }}>
+    <Sheet
+      open={sidebarOpen}
+      onOpenChange={(open) => {
+        if (!open) closePanel()
+      }}
+    >
       <SheetContent side="right" className="w-[340px] overflow-y-auto pb-10">
         <SheetHeader>
           <SheetTitle>{activePanel ? (PANEL_META[activePanel] ?? 'Tools') : 'Tools'}</SheetTitle>
@@ -200,11 +218,11 @@ function ToolSheet() {
 
 // Tool rail button definitions
 const TOOL_BUTTONS = [
-  { id: 'bookmarks'  as const, icon: Bookmark,    label: 'Bookmarks'  },
-  { id: 'notes'      as const, icon: StickyNote,  label: 'Notes'      },
+  { id: 'bookmarks' as const, icon: Bookmark, label: 'Bookmarks' },
+  { id: 'notes' as const, icon: StickyNote, label: 'Notes' },
   { id: 'highlights' as const, icon: Highlighter, label: 'Highlights' },
-  { id: 'history'    as const, icon: Clock,       label: 'History'    },
-  { id: 'map'        as const, icon: Map,         label: 'Bible Map'  },
+  { id: 'history' as const, icon: Clock, label: 'History' },
+  { id: 'map' as const, icon: MapIcon, label: 'Bible Map' },
 ]
 
 // Minimal toast renderer — replaces Alpine's $store.ui.toasts
@@ -213,23 +231,24 @@ function ToastStack() {
   if (!toasts.length) return null
 
   const colourMap: Record<string, string> = {
-    info:    'bg-bg-elevated border-bg-overlay text-text-primary',
+    info: 'bg-bg-elevated border-bg-overlay text-text-primary',
     success: 'bg-bg-elevated border-gold       text-gold',
-    error:   'bg-bg-elevated border-red-700    text-red-400',
+    error: 'bg-bg-elevated border-red-700    text-red-400',
     warning: 'bg-bg-elevated border-gold-muted text-gold',
   }
 
   return (
     <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">
       {toasts.map((t) => (
-        <div
+        <button
           key={t.id}
+          type="button"
           className={`flex items-center gap-2 rounded-lg border px-4 py-2.5 text-sm shadow-xl
             animate-fade-in ${colourMap[t.type] ?? colourMap.info}`}
           onClick={() => dismissToast(t.id)}
         >
           {t.message}
-        </div>
+        </button>
       ))}
     </div>
   )
