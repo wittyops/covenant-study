@@ -52,6 +52,12 @@ export interface CrossRef {
   to_book_name: string
 }
 
+export interface TaggedWord {
+  text:    string
+  strongs: string
+  morph:   string
+}
+
 export interface InterlinearWord {
   position:   number
   original:   string

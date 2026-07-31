@@ -151,6 +151,20 @@ async def fragment_books():
 # CHAPTER — verse display
 # ===========================================================================
 
+@router.get("/chapter/words")
+async def fragment_chapter_words(
+    book:    int = Query(..., ge=1, le=66),
+    chapter: int = Query(..., ge=1),
+):
+    """JSON word-tagging data for the React SPA ChapterView.
+
+    Returns {verse_num_str: [{text, strongs, morph}, ...]} sourced from the
+    same _load_tagged_words pipeline used by the htmx fragment renderer.
+    Int dict keys become JSON string keys, so TypeScript uses Record<string, ...>.
+    """
+    return _load_tagged_words(book, chapter)
+
+
 @router.get("/chapter", response_class=HTMLResponse)
 async def fragment_chapter(
     book:        str  = Query("Genesis"),

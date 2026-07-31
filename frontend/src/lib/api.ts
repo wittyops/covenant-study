@@ -12,7 +12,7 @@
 
 import type {
   BookInfo, ChapterResponse, StrongsEntry, CrossRef, InterlinearWord,
-  Bookmark, Highlight, HistoryEntry, StudySession, Place, Translation, User, Verse,
+  Bookmark, Highlight, HistoryEntry, StudySession, Place, Translation, User, Verse, TaggedWord,
 } from './types'
 
 // ─── Core fetch wrapper ────────────────────────────────────────────────────
@@ -99,6 +99,11 @@ export const bible = {
   interlinear(book: number, chapter: number, token?: string | null) {
     const qs = new URLSearchParams({ book: String(book), chapter: String(chapter) })
     return apiFetch<InterlinearWord[]>(`/api/bible/interlinear?${qs}`, { token })
+  },
+
+  chapterWords(book: number, chapter: number, token?: string | null) {
+    const qs = new URLSearchParams({ book: String(book), chapter: String(chapter) })
+    return apiFetch<Record<string, TaggedWord[]>>(`/fragments/chapter/words?${qs}`, { token })
   },
 
   places(token?: string | null) {
