@@ -22,6 +22,7 @@ import time
 import traceback
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import quote as url_quote
 
 import requests
 
@@ -1303,7 +1304,7 @@ def build_lxx() -> None:
             rows: list = []
             for chap in range(1, _BRENTON_MAX_CHAPTERS + 1):
                 url = _BRENTON_RAW_BASE.format(
-                    book=requests.utils.quote(book_dir, safe=""),
+                    book=url_quote(book_dir, safe=""),
                     chap=chap,
                 )
                 try:
