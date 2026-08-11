@@ -1182,6 +1182,221 @@ def build_commentary() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 8 — LXX (Brenton English Septuagint + FreLXXGiguet → bible_multi.db)
+# ---------------------------------------------------------------------------
+
+# Map wldeh/bible-api Brenton directory names → Protestant canonical book IDs.
+# The LXX uses Greek transliterations of Hebrew names; deuterocanonical books
+# (Baruch, Maccabees, Tobit, Judith, Wisdom, Sirach, etc.) are not in BOOKS
+# (1-66) and are silently skipped.
+# Notes on gaps:
+#   Nehemiah (16) — included within "ezra" as Esdras B in this dataset
+#   Daniel (27)   — scattered across susanna/belandthedragon; skipped here
+_LXX_BRENTON_TO_BOOKID: dict[str, int] = {
+    "genesis": 1,   "exodus": 2,    "leviticus": 3,  "numbers": 4,   "deuteronomy": 5,
+    "joshua": 6,    "judges": 7,    "ruth": 8,
+    # LXX calls 1-2 Samuel "Kings I-II" and 1-2 Kings "Kings III-IV"
+    "kingsi": 9,    "kingsii": 10,  "kingsiii": 11,  "kingsiv": 12,
+    "chroniclesi": 13, "chroniclesii": 14,
+    "ezra": 15,          # Esdras B in LXX contains Ezra + Nehemiah text
+    "esther(greek)": 17, # Greek Esther (longer than Hebrew; includes Greek additions)
+    "job": 18,
+    "psalms": 19,        # LXX has 151 Psalms; Ps 151 stored as chapter 151
+    "proverbs": 20, "ecclesiastes": 21, "thesongofsolomon": 22,
+    "esaias": 23,        # Isaiah (Greek: Ēsaias)
+    "jeremias": 24,      # Jeremiah (Greek: Ieremias)
+    "lamentations": 25,
+    "jezekiel": 26,      # Ezekiel (Greek: Iezekiēl)
+    "osee": 28,          # Hosea (Greek: Ōsēe)
+    "joel": 29,   "amos": 30,
+    "obdias": 31,        # Obadiah (Greek: Obdias)
+    "jonas": 32,         # Jonah (Greek: Ionas)
+    "michæas": 33,       # Micah (Greek: Michaias)
+    "naum": 34,          # Nahum (Greek)
+    "ambacum": 35,       # Habakkuk (Greek: Ambakoum)
+    "sophonias": 36,     # Zephaniah (Greek: Sophonias)
+    "aggæus": 37,        # Haggai (Greek: Aggaios)
+    "zacharias": 38,     # Zechariah (Greek: Zacharias)
+    "malachias": 39,     # Malachi (Greek: Malachias)
+}
+
+# Map FreLXXGiguet book names (English labels, LXX canonical order) → Protestant IDs.
+_LXX_GIGUET_NAME_TO_ID: dict[str, int] = {
+    "Genesis": 1,  "Exodus": 2,  "Leviticus": 3,  "Numbers": 4,  "Deuteronomy": 5,
+    "Joshua": 6,   "Judges": 7,  "Ruth": 8,
+    "I Samuel": 9, "II Samuel": 10, "I Kings": 11, "II Kings": 12,
+    "I Chronicles": 13, "II Chronicles": 14,
+    "Ezra": 15,    "Nehemiah": 16, "Esther": 17,
+    "Job": 18,     "Psalms": 19, "Proverbs": 20, "Ecclesiastes": 21,
+    "Song of Solomon": 22,
+    "Isaiah": 23,  "Jeremiah": 24, "Lamentations": 25, "Ezekiel": 26, "Daniel": 27,
+    "Hosea": 28,   "Joel": 29,   "Amos": 30,    "Obadiah": 31,  "Jonah": 32,
+    "Micah": 33,   "Nahum": 34,  "Habakkuk": 35, "Zephaniah": 36,
+    "Haggai": 37,  "Zechariah": 38, "Malachi": 39,
+    # NT — FreLXXGiguet bundles a French NT alongside the LXX OT
+    "Matthew": 40,  "Mark": 41,  "Luke": 42,  "John": 43,  "Acts": 44,
+    "Romans": 45,
+    "I Corinthians": 46, "II Corinthians": 47,
+    "Galatians": 48, "Ephesians": 49, "Philippians": 50, "Colossians": 51,
+    "I Thessalonians": 52, "II Thessalonians": 53,
+    "I Timothy": 54, "II Timothy": 55,
+    "Titus": 56,   "Philemon": 57, "Hebrews": 58, "James": 59,
+    "I Peter": 60, "II Peter": 61,
+    "I John": 62,  "II John": 63, "III John": 64,
+    "Jude": 65,    "Revelation": 66,
+    # Deuterocanonical/Apocryphal books — intentionally absent (no ID)
+    # I Esdras, Judith, Tobit, I-IV Maccabees, Wisdom, Sirach,
+    # Prayer of Manasses, Psalms of Solomon, Baruch, Epistle of Jeremiah
+}
+
+_BRENTON_RAW_BASE = (
+    "https://raw.githubusercontent.com/wldeh/bible-api/main"
+    "/bibles/en-engbrent/books/{book}/chapters/{chap}.json"
+)
+_LXX_GIGUET_JSON_URL = (
+    "https://raw.githubusercontent.com/scrollmapper/bible_databases"
+    "/master/formats/json/FreLXXGiguet.json"
+)
+_BRENTON_MAX_CHAPTERS = 155  # Psalms 151 is the longest book; generous headroom
+
+
+def build_lxx() -> None:
+    """Import the Septuagint (LXX) into bible_multi.db.
+
+    Adds two translations:
+      Brenton   — Brenton English Septuagint (Sir Lancelot Brenton, 1844; public domain)
+                  Source: github.com/wldeh/bible-api  (per-chapter JSON)
+      FreLXXGiguet — French LXX by P. Giguet et al. (1872; public domain)
+                  Source: scrollmapper/bible_databases (single JSON)
+
+    Only books that map to the Protestant 66-book canon are imported.
+    Deuterocanonical books (Maccabees, Tobit, Judith, Wisdom, etc.) are logged.
+    """
+    print("\n=== Step 8: LXX (Brenton + FreLXXGiguet) ===", flush=True)
+
+    out_path = DATA / "bible_multi.db"
+    if not out_path.exists():
+        print("  bible_multi.db not found — run multi_translation step first.", flush=True)
+        return
+
+    con = sqlite3.connect(str(out_path))
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+
+    insert_sql = "INSERT OR IGNORE INTO verses(translation, b, c, v, t) VALUES(?,?,?,?,?)"
+
+    # ------------------------------------------------------------------
+    # A) Brenton English Septuagint
+    # ------------------------------------------------------------------
+    brenton_have = con.execute(
+        "SELECT COUNT(*) FROM verses WHERE translation='Brenton'"
+    ).fetchone()[0]
+
+    if brenton_have > 0:
+        print(f"  Brenton already present ({brenton_have:,} verses) — skipping.", flush=True)
+    else:
+        print("  Fetching Brenton English Septuagint (per-chapter, ~740 requests) …", flush=True)
+        brenton_total = 0
+        skipped_books = []
+
+        for book_dir, book_id in _LXX_BRENTON_TO_BOOKID.items():
+            rows: list = []
+            for chap in range(1, _BRENTON_MAX_CHAPTERS + 1):
+                url = _BRENTON_RAW_BASE.format(
+                    book=requests.utils.quote(book_dir, safe=""),
+                    chap=chap,
+                )
+                try:
+                    r = requests.get(url, timeout=20)
+                    if r.status_code == 404:
+                        break  # past last chapter of this book
+                    r.raise_for_status()
+                    for entry in r.json().get("data", []):
+                        v_num = entry.get("verse")
+                        text = (entry.get("text") or "").strip()
+                        if v_num and text:
+                            rows.append(("Brenton", book_id, chap, int(v_num), text))
+                except Exception as exc:
+                    print(f"    WARN {book_dir} ch{chap}: {exc}", flush=True)
+                    break
+                time.sleep(0.05)
+
+            if rows:
+                con.executemany(insert_sql, rows)
+                con.commit()
+                brenton_total += len(rows)
+                print(f"    {book_dir} (→ book {book_id}): {len(rows)} verses", flush=True)
+            else:
+                skipped_books.append(book_dir)
+
+        final_brenton = con.execute(
+            "SELECT COUNT(*) FROM verses WHERE translation='Brenton'"
+        ).fetchone()[0]
+        print(f"  Brenton: {final_brenton:,} verses imported", flush=True)
+        if skipped_books:
+            print(f"  Brenton books with no data: {skipped_books}", flush=True)
+
+    # ------------------------------------------------------------------
+    # B) FreLXXGiguet — French Septuagint (single JSON download)
+    # ------------------------------------------------------------------
+    giguet_have = con.execute(
+        "SELECT COUNT(*) FROM verses WHERE translation='FreLXXGiguet'"
+    ).fetchone()[0]
+
+    if giguet_have > 0:
+        print(f"  FreLXXGiguet already present ({giguet_have:,} verses) — skipping.", flush=True)
+    else:
+        print("  Fetching FreLXXGiguet (single JSON) …", flush=True)
+        try:
+            resp = requests.get(_LXX_GIGUET_JSON_URL, timeout=60)
+            resp.raise_for_status()
+            gig_data = resp.json()
+        except Exception as exc:
+            print(f"  ERROR downloading FreLXXGiguet: {exc}", flush=True)
+            con.close()
+            return
+
+        giguet_rows: list = []
+        giguet_skipped: list = []
+        giguet_total = 0
+
+        for book_obj in gig_data.get("books", []):
+            book_name = book_obj.get("name", "")
+            book_id = _LXX_GIGUET_NAME_TO_ID.get(book_name)
+            if not book_id:
+                giguet_skipped.append(book_name)
+                continue
+            for chap_obj in book_obj.get("chapters", []):
+                chap_num = chap_obj.get("chapter")
+                if chap_num is None:
+                    continue
+                for verse_obj in chap_obj.get("verses", []):
+                    v_num = verse_obj.get("verse")
+                    text = (verse_obj.get("text") or "").strip()
+                    if v_num and text:
+                        giguet_rows.append(("FreLXXGiguet", book_id, chap_num, v_num, text))
+                        if len(giguet_rows) >= 10_000:
+                            con.executemany(insert_sql, giguet_rows)
+                            giguet_total += len(giguet_rows)
+                            giguet_rows.clear()
+
+        if giguet_rows:
+            con.executemany(insert_sql, giguet_rows)
+            giguet_total += len(giguet_rows)
+        con.commit()
+
+        final_giguet = con.execute(
+            "SELECT COUNT(*) FROM verses WHERE translation='FreLXXGiguet'"
+        ).fetchone()[0]
+        print(f"  FreLXXGiguet: {final_giguet:,} verses imported", flush=True)
+        if giguet_skipped:
+            deutero = sorted(set(giguet_skipped))
+            print(f"  FreLXXGiguet skipped (deuterocanonical/unmapped): {deutero}", flush=True)
+
+    con.close()
+
+
+# ---------------------------------------------------------------------------
 # Step 7 — bible_multi (all translations → bible_multi.db)
 # ---------------------------------------------------------------------------
 
@@ -1375,6 +1590,7 @@ def main() -> None:
         ("interlinear",       build_interlinear),
         ("commentary",        build_commentary),
         ("multi_translation", build_multi_translation),
+        ("lxx",               build_lxx),
     ]
 
     results: dict[str, str] = {}

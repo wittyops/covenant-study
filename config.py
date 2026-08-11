@@ -83,6 +83,9 @@ TRANSLATIONS: list[str] = [
     "RWebster", "Rotherham", "NHEB", "LEB", "Anderson", "Noyes", "Haweis", "Twenty",
     # Scholarly originals
     "JPS", "HebModern", "Vulgate", "VulgClementine", "Peshitta", "TR", "Byz",
+    # Septuagint (LXX) — Greek OT used by the New Testament writers
+    "Brenton",       # Brenton English Septuagint (1844) — public domain
+    "FreLXXGiguet",  # Giguet French Septuagint (1872) — public domain
     # Other languages
     "FreSynodale", "FreGeneve",
 ]

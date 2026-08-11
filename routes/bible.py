@@ -256,9 +256,27 @@ async def health():
     """
     from config import USERDATA, NOTES
     multi = (DATA / "bible_multi.db").exists()
+    lxx_brenton = False
+    lxx_giguet  = False
+    if multi:
+        try:
+            from database import get_db
+            conn, _ = get_db()
+            if conn:
+                lxx_brenton = bool(conn.execute(
+                    "SELECT 1 FROM verses WHERE translation='Brenton' LIMIT 1"
+                ).fetchone())
+                lxx_giguet = bool(conn.execute(
+                    "SELECT 1 FROM verses WHERE translation='FreLXXGiguet' LIMIT 1"
+                ).fetchone())
+                conn.close()
+        except Exception:
+            pass
     return {
         "db":              multi or (DATA / "kjv.db").exists(),
         "multi_translation": multi,
+        "lxx_brenton":     lxx_brenton,
+        "lxx_giguet":      lxx_giguet,
         "strongs":         (DATA / "strongs.db").exists(),
         "crossrefs":       (DATA / "cross_references.db").exists(),
         "interlinear":     (DATA / "interlinear.db").exists(),
