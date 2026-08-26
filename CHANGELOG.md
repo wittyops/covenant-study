@@ -8,6 +8,12 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+- Brenton English Septuagint (LXX, 1844) as a translation source, public domain
+
+### Note
+- FreLXXGiguet (French LXX) was added and then removed in the same window; it is not an available translation
+
 ## [3.1.0] — 2026-07-31
 
 ### Added

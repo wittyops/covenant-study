@@ -4,7 +4,7 @@ A self-hosted Bible study platform — built for depth. Strong's concordance, in
 
 ## Features
 
-- **Scripture** — KJV + 30+ public-domain translations (ASV, YLT, Darby, Vulgate, and more)
+- **Scripture** — KJV + 30+ public-domain translations (ASV, YLT, Darby, Vulgate, and more), plus the Brenton English Septuagint (LXX)
 - **Word tagging** — click any word to open its Strong's entry (Hebrew or Greek)
 - **Interlinear** — original language with transliteration and morphology
 - **Cross-references** — linked verse network drawn from scrollmapper's database
@@ -79,6 +79,7 @@ All Bible content is public domain or CC BY 4.0 and is downloaded at image build
 | Source | Content | License |
 |--------|---------|---------|
 | [scrollmapper/bible_databases](https://github.com/scrollmapper/bible_databases) | KJV + 30+ translations | Public domain |
+| Brenton English Septuagint (1844) | Septuagint (LXX) | Public domain |
 | [tyndale/STEPBible-Data](https://github.com/tyndale/STEPBible-Data) | Hebrew OT + Greek NT interlinear | CC BY 4.0 |
 | [openscriptures/strongs](https://github.com/openscriptures/strongs) | Strong's Hebrew + Greek lexicons | CC BY 4.0 / Public domain |
 
