@@ -22,10 +22,21 @@ import { bible, highlights as highlightsApi } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth'
 import { useReaderStore } from '@/stores/reader'
 import { useUiStore } from '@/stores/ui'
+import { SelectionActionBar } from './SelectionActionBar'
 import { StrongsCard } from './StrongsCard'
 
 export function ChapterView() {
-  const { book, chapter, translation, setVerse, openStrongs, activeStrongs } = useReaderStore()
+  const {
+    book,
+    chapter,
+    translation,
+    verse: selectedVerse,
+    selectionEnd,
+    setVerse,
+    selectVerseNumber,
+    openStrongs,
+    activeStrongs,
+  } = useReaderStore()
   const { token } = useAuthStore()
   const { toast } = useUiStore()
   const containerRef = useRef<HTMLElement>(null)
@@ -68,19 +79,46 @@ export function ChapterView() {
     return m
   }, [allHighlights, data?.book_name, chapter])
 
-  // ── Delegated handler — catches [data-verse] and [data-strongs] ──────────
+  // ── Delegated handler — catches [data-verse-number], [data-verse], [data-strongs] ──
   // Shared by onClick + onKeyDown so keyboard users can select verses and words.
+  //
+  // [data-verse-number] (the small superscript verse number) is checked FIRST
+  // and, if matched, short-circuits the rest: tapping the number is the
+  // range-selection gesture (selectVerseNumber) and must never also fire the
+  // single-verse-select-and-maybe-open-Strong's behavior below, even though
+  // the number sits inside the same [data-verse] wrapper.
+  //
+  // Tapping anywhere else in the verse (the body text) keeps the original,
+  // unchanged behavior: select just this verse (collapsing any pending
+  // range — see setVerse in reader.ts) and open Strong's if a tagged word
+  // was hit.
   const handleContainerClick = useCallback(
     (e: React.MouseEvent<HTMLElement> | React.KeyboardEvent<HTMLElement>) => {
       if ('key' in e && e.key !== 'Enter' && e.key !== ' ') return
+
+      const numberEl = (e.target as Element).closest('[data-verse-number]') as HTMLElement | null
+      if (numberEl) {
+        selectVerseNumber(Number(numberEl.dataset.verseNumber))
+        return
+      }
+
       const verseEl = (e.target as Element).closest('[data-verse]') as HTMLElement | null
       if (verseEl) setVerse(Number(verseEl.dataset.verse))
 
       const strongsEl = (e.target as Element).closest('[data-strongs]') as HTMLElement | null
       if (strongsEl) openStrongs(strongsEl.dataset.strongs ?? null)
     },
-    [setVerse, openStrongs],
+    [setVerse, selectVerseNumber, openStrongs],
   )
+
+  // Range is always stored as [verse, selectionEnd] in tap order, not
+  // necessarily low-to-high — normalize here for the membership check.
+  const selectionRange = useMemo(() => {
+    if (selectedVerse === null) return null
+    const lo = selectionEnd === null ? selectedVerse : Math.min(selectedVerse, selectionEnd)
+    const hi = selectionEnd === null ? selectedVerse : Math.max(selectedVerse, selectionEnd)
+    return [lo, hi] as const
+  }, [selectedVerse, selectionEnd])
 
   if (isLoading) return <ChapterSkeleton />
   if (isError) {
@@ -115,17 +153,24 @@ export function ChapterView() {
         {data?.verses.map((v) => {
           const words = wordData?.[String(v.verse)]
           const hlColor = highlightMap.get(v.verse)
+          const isSelected =
+            !!selectionRange && v.verse >= selectionRange[0] && v.verse <= selectionRange[1]
 
           return (
             <span
               key={v.verse}
               data-verse={v.verse}
-              className={`cursor-pointer rounded px-0.5 transition-colors hover:bg-bg-elevated${hlColor ? ' verse-highlighted' : ''}`}
+              className={`cursor-pointer rounded px-0.5 transition-colors hover:bg-bg-elevated${hlColor ? ' verse-highlighted' : ''}${isSelected ? ' verse-selected' : ''}`}
               style={
                 hlColor ? ({ '--highlight-color': hlColor } as React.CSSProperties) : undefined
               }
             >
-              <sup className="mr-1 text-xs font-bold text-gold-muted select-none">{v.verse}</sup>
+              <sup
+                data-verse-number={v.verse}
+                className="mr-1 text-xs font-bold text-gold-muted select-none cursor-pointer"
+              >
+                {v.verse}
+              </sup>
               {words?.length
                 ? words.map((w, i) =>
                     w.strongs ? (
@@ -149,6 +194,9 @@ export function ChapterView() {
 
       {/* Strong's lexicon dialog — opens when a tagged word is clicked */}
       {activeStrongs && <StrongsCard number={activeStrongs} onClose={() => openStrongs(null)} />}
+
+      {/* Floating action bar — appears once a verse number is tapped */}
+      {data?.book_name && <SelectionActionBar bookName={data.book_name} chapter={chapter} />}
     </>
   )
 }

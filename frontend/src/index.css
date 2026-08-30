@@ -99,6 +99,15 @@
   padding: 1px 2px;
 }
 
+/* Pending verse-number selection (not yet applied as a highlight/bookmark) —
+   distinct from .verse-highlighted so a saved highlight never looks like an
+   in-progress selection or vice versa. */
+.verse-selected {
+  outline: 2px dashed var(--color-gold);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
 .loading-shimmer {
   border-radius: 0.25rem;
   background: linear-gradient(
