@@ -25,7 +25,12 @@ export function MapsPanel() {
 
   function osmUrl(p: Place) {
     const zoom = 10
-    return `https://www.openstreetmap.org/?mlat=${p.latitude}&mlon=${p.longitude}#map=${zoom}/${p.latitude}/${p.longitude}`
+    // layers=C selects OSM's "Cycle Map" style, which renders major place
+    // names in Latin/English script. The default "Standard" style uses each
+    // place's local-script name tag with no per-URL English override, which
+    // is unreadable for this app's English-speaking audience across most of
+    // the biblical Middle East (Hebrew/Arabic script by default).
+    return `https://www.openstreetmap.org/?mlat=${p.latitude}&mlon=${p.longitude}#map=${zoom}/${p.latitude}/${p.longitude}&layers=C`
   }
 
   return (
