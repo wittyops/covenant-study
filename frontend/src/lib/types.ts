@@ -11,7 +11,7 @@ export interface User {
 export interface BookInfo {
   book: number
   name: string
-  testament: 'OT' | 'NT'
+  testament: 'OT' | 'NT' | 'AP'
   chapters: number
 }
 

@@ -1,6 +1,7 @@
 /**
- * BookPicker — slide-in sheet showing the OT/NT book grid.
- * Tabs split Old Testament from New Testament (same structure as the backend's BOOKS list).
+ * BookPicker — slide-in sheet showing the OT/NT/Apocrypha book grid.
+ * Tabs split Old Testament, New Testament, and Apocrypha (same structure as
+ * the backend's BOOKS + APOCRYPHA_BOOKS lists).
  */
 
 import * as TabsPrimitive from '@radix-ui/react-tabs'
@@ -29,6 +30,7 @@ export function BookPicker({ open, onClose }: Props) {
 
   const ot = books.filter((b) => b.testament === 'OT')
   const nt = books.filter((b) => b.testament === 'NT')
+  const ap = books.filter((b) => b.testament === 'AP')
 
   function pickBook(bookNum: number) {
     setBook(bookNum)
@@ -49,7 +51,7 @@ export function BookPicker({ open, onClose }: Props) {
 
         <TabsPrimitive.Root defaultValue="OT" className="mt-4">
           <TabsPrimitive.List className="flex rounded-lg bg-bg-elevated p-1 gap-1 mb-4">
-            {(['OT', 'NT'] as const).map((t) => (
+            {(['OT', 'NT', 'AP'] as const).map((t) => (
               <TabsPrimitive.Trigger
                 key={t}
                 value={t}
@@ -58,7 +60,7 @@ export function BookPicker({ open, onClose }: Props) {
                   'text-text-muted data-[state=active]:bg-bg-overlay data-[state=active]:text-gold',
                 )}
               >
-                {t === 'OT' ? 'Old Testament' : 'New Testament'}
+                {t === 'OT' ? 'Old Testament' : t === 'NT' ? 'New Testament' : 'Apocrypha'}
               </TabsPrimitive.Trigger>
             ))}
           </TabsPrimitive.List>
@@ -66,6 +68,7 @@ export function BookPicker({ open, onClose }: Props) {
           {[
             { value: 'OT', items: ot },
             { value: 'NT', items: nt },
+            { value: 'AP', items: ap },
           ].map(({ value, items }) => (
             <TabsPrimitive.Content key={value} value={value}>
               <div className="grid grid-cols-2 gap-1.5">

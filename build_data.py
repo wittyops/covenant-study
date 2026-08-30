@@ -1356,6 +1356,27 @@ SCROLLMAPPER_BASE = (
     "https://raw.githubusercontent.com/scrollmapper/bible_databases/master/formats/sqlite/"
 )
 
+# KJVA's own book_id scheme inserts its 14 Apocrypha books between the OT and
+# NT (ids 40-53), which shifts its entire NT to ids 54-80. Every other
+# translation in this app uses the Protestant-canon-adjacent scheme (OT 1-39,
+# NT 40-66, Apocrypha appended at 67-80 — see config.APOCRYPHA_BOOKS). Import
+# would otherwise silently misalign KJVA's NT text under the wrong book
+# numbers (e.g. book 40/Matthew would return 1 Esdras). Remap KJVA's raw rows
+# to the app's scheme before insert.
+#   source ids 40-53 (Apocrypha)      -> app ids 67-80  (+27)
+#   source ids 54-80 (NT, shifted)    -> app ids 40-66  (-14)
+#   source ids  1-39 (OT, unaffected) -> unchanged (identity, via .get() fallback)
+_KJVA_REMAP: dict[int, int] = {**{b: b + 27 for b in range(40, 54)}, **{b: b - 14 for b in range(54, 81)}}
+
+
+def _remap_kjva_book_id(book_id: int) -> int:
+    """Translate one KJVA source book_id to this app's book-numbering scheme.
+
+    No-op for ids outside 40-80 (i.e. the OT, ids 1-39, which both schemes
+    already agree on). See _KJVA_REMAP above for the two-range mapping.
+    """
+    return _KJVA_REMAP.get(book_id, book_id)
+
 
 def _detect_verses_table(conn: sqlite3.Connection) -> tuple:
     """Return (table, book_col, chap_col, verse_col, text_col) or all-None on failure."""
@@ -1445,9 +1466,12 @@ def build_multi_translation() -> None:
             ).fetchall()
             src.close()
 
+            # Only KJVA needs remapping — every other scrollmapper translation
+            # already uses this app's book-numbering scheme natively.
+            book_map = _remap_kjva_book_id if display_name == "KJVA" else (lambda b: b)
             con.executemany(
                 "INSERT OR IGNORE INTO verses(translation,b,c,v,t) VALUES(?,?,?,?,?)",
-                [(display_name, r[0], r[1], r[2], r[3]) for r in rows],
+                [(display_name, book_map(r[0]), r[1], r[2], r[3]) for r in rows],
             )
             con.commit()
             count = con.execute(

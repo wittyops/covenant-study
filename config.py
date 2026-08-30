@@ -45,6 +45,27 @@ BOOKS: dict[int, str] = {
     64: "3 John",     65: "Jude",           66: "Revelation",
 }
 
+# Deuterocanonical / Apocrypha books — sourced from KJVA (KJV with Apocrypha).
+# IDs 67-80 continue past the 66-book Protestant canon (OT 1-39, NT 40-66).
+# Order matches KJVA's own book_id scheme in its upstream source (scrollmapper),
+# where these 14 books originally sat at ids 40-53, inserted between Malachi
+# and Matthew. build_data.py's build_multi_translation() remaps KJVA's raw
+# rows from that source scheme to this one at import time — see
+# build_data.py::_KJVA_REMAP / _remap_kjva_book_id() for the exact mapping
+# and the reasoning (the two schemes collide on ids 40-66, which is what
+# made this a real data bug and not just an unclaimed id range).
+APOCRYPHA_BOOKS: dict[int, str] = {
+    67: "1 Esdras",           68: "2 Esdras",
+    69: "Tobit",              70: "Judith",
+    71: "Rest of Esther",     72: "Wisdom of Solomon",
+    73: "Sirach",             74: "Baruch",
+    75: "Song of the Three Holy Children",
+    76: "Susanna",            77: "Bel and the Dragon",
+    78: "Prayer of Manasses",
+    79: "1 Maccabees",        80: "2 Maccabees",
+}
+BOOKS.update(APOCRYPHA_BOOKS)
+
 # Abbreviation → book number mapping used by parse_reference().
 # Longer/exact matches must win over prefix matches, so keep both full
 # lowercase names and common short forms.
@@ -65,6 +86,10 @@ BOOK_ABBR.update({
     "1ti": 54,  "2ti": 55,  "tit": 56,  "phm": 57,
     "heb": 58,  "jas": 59,  "1pe": 60,  "2pe": 61,
     "rev": 66,
+    "1esd": 67, "2esd": 68, "tob": 69,  "jdt": 70,  "esth-gr": 71,
+    "wis": 72,  "sir": 73,  "ecclus": 73, "bar": 74,
+    "song3": 75, "sus": 76, "bel": 77,  "manasses": 78,
+    "1macc": 79, "2macc": 80,
 })
 
 # ---------------------------------------------------------------------------

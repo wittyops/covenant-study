@@ -8,7 +8,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from config import BOOKS, PLACES, DATA
+from config import BOOKS, APOCRYPHA_BOOKS, PLACES, DATA
 from database import (
     get_crossrefs_db,
     get_db,
@@ -570,8 +570,13 @@ async def get_commentary(ref: str = Query(...)):
 # Reverse-lookup: book name → number (used to parse crossref results from DB)
 _BOOK_NUMS: dict[str, int] = {v: k for k, v in BOOKS.items()}
 
-# Testament assignment (OT=1-39, NT=40-66) and canonical chapter counts
-_TESTAMENT: dict[int, str] = {**{i: "OT" for i in range(1, 40)}, **{i: "NT" for i in range(40, 67)}}
+# Testament assignment (OT=1-39, NT=40-66, AP=67-80 deuterocanon/apocrypha)
+# and canonical chapter counts.
+_TESTAMENT: dict[int, str] = {
+    **{i: "OT" for i in range(1, 40)},
+    **{i: "NT" for i in range(40, 67)},
+    **{i: "AP" for i in APOCRYPHA_BOOKS},
+}
 _CHAPTERS: dict[int, int] = {
     1: 50, 2: 40, 3: 27, 4: 36, 5: 34, 6: 24, 7: 21, 8: 4, 9: 31, 10: 24,
     11: 22, 12: 25, 13: 29, 14: 36, 15: 10, 16: 13, 17: 10, 18: 42, 19: 150,
@@ -581,6 +586,10 @@ _CHAPTERS: dict[int, int] = {
     47: 13, 48: 6,  49: 6,  50: 4,  51: 4,  52: 5,  53: 3,  54: 6,  55: 4,
     56: 3,  57: 1,  58: 13, 59: 5,  60: 5,  61: 3,  62: 5,  63: 1,  64: 1,
     65: 1,  66: 22,
+    # Apocrypha — chapter counts confirmed live from bible_multi.db KJVA data
+    # (queried under the pre-remap source IDs 40-53, which map 1:1 to 67-80).
+    67: 9,  68: 16, 69: 14, 70: 16, 71: 16, 72: 19, 73: 51, 74: 6,
+    75: 1,  76: 1,  77: 1,  78: 1,  79: 16, 80: 15,
 }
 
 
@@ -617,7 +626,7 @@ async def react_translations():
 
 @router.get("/api/bible/chapter")
 async def react_chapter(
-    book:        int = Query(..., ge=1, le=66),
+    book:        int = Query(..., ge=1, le=80),
     chapter:     int = Query(..., ge=1),
     translation: str = Query("KJV"),
 ):
@@ -736,7 +745,7 @@ async def react_strongs(number: str):
 
 @router.get("/api/bible/crossrefs")
 async def react_crossrefs(
-    book:    int = Query(..., ge=1, le=66),
+    book:    int = Query(..., ge=1, le=80),
     chapter: int = Query(..., ge=1),
     verse:   int = Query(..., ge=1),
     limit:   int = Query(25, ge=1, le=200),
@@ -772,7 +781,7 @@ async def react_crossrefs(
 
 @router.get("/api/bible/interlinear")
 async def react_interlinear(
-    book:    int = Query(..., ge=1, le=66),
+    book:    int = Query(..., ge=1, le=80),
     chapter: int = Query(..., ge=1),
 ):
     """Interlinear for the React SPA — takes numeric book/chapter, returns InterlinearWord[]."""
