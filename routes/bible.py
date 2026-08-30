@@ -192,20 +192,25 @@ async def get_places(ref: Optional[str] = Query(default=None)):
     Without ref: all known places.
     With ref: only places whose names appear in that passage's KJV text.
     """
+    # Response shape must match frontend/src/lib/types.ts Place[] — a bare
+    # array of {id, name, latitude, longitude, reference}, consumed by
+    # MapsPanel.tsx via bible.places(). This previously drifted out of sync
+    # (an earlier commit switched to {places: [{name, lat, lng, notes}]}
+    # without updating the frontend), which silently broke the Map tool —
+    # fixed 2026-08-30 alongside the LXX/Apocrypha work, discovered while
+    # reconciling drift between this repo and the wn-bible-01 deployment copy.
     if ref is None:
-        return {
-            "places": [
-                {"name": name, "lat": d["lat"], "lng": d["lon"], "notes": d.get("notes", "")}
-                for name, d in PLACES.items()
-            ]
-        }
+        return [
+            {"id": i, "name": name, "latitude": d["lat"], "longitude": d["lon"], "reference": d.get("notes") or None}
+            for i, (name, d) in enumerate(PLACES.items())
+        ]
     conn, multi = get_db()
     if not conn:
-        return {"reference": ref, "places": []}
+        return []
     try:
         book_num, chapter, verse = parse_reference(ref)
         if not book_num:
-            return {"reference": ref, "places": []}
+            return []
         cur = conn.cursor()
         if multi:
             rows = (
@@ -227,11 +232,11 @@ async def get_places(ref: Optional[str] = Query(default=None)):
             )
         passage_text = " ".join(r[0] for r in rows)
         found = [
-            {"name": name, "lat": d["lat"], "lng": d["lon"], "notes": d.get("notes", "")}
-            for name, d in PLACES.items()
+            {"id": i, "name": name, "latitude": d["lat"], "longitude": d["lon"], "reference": d.get("notes") or None}
+            for i, (name, d) in enumerate(PLACES.items())
             if re.search(r"\b" + re.escape(name) + r"\b", passage_text, re.IGNORECASE)
         ]
-        return {"reference": ref, "passage_length": len(rows), "places": found}
+        return found
     finally:
         conn.close()
 
