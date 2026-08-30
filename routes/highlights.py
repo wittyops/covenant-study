@@ -6,7 +6,7 @@ from fastapi import APIRouter, Header, Request
 
 from auth import get_current_user, require_user
 from database import get_users_db
-from models import HighlightCreateBody
+from models import HighlightCreateBody, HighlightSetBody
 
 router = APIRouter(prefix="/api/highlights", tags=["highlights"])
 
@@ -47,6 +47,34 @@ async def set_highlight(
         )
         conn.commit()
         return {"ref": body.ref, "color": body.color, "note": body.note}
+    finally:
+        conn.close()
+
+
+@router.put("/{ref:path}", status_code=200)
+async def set_highlight_by_ref(
+    ref: str,
+    body: HighlightSetBody,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Create or update a highlight for a specific ref (React SPA contract).
+
+    The frontend has always called PUT /api/highlights/{ref} — this route
+    never existed, so highlighting a verse silently 405'd. list/delete were
+    already correct; only this create/update path was missing.
+    """
+    user = require_user(request, authorization)
+    now = int(time.time())
+    conn = get_users_db()
+    try:
+        conn.execute(
+            "INSERT INTO highlights(user_id, ref, color, note, created_at) VALUES(?, ?, ?, ?, ?)"
+            " ON CONFLICT(user_id, ref) DO UPDATE SET color = excluded.color, note = excluded.note",
+            (user.id, ref, body.color, body.note, now),
+        )
+        conn.commit()
+        return {"ref": ref, "color": body.color, "note": body.note}
     finally:
         conn.close()
 

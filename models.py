@@ -23,6 +23,13 @@ class AdminResetPasswordBody(BaseModel):
     password: str = Field(..., min_length=8)
 
 
+class AdminCreateUserBody(BaseModel):
+    username: str = Field(..., min_length=3, max_length=32, pattern=r"^[a-zA-Z0-9_]+$")
+    password: str = Field(..., min_length=8)
+    display_name: Optional[str] = None
+    role: str = Field("user", pattern=r"^(user|admin)$")
+
+
 class SessionCreateBody(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     state_json: str
@@ -49,6 +56,12 @@ class NoteBody(BaseModel):
 
 class HighlightCreateBody(BaseModel):
     ref: str = Field(..., min_length=1)
+    color: str = "#ffeb3b"
+    note: Optional[str] = None
+
+
+class HighlightSetBody(BaseModel):
+    # ref comes from the URL path on PUT /api/highlights/{ref} — not the body.
     color: str = "#ffeb3b"
     note: Optional[str] = None
 
