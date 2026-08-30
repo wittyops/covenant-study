@@ -31,3 +31,21 @@ export function relativeTime(unix: number) {
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
   return `${Math.floor(diff / 86400)}d ago`
 }
+
+/**
+ * Extract a readable message from a TanStack Form field error entry.
+ *
+ * TanStack Form's Zod integration doesn't always hand back a plain string —
+ * depending on how the validator is wired up, `field.state.meta.errors[0]`
+ * can be a ZodIssue-shaped object instead. Blindly calling `String()` on
+ * that object stringifies it as the literal text "[object Object]" since it
+ * has no custom `toString()`. Prefer `.message` when present.
+ */
+export function formatFieldError(err: unknown): string {
+  if (err == null) return ''
+  if (typeof err === 'string') return err
+  if (typeof err === 'object' && 'message' in err && typeof err.message === 'string') {
+    return err.message
+  }
+  return String(err)
+}

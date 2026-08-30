@@ -8,6 +8,10 @@
  *
  * Range handling:
  *   - Highlight applies to every verse in the range (one PUT per verse).
+ *   - Remove highlight (the eraser icon) deletes any highlight on every
+ *     verse in the range (one DELETE per verse) — a no-op per verse that
+ *     was never highlighted, per the backend's "silent success" contract,
+ *     so it's always safe to show regardless of current highlight state.
  *   - Bookmark applies to the range's start verse only — a bookmark is a
  *     "return to this spot" marker, not a colored span, so a multi-verse
  *     bookmark isn't meaningful.
@@ -16,7 +20,7 @@
  */
 
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Bookmark, StickyNote, X } from 'lucide-react'
+import { Bookmark, Eraser, StickyNote, X } from 'lucide-react'
 import { bookmarks as bookmarksApi, highlights as highlightsApi } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth'
 import { useReaderStore } from '@/stores/reader'
@@ -55,7 +59,23 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
       toast(isRange ? `Highlighted ${hi - lo + 1} verses` : 'Verse highlighted', 'success')
       clearSelection()
     },
-    onError: () => toast('Could not save highlight', 'error'),
+    onError: (e: Error) => toast(e.message || 'Could not save highlight', 'error'),
+  })
+
+  const removeHighlight = useMutation({
+    mutationFn: async () => {
+      const verses = Array.from({ length: hi - lo + 1 }, (_, i) => lo + i)
+      await Promise.all(verses.map((v) => highlightsApi.remove(refFor(v), token ?? '')))
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['highlights'] })
+      toast(
+        isRange ? `Removed highlight from ${hi - lo + 1} verses` : 'Highlight removed',
+        'success',
+      )
+      clearSelection()
+    },
+    onError: (e: Error) => toast(e.message || 'Could not remove highlight', 'error'),
   })
 
   const addBookmark = useMutation({
@@ -65,7 +85,7 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
       toast('Bookmark added', 'success')
       clearSelection()
     },
-    onError: () => toast('Could not add bookmark', 'error'),
+    onError: (e: Error) => toast(e.message || 'Could not add bookmark', 'error'),
   })
 
   if (verse === null) return null
@@ -93,6 +113,15 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
             style={{ background: color }}
           />
         ))}
+        <button
+          type="button"
+          title="Remove highlight"
+          disabled={removeHighlight.isPending}
+          onClick={() => removeHighlight.mutate()}
+          className="text-text-muted hover:text-red-400 transition-colors disabled:opacity-50"
+        >
+          <Eraser className="h-4 w-4" />
+        </button>
       </div>
 
       <button

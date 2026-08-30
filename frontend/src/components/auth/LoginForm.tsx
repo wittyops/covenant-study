@@ -10,6 +10,7 @@ import { z } from 'zod'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { formatFieldError } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
 
@@ -62,9 +63,7 @@ export function LoginForm({ onSwitchToRegister }: Props) {
               onChange={(e) => field.handleChange(e.target.value)}
             />
             {field.state.meta.errors.length > 0 && (
-              <p className="text-xs text-red-400">
-                {field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}
-              </p>
+              <p className="text-xs text-red-400">{formatFieldError(field.state.meta.errors[0])}</p>
             )}
           </div>
         )}
@@ -84,9 +83,7 @@ export function LoginForm({ onSwitchToRegister }: Props) {
               onChange={(e) => field.handleChange(e.target.value)}
             />
             {field.state.meta.errors.length > 0 && (
-              <p className="text-xs text-red-400">
-                {field.state.meta.errors[0] != null ? String(field.state.meta.errors[0]) : ''}
-              </p>
+              <p className="text-xs text-red-400">{formatFieldError(field.state.meta.errors[0])}</p>
             )}
           </div>
         )}
