@@ -19,6 +19,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
+  Columns2,
   Highlighter,
   LogOut,
   Map as MapIcon,
@@ -30,12 +31,14 @@ import { useState } from 'react'
 import { AuthGate } from '@/components/auth/AuthGate'
 import { AdminPanel } from '@/components/panels/AdminPanel'
 import { BookmarksPanel } from '@/components/panels/BookmarksPanel'
+import { ComparePanel } from '@/components/panels/ComparePanel'
 import { HighlightsPanel } from '@/components/panels/HighlightsPanel'
 import { HistoryPanel } from '@/components/panels/HistoryPanel'
 import { MapsPanel } from '@/components/panels/MapsPanel'
 import { NotesPanel } from '@/components/panels/NotesPanel'
 import { BookPicker } from '@/components/reader/BookPicker'
 import { ChapterView } from '@/components/reader/ChapterView'
+import { ComparePassageView } from '@/components/reader/ComparePassageView'
 import { TranslationPicker } from '@/components/reader/TranslationPicker'
 import { Button } from '@/components/ui/button'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
@@ -55,7 +58,7 @@ export default function App() {
 function ReaderShell() {
   const { chapter, setChapter } = useReaderStore()
   const { user, logout } = useAuthStore()
-  const { toast, activePanel, togglePanel } = useUiStore()
+  const { toast, activePanel, togglePanel, compareActive } = useUiStore()
   const [bookPickerOpen, setBookPickerOpen] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
 
@@ -140,9 +143,13 @@ function ReaderShell() {
 
       {/* ── Body ───────────────────────────────────────────────────── */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Chapter content */}
-        <main className="flex-1 overflow-y-auto px-6 py-8 max-w-3xl mx-auto w-full">
-          <ChapterView />
+        {/* Chapter content — swaps to the full-passage compare view while active */}
+        <main
+          className={`flex-1 overflow-y-auto px-6 py-8 w-full ${
+            compareActive ? 'max-w-5xl mx-auto' : 'max-w-3xl mx-auto'
+          }`}
+        >
+          {compareActive ? <ComparePassageView /> : <ChapterView />}
         </main>
 
         {/* Tool rail — vertical icon strip */}
@@ -205,6 +212,7 @@ const PANEL_META: Record<string, string> = {
   highlights: 'Highlights',
   history: 'Reading History',
   map: 'Bible Map',
+  compare: 'Compare Translations',
   admin: 'Administration',
 }
 
@@ -215,6 +223,7 @@ function PanelContent({ id }: { id: PanelId }) {
   if (id === 'highlights') return <HighlightsPanel />
   if (id === 'history') return <HistoryPanel />
   if (id === 'map') return <MapsPanel />
+  if (id === 'compare') return <ComparePanel />
   if (id === 'admin') return <AdminPanel />
   return null
 }
@@ -248,6 +257,7 @@ const TOOL_BUTTONS = [
   { id: 'highlights' as const, icon: Highlighter, label: 'Highlights' },
   { id: 'history' as const, icon: Clock, label: 'History' },
   { id: 'map' as const, icon: MapIcon, label: 'Bible Map' },
+  { id: 'compare' as const, icon: Columns2, label: 'Compare Translations' },
 ]
 
 // Minimal toast renderer — replaces Alpine's $store.ui.toasts

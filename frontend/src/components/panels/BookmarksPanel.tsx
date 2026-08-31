@@ -3,9 +3,9 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Bookmark, ChevronRight, Trash2 } from 'lucide-react'
-import { bookmarks as bookmarksApi } from '@/lib/api'
+import { bible, bookmarks as bookmarksApi } from '@/lib/api'
 import type { Bookmark as BookmarkType } from '@/lib/types'
-import { relativeTime } from '@/lib/utils'
+import { parseRef, relativeTime } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth'
 import { useReaderStore } from '@/stores/reader'
 import { useUiStore } from '@/stores/ui'
@@ -22,6 +22,15 @@ export function BookmarksPanel() {
     enabled: !!token,
   })
 
+  // Refs only carry the book's display name ("John 3:16"), not its numeric
+  // id, so resolving a click to an actual navigate() call needs the book
+  // list to map name -> id. Cheap and already cached app-wide.
+  const { data: books = [] } = useQuery({
+    queryKey: ['books'],
+    queryFn: () => bible.books(token),
+    staleTime: Infinity,
+  })
+
   const remove = useMutation({
     mutationFn: (id: number) => bookmarksApi.remove(id, token ?? ''),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['bookmarks'] }),
@@ -29,9 +38,14 @@ export function BookmarksPanel() {
   })
 
   function goTo(bm: BookmarkType) {
-    // ref format: "BookName chapter:verse"
-    const m = bm.ref.match(/^(.+)\s+(\d+):(\d+)$/)
-    if (m) navigate(parseInt(m[2], 10), parseInt(m[3], 10)) // book num not in ref — chapter nav sufficient
+    const parsed = parseRef(bm.ref)
+    if (!parsed) return
+    const book = books.find((b) => b.name === parsed.book)
+    if (!book) {
+      toast(`Could not find "${parsed.book}" in the book list`, 'error')
+      return
+    }
+    navigate(book.book, parsed.chapter, parsed.verse)
     closePanel()
   }
 

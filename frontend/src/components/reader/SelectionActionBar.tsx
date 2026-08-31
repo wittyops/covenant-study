@@ -19,12 +19,19 @@
  *     it opens the existing NotesPanel for the single selected verse.
  */
 
-import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Bookmark, Eraser, StickyNote, X } from 'lucide-react'
-import { bookmarks as bookmarksApi, highlights as highlightsApi } from '@/lib/api'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { ArrowLeftRight, Bookmark, Eraser, StickyNote, X } from 'lucide-react'
+import { useState } from 'react'
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { bible, bookmarks as bookmarksApi, highlights as highlightsApi } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth'
 import { useReaderStore } from '@/stores/reader'
 import { useUiStore } from '@/stores/ui'
+
+// Same translations offered by the passage-compare picker's default
+// selection — kept small since this is a quick inline glance, not the full
+// research view (that's ComparePassageView).
+const VERSE_COMPARE_TRANSLATIONS = ['KJV', 'ASV', 'YLT', 'Darby']
 
 // Same five colors HighlightsPanel already knows how to label.
 const HIGHLIGHT_COLORS = ['#ffe066', '#b8f0c8', '#a0c8ff', '#ffb3b3', '#d4b3ff']
@@ -39,6 +46,7 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
   const { toast, openPanel } = useUiStore()
   const qc = useQueryClient()
   const { verse, selectionEnd, clearSelection } = useReaderStore()
+  const [compareOpen, setCompareOpen] = useState(false)
 
   // lo/hi collapse to the same value when nothing (or just one verse) is
   // selected — safe to compute unconditionally so every hook below runs on
@@ -86,6 +94,15 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
       clearSelection()
     },
     onError: (e: Error) => toast(e.message || 'Could not add bookmark', 'error'),
+  })
+
+  // Single-verse-only — the compare dialog is a quick inline glance, not a
+  // range tool. Only fetched once the dialog is actually opened.
+  const compareRef = !isRange ? refFor(lo) : ''
+  const { data: compareData, isLoading: compareLoading } = useQuery({
+    queryKey: ['compare-verse', compareRef],
+    queryFn: () => bible.compareVerse(compareRef, VERSE_COMPARE_TRANSLATIONS, token),
+    enabled: compareOpen && !isRange,
   })
 
   if (verse === null) return null
@@ -146,12 +163,48 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
 
       <button
         type="button"
+        title={isRange ? 'Compare applies to a single verse' : 'Compare translations'}
+        disabled={isRange}
+        onClick={() => setCompareOpen(true)}
+        className="text-text-muted hover:text-gold transition-colors disabled:opacity-30"
+      >
+        <ArrowLeftRight className="h-4 w-4" />
+      </button>
+
+      <button
+        type="button"
         title="Clear selection"
         onClick={() => clearSelection()}
         className="text-text-muted hover:text-text-primary transition-colors"
       >
         <X className="h-4 w-4" />
       </button>
+
+      <Dialog open={compareOpen} onOpenChange={setCompareOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{compareRef}</DialogTitle>
+          </DialogHeader>
+          {compareLoading ? (
+            <div className="space-y-2 py-2">
+              {[90, 75, 85].map((w, i) => (
+                <div key={i} className="loading-shimmer h-5 rounded" style={{ width: `${w}%` }} />
+              ))}
+            </div>
+          ) : (
+            <dl className="space-y-3">
+              {Object.entries(compareData?.comparisons ?? {}).map(([tr, text]) => (
+                <div key={tr}>
+                  <dt className="text-xs font-bold text-gold-muted uppercase tracking-wide">
+                    {tr}
+                  </dt>
+                  <dd className="text-sm text-text-primary leading-6 mt-0.5">{text}</dd>
+                </div>
+              ))}
+            </dl>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -36,6 +36,7 @@ export function ChapterView() {
     selectVerseNumber,
     openStrongs,
     activeStrongs,
+    navigate,
   } = useReaderStore()
   const { token } = useAuthStore()
   const { toast } = useUiStore()
@@ -124,10 +125,18 @@ export function ChapterView() {
   if (isError) {
     toast('Failed to load chapter', 'error')
     return (
-      <div className="flex flex-col items-center justify-center py-20 text-text-muted">
+      <div className="flex flex-col items-center justify-center gap-4 py-20 text-text-muted">
         <p>
-          Could not load {book} {chapter}.
+          {translation} doesn't have text for this book/chapter — it may not cover the Apocrypha, or
+          this reference doesn't exist.
         </p>
+        <button
+          type="button"
+          onClick={() => navigate(1, 1)}
+          className="rounded-lg bg-gold px-4 py-2 text-sm font-semibold text-bg-base transition-opacity hover:opacity-90"
+        >
+          Return to Genesis 1
+        </button>
       </div>
     )
   }
@@ -150,7 +159,7 @@ export function ChapterView() {
         onClick={handleContainerClick}
         onKeyDown={handleContainerClick}
       >
-        {data?.verses.map((v) => {
+        {(data?.verses ?? []).map((v) => {
           const words = wordData?.[String(v.verse)]
           const hlColor = highlightMap.get(v.verse)
           const isSelected =

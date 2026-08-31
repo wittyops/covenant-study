@@ -681,6 +681,58 @@ async def react_chapter(
         conn.close()
 
 
+@router.get("/api/bible/compare")
+async def react_compare(
+    book:         int = Query(..., ge=1, le=80),
+    chapter:      int = Query(..., ge=1),
+    translations: str = Query(...),
+):
+    """Full-chapter multi-translation comparison for the React SPA.
+
+    Returns one ChapterResponse-shaped entry per translation, in the order
+    requested. Capped at 4 translations server-side (defense in depth — the
+    picker UI already caps at 4) to keep response size and column/card count
+    sane.
+    """
+    trans_list = [t.strip() for t in translations.split(",") if t.strip()][:4]
+    if not trans_list:
+        raise HTTPException(400, "At least one translation is required")
+    conn, multi = get_db()
+    if not conn:
+        raise HTTPException(503, "Bible database not loaded")
+    try:
+        book_name = BOOKS.get(book, str(book))
+        cur = conn.cursor()
+        results = []
+        for tr in trans_list:
+            if multi:
+                cur.execute(
+                    "SELECT v, t FROM verses WHERE translation=? AND b=? AND c=? ORDER BY v",
+                    (tr, book, chapter),
+                )
+            else:
+                cur.execute("SELECT v, t FROM t_kjv WHERE b=? AND c=? ORDER BY v", (book, chapter))
+                tr = "KJV"
+            rows = cur.fetchall()
+            verses = [
+                {
+                    "book":        book,
+                    "book_name":   book_name,
+                    "chapter":     chapter,
+                    "verse":       r[0],
+                    "text":        r[1],
+                    "translation": tr,
+                }
+                for r in rows
+            ]
+            results.append(
+                {"book": book, "book_name": book_name, "chapter": chapter, "translation": tr, "verses": verses}
+            )
+        return results
+    finally:
+        conn.close()
+
+
 @router.get("/api/bible/search")
 async def react_search(
     q:           str = Query(..., min_length=3),

@@ -19,7 +19,7 @@ interface Props {
 }
 
 export function BookPicker({ open, onClose }: Props) {
-  const { book: currentBook, setBook } = useReaderStore()
+  const { book: currentBook, translation, setBook, setTranslation } = useReaderStore()
   const { token } = useAuthStore()
 
   const { data: books = [] } = useQuery({
@@ -32,7 +32,13 @@ export function BookPicker({ open, onClose }: Props) {
   const nt = books.filter((b) => b.testament === 'NT')
   const ap = books.filter((b) => b.testament === 'AP')
 
-  function pickBook(bookNum: number) {
+  // KJVA is currently the only translation with Apocrypha text (67-80) — see
+  // config.APOCRYPHA_BOOKS in the backend. Picking an Apocrypha book on any
+  // other translation would otherwise leave the reader pointed at a
+  // book/translation combo the backend 404s on every chapter fetch, with no
+  // way back short of knowing to reopen this picker.
+  function pickBook(bookNum: number, testament: 'OT' | 'NT' | 'AP') {
+    if (testament === 'AP' && translation !== 'KJVA') setTranslation('KJVA')
     setBook(bookNum)
     onClose()
   }
@@ -78,7 +84,7 @@ export function BookPicker({ open, onClose }: Props) {
                     variant={b.book === currentBook ? 'default' : 'ghost'}
                     size="sm"
                     className="justify-start text-left h-auto py-2 px-3"
-                    onClick={() => pickBook(b.book)}
+                    onClick={() => pickBook(b.book, b.testament)}
                   >
                     <span className="truncate">{b.name}</span>
                   </Button>

@@ -1,12 +1,14 @@
 /**
  * HighlightsPanel — list all verse highlights with colour swatches.
- * Clicking a row navigates to that reference and removes highlight via DELETE.
+ * Clicking a row navigates to that reference; the X button removes it.
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Highlighter, X } from 'lucide-react'
-import { highlights as highlightsApi } from '@/lib/api'
+import { bible, highlights as highlightsApi } from '@/lib/api'
 import type { Highlight } from '@/lib/types'
+import { parseRef } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth'
+import { useReaderStore } from '@/stores/reader'
 import { useUiStore } from '@/stores/ui'
 
 // Human-readable names for the five highlight colours
@@ -20,7 +22,8 @@ const COLOUR_LABELS: Record<string, string> = {
 
 export function HighlightsPanel() {
   const { token } = useAuthStore()
-  const { toast } = useUiStore()
+  const { navigate } = useReaderStore()
+  const { toast, closePanel } = useUiStore()
   const qc = useQueryClient()
 
   const { data = [], isLoading } = useQuery({
@@ -29,11 +32,32 @@ export function HighlightsPanel() {
     enabled: !!token,
   })
 
+  // Refs only carry the book's display name ("John 3:16"), not its numeric
+  // id, so resolving a click to an actual navigate() call needs the same
+  // book list the picker uses. Cheap and already cached app-wide.
+  const { data: books = [] } = useQuery({
+    queryKey: ['books'],
+    queryFn: () => bible.books(token),
+    staleTime: Infinity,
+  })
+
   const remove = useMutation({
     mutationFn: (ref: string) => highlightsApi.remove(ref, token ?? ''),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['highlights'] }),
     onError: () => toast('Could not remove highlight', 'error'),
   })
+
+  function goTo(ref: string) {
+    const parsed = parseRef(ref)
+    if (!parsed) return
+    const book = books.find((b) => b.name === parsed.book)
+    if (!book) {
+      toast(`Could not find "${parsed.book}" in the book list`, 'error')
+      return
+    }
+    navigate(book.book, parsed.chapter, parsed.verse)
+    closePanel()
+  }
 
   if (isLoading)
     return (
@@ -76,7 +100,13 @@ export function HighlightsPanel() {
                 key={h.ref}
                 className="flex items-center gap-2 rounded px-2 py-1.5 hover:bg-bg-elevated group"
               >
-                <span className="flex-1 text-sm text-text-primary">{h.ref}</span>
+                <button
+                  type="button"
+                  onClick={() => goTo(h.ref)}
+                  className="flex-1 text-left text-sm text-text-primary"
+                >
+                  {h.ref}
+                </button>
                 {h.note && (
                   <span className="max-w-[120px] truncate text-xs text-text-muted">{h.note}</span>
                 )}

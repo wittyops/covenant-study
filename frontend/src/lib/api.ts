@@ -128,6 +128,26 @@ export const bible = {
   places(token?: string | null) {
     return apiFetch<Place[]>('/api/places', { token })
   },
+
+  compare(book: number, chapter: number, translations: string[], token?: string | null) {
+    const qs = new URLSearchParams({
+      book: String(book),
+      chapter: String(chapter),
+      translations: translations.join(','),
+    })
+    return apiFetch<ChapterResponse[]>(`/api/bible/compare?${qs}`, { token })
+  },
+
+  // Legacy single-verse route (predates the React rewrite) — takes a ref
+  // string ('John 3:16') rather than numeric book/chapter, so it stays on
+  // its own /api/compare path instead of the /api/bible/* SPA dialect.
+  compareVerse(ref: string, translations: string[], token?: string | null) {
+    const qs = new URLSearchParams({ ref, translations: translations.join(',') })
+    return apiFetch<{ reference: string; comparisons: Record<string, string> }>(
+      `/api/compare?${qs}`,
+      { token },
+    )
+  },
 }
 
 // ─── User data ─────────────────────────────────────────────────────────────

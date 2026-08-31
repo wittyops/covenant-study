@@ -19,12 +19,21 @@ interface UiState {
   toasts: Toast[]
   _toastSeq: number
 
+  // Passage compare mode — replaces ChapterView's main content with
+  // ComparePassageView while active. Separate from activePanel/sidebarOpen
+  // since the compare picker (a panel) and the compare view (the main
+  // content area) are two different pieces of UI.
+  compareActive: boolean
+  compareTranslations: string[]
+
   openPanel(id: PanelId): void
   closePanel(): void
   togglePanel(id: PanelId): void
   setSidebarOpen(v: boolean): void
   setSearchOpen(v: boolean): void
   setUserMenuOpen(v: boolean): void
+  startCompare(translations: string[]): void
+  stopCompare(): void
 
   // Pushes a toast that auto-dismisses after `ms` milliseconds (default 3500)
   toast(message: string, type?: Toast['type'], ms?: number): void
@@ -38,6 +47,8 @@ export const useUiStore = create<UiState>()((set, get) => ({
   userMenuOpen: false,
   toasts: [],
   _toastSeq: 0,
+  compareActive: false,
+  compareTranslations: [],
 
   openPanel(id) {
     set({ activePanel: id, sidebarOpen: true })
@@ -61,6 +72,17 @@ export const useUiStore = create<UiState>()((set, get) => ({
   },
   setUserMenuOpen(v) {
     set({ userMenuOpen: v })
+  },
+  startCompare(translations) {
+    set({
+      compareActive: true,
+      compareTranslations: translations,
+      activePanel: null,
+      sidebarOpen: false,
+    })
+  },
+  stopCompare() {
+    set({ compareActive: false })
   },
 
   toast(message, type = 'info', ms = 3500) {
