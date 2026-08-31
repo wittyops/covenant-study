@@ -166,6 +166,12 @@ export const bookmarks = {
   remove(id: number, token: string) {
     return apiFetch<void>(`/api/bookmarks/${id}`, { method: 'DELETE', token })
   },
+  check(ref: string, token: string) {
+    const qs = new URLSearchParams({ ref })
+    return apiFetch<{ bookmarked: boolean; id: number | null }>(`/api/bookmarks/check?${qs}`, {
+      token,
+    })
+  },
 }
 
 export const highlights = {

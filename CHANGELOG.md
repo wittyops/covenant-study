@@ -9,6 +9,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ## [Unreleased]
 
 ### Added
+- **Bookmark toggle in the selection action bar.** The Bookmark button now checks `GET /api/bookmarks/check` (existed on the backend with no frontend caller until now) and shows filled/gold when the current verse is already bookmarked; tapping it again removes the bookmark. Previously the "X" in the action bar looked like it should undo the bookmark but only ever cleared the pending selection — there was no way to un-bookmark from the reading view at all, matching a bug report ("tapping 'x' in the bookmark menu does not remove the bookmark").
 - **Multi-translation comparison.** Full-passage compare view (new "Compare" tool-rail entry, `ComparePanel.tsx` picker capped at 4 translations, `ComparePassageView.tsx` — side-by-side columns on wide viewports, a swipeable verse-anchored carousel on narrow ones) plus a quick inline single-verse compare popover from the selection action bar. New backend endpoint `GET /api/bible/compare`; wires up the pre-existing (previously uncalled) legacy `GET /api/compare` for the inline popover.
 - Brenton English Septuagint (LXX, 1844) as a translation source, public domain
 - Deuterocanonical / Apocrypha books (1–2 Esdras, Tobit, Judith, Rest of Esther, Wisdom, Sirach, Baruch, Song of the Three Holy Children, Susanna, Bel and the Dragon, Prayer of Manasses, 1–2 Maccabees) — book IDs 67–80, `config.APOCRYPHA_BOOKS`, third "Apocrypha" tab in `BookPicker.tsx`, `/api/bible/*` numeric-param routes raised from `le=66` to `le=80`

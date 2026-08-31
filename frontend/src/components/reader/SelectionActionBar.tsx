@@ -12,9 +12,14 @@
  *     verse in the range (one DELETE per verse) — a no-op per verse that
  *     was never highlighted, per the backend's "silent success" contract,
  *     so it's always safe to show regardless of current highlight state.
- *   - Bookmark applies to the range's start verse only — a bookmark is a
+ *   - Bookmark is a toggle on the range's start verse only — a bookmark is a
  *     "return to this spot" marker, not a colored span, so a multi-verse
- *     bookmark isn't meaningful.
+ *     bookmark isn't meaningful. Uses GET /api/bookmarks/check (existed on
+ *     the backend with no frontend caller until now) to show filled/gold
+ *     when the verse is already bookmarked, and removes on a second tap
+ *     instead of just clearing the selection (the "X" only ever clears the
+ *     pending selection — it was never a bookmark-remove action, which read
+ *     as a bug when there was no other way to un-bookmark from here).
  *   - Note is disabled for a range (notes are one-per-verse in the schema);
  *     it opens the existing NotesPanel for the single selected verse.
  */
@@ -86,14 +91,40 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
     onError: (e: Error) => toast(e.message || 'Could not remove highlight', 'error'),
   })
 
+  // Single-verse-only, same as Note — a bookmark is a "return here" marker
+  // for one spot, not a span, so toggle state only makes sense for the
+  // range's start verse. Uses the /api/bookmarks/check endpoint, which
+  // existed on the backend with no frontend caller until now.
+  const bookmarkRef = refFor(lo)
+  const { data: bookmarkStatus } = useQuery({
+    queryKey: ['bookmark-check', bookmarkRef],
+    queryFn: () => bookmarksApi.check(bookmarkRef, token ?? ''),
+    enabled: verse !== null && !!token,
+  })
+
   const addBookmark = useMutation({
-    mutationFn: () => bookmarksApi.add(refFor(lo), null, '#b8962e', token ?? ''),
+    mutationFn: () => bookmarksApi.add(bookmarkRef, null, '#b8962e', token ?? ''),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['bookmarks'] })
+      qc.invalidateQueries({ queryKey: ['bookmark-check', bookmarkRef] })
       toast('Bookmark added', 'success')
       clearSelection()
     },
     onError: (e: Error) => toast(e.message || 'Could not add bookmark', 'error'),
+  })
+
+  const removeBookmark = useMutation({
+    mutationFn: () => {
+      if (!bookmarkStatus?.id) throw new Error('Bookmark not found')
+      return bookmarksApi.remove(bookmarkStatus.id, token ?? '')
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['bookmarks'] })
+      qc.invalidateQueries({ queryKey: ['bookmark-check', bookmarkRef] })
+      toast('Bookmark removed', 'success')
+      clearSelection()
+    },
+    onError: (e: Error) => toast(e.message || 'Could not remove bookmark', 'error'),
   })
 
   // Single-verse-only — the compare dialog is a quick inline glance, not a
@@ -143,12 +174,16 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
 
       <button
         type="button"
-        title="Bookmark"
-        disabled={addBookmark.isPending}
-        onClick={() => addBookmark.mutate()}
-        className="text-text-muted hover:text-gold transition-colors disabled:opacity-50"
+        title={bookmarkStatus?.bookmarked ? 'Remove bookmark' : 'Bookmark'}
+        disabled={addBookmark.isPending || removeBookmark.isPending}
+        onClick={() =>
+          bookmarkStatus?.bookmarked ? removeBookmark.mutate() : addBookmark.mutate()
+        }
+        className={`transition-colors disabled:opacity-50 ${
+          bookmarkStatus?.bookmarked ? 'text-gold' : 'text-text-muted hover:text-gold'
+        }`}
       >
-        <Bookmark className="h-4 w-4" />
+        <Bookmark className="h-4 w-4" fill={bookmarkStatus?.bookmarked ? 'currentColor' : 'none'} />
       </button>
 
       <button
