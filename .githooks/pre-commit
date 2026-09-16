@@ -1,0 +1,95 @@
+#!/bin/sh
+# .githooks/pre-commit — blocks a commit that introduces a live-looking secret.
+#
+# WHY THIS EXISTS
+#   Built 2026-09-11 immediately after finding a REAL, LIVE Vaultwarden
+#   master password sitting in plaintext in wittycomp-lab's tracked git
+#   history (.claude/settings.local.json, committed months earlier, pushed
+#   to both Forgejo and the GitHub mirror). No hook existed to catch it —
+#   only the commit-msg hook (attribution) existed at the time. This hook
+#   closes that specific class of gap: it cannot undo a secret already in
+#   history, but it stops the NEXT one from ever landing.
+#
+# WHAT IT CHECKS
+#   Only the lines being ADDED in this commit (`git diff --cached -U0`),
+#   never the whole tree — scanning the whole tree would immediately block
+#   every future commit in a repo that already has a historical exposure
+#   (like this one) until that history is fully scrubbed, which is a much
+#   bigger, separate decision. This hook is about the next commit, not a
+#   full-repo audit.
+#
+# PATTERNS (deliberately blunt regex, not a real secret-scanner)
+#   - Cloud/VCS token shapes: GitHub PAT (ghp_/github_pat_), AWS access key
+#   - Credentials embedded in a URL: scheme://user:pass@host
+#   - Common env-var secret assignments with a real-looking value:
+#     *_PASSWORD=, *_SECRET=, *_TOKEN=, *_API_KEY=, *_CLIENTSECRET=, *_APIKEY=
+#     — skipped when the value is empty, a shell/compose variable
+#     reference (${VAR} or $VAR), or an obvious placeholder
+#     (changeme/xxx/your_.../<...>/REDACTED, case-insensitive)
+#   - PEM/private-key headers
+#
+# BYPASS
+#   A line ending in `# nosemgrep` is allowed through — same convention
+#   CLAUDE.md §4 already uses for intentional credential lines edited via
+#   sed in .env files. Use it deliberately, on the specific line, never as
+#   a blanket file-level suppression.
+#
+# KNOWN LIMITATION (accepted trade-off, consistent with this repo's other
+# hooks — see warn-bash-over-mcp.sh's own documented scope limits): this is
+# pattern-matching on text, not real entropy analysis or a maintained
+# signature database. It will miss a secret that doesn't match any pattern
+# here and can false-positive on a line that merely *looks* like one. When
+# you hit a false positive, use `# nosemgrep` on that line rather than
+# disabling the hook.
+
+set -eu
+
+DIFF=$(git diff --cached -U0 --no-color -- . ':(exclude).githooks/pre-commit')
+
+# Only look at added lines (start with a single '+', not '+++' file headers).
+ADDED=$(printf '%s\n' "$DIFF" | grep -E '^\+[^+]' | sed 's/^\+//')
+
+[ -z "$ADDED" ] && exit 0
+
+FOUND=""
+
+PLACEHOLDER_RE='changeme|xxxxx|your_[a-z_]+|<[a-z_]+>|REDACTED|example\.com|placeholder'
+
+check() {
+    # $1 = human label, $2 = extended regex. Placeholder-looking values are
+    # filtered out of the candidate matches BEFORE deciding whether this
+    # check found anything — filtering after the label is already appended
+    # leaves a bare header with nothing under it, which is worse than
+    # useless (a previous version of this hook had exactly that bug).
+    MATCHES=$(printf '%s\n' "$ADDED" \
+        | grep -viE '#\s*nosemgrep\s*$' \
+        | grep -E -- "$2" \
+        | grep -viE -- "$PLACEHOLDER_RE" || true)
+    if [ -n "$MATCHES" ]; then
+        FOUND="$FOUND
+
+[$1]
+$(printf '%s\n' "$MATCHES" | sed 's/^/    /')"
+    fi
+}
+
+check "GitHub token"            'ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}'
+check "AWS access key"          'AKIA[0-9A-Z]{16}'
+check "Credential embedded in URL" '[a-zA-Z][a-zA-Z0-9+.-]*://[^/@[:space:]]+:[^/@[:space:]]+@'
+check "PEM private key"         '-----BEGIN[A-Z ]*PRIVATE KEY-----'
+check "Secret-shaped env assignment" \
+  '\b[A-Z0-9_]*(PASSWORD|SECRET|TOKEN|API_?KEY|CLIENTSECRET)\b\s*[:=]\s*[^[:space:]${][^[:space:]]{6,}'
+
+if [ -n "$(printf '%s' "$FOUND" | tr -d '[:space:]')" ]; then
+    echo "" >&2
+    echo "COMMIT BLOCKED: a line being added looks like a live secret." >&2
+    echo "$FOUND" >&2
+    echo "" >&2
+    echo "If this is a real secret: remove it, put it in Vaultwarden instead," >&2
+    echo "and reference it via env var / MCP lookup, per CLAUDE.md section 4." >&2
+    echo "If this is a false positive: add '# nosemgrep' to the end of that" >&2
+    echo "specific line and re-commit." >&2
+    exit 1
+fi
+
+exit 0

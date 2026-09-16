@@ -1,0 +1,24 @@
+#!/bin/sh
+# Rejects any commit whose message contains Claude/Anthropic attribution
+# boilerplate. This repo's git identity is Enoch (enoch@wittycomp.com),
+# never "Claude" or an anthropic.com/claude.ai address — see the memory
+# file feedback_commit_identity.md for why. That rule was documented and
+# then violated four separate times purely because it depended on being
+# remembered at the moment of committing. This hook makes it mechanical
+# instead: git itself refuses the commit, no memory required.
+
+msg_file="$1"
+
+if grep -qiE 'claude sonnet|claude opus|claude haiku|anthropic\.com|claude\.ai' "$msg_file"; then
+  echo "" >&2
+  echo "COMMIT REJECTED: message contains Claude/Anthropic attribution boilerplate." >&2
+  echo "" >&2
+  echo "Use instead:" >&2
+  echo "  Co-Authored-By: Enoch <enoch@wittycomp.com>" >&2
+  echo "(or Lazarus <lazarus@wittycomp.com> for Buntyn-site work)" >&2
+  echo "" >&2
+  echo "Never include a Claude-Session: URL in commit messages." >&2
+  exit 1
+fi
+
+exit 0
