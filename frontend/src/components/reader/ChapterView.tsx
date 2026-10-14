@@ -17,10 +17,12 @@
  * --highlight-color CSS variable that index.css picks up via color-mix().
  */
 import { useQuery } from '@tanstack/react-query'
+import { Volume2 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { bible, highlights as highlightsApi } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth'
 import { useReaderStore } from '@/stores/reader'
+import { speechSupported, useSpeechStore } from '@/stores/speech'
 import { useUiStore } from '@/stores/ui'
 import { SelectionActionBar } from './SelectionActionBar'
 import { StrongsCard } from './StrongsCard'
@@ -132,6 +134,17 @@ export function ChapterView() {
     if (isError) toast('Failed to load chapter', 'error')
   }, [isError, toast])
 
+  // Stop any in-progress read-aloud the moment the reader moves to a
+  // different book/chapter — otherwise the browser keeps reading the OLD
+  // chapter's text out loud while the screen shows a different one, which
+  // is confusing (and listening to the right text matters more here than
+  // almost anywhere else in the app).
+  const stopSpeech = useSpeechStore((s) => s.stop)
+  // biome-ignore lint/correctness/useExhaustiveDependencies: book/chapter aren't read in the effect body — they're the re-trigger signal for the cleanup, not a value it uses.
+  useEffect(() => {
+    return () => stopSpeech()
+  }, [book, chapter, stopSpeech])
+
   if (isLoading) return <ChapterSkeleton />
   if (isError) {
     return (
@@ -154,18 +167,23 @@ export function ChapterView() {
   return (
     <>
       {/* Chapter heading */}
-      <header className="mb-6 border-b border-bg-overlay pb-4">
-        <h2 className="text-2xl font-bold text-gold">
-          {data?.book_name} {chapter}
-        </h2>
-        <p className="text-xs text-text-muted mt-1 uppercase tracking-wide">{translation}</p>
+      <header className="mb-6 flex items-start justify-between gap-3 border-b border-bg-overlay pb-4">
+        <div>
+          <h2 className="text-2xl font-bold text-gold">
+            {data?.book_name} {chapter}
+          </h2>
+          <p className="text-xs text-text-muted mt-1 uppercase tracking-wide">{translation}</p>
+        </div>
+        {speechSupported() && data && (
+          <ReadAloudButton chapterLabel={`${data.book_name} ${chapter}`} verses={data.verses} />
+        )}
       </header>
 
       {/* Verse list — delegated click for verse selection and Strong's */}
       <section
         ref={containerRef}
         aria-label="Scripture text"
-        className="scripture-text space-y-2 leading-8 text-text-primary"
+        className="scripture-text readable-text space-y-2 leading-8 text-text-primary"
         onClick={handleContainerClick}
         onKeyDown={handleContainerClick}
       >
@@ -217,6 +235,44 @@ export function ChapterView() {
       {/* Floating action bar — appears once a verse number is tapped */}
       {data?.book_name && <SelectionActionBar bookName={data.book_name} chapter={chapter} />}
     </>
+  )
+}
+
+/** Toggle button for reading the current chapter aloud via Web Speech API. */
+function ReadAloudButton({
+  chapterLabel,
+  verses,
+}: {
+  chapterLabel: string
+  verses: { verse: number; text: string }[]
+}) {
+  const { speaking, label, speak, stop } = useSpeechStore()
+  const isThisChapter = speaking && label === chapterLabel
+
+  function toggle() {
+    if (isThisChapter) {
+      stop()
+      return
+    }
+    const text = verses.map((v) => v.text).join(' ')
+    speak(text, chapterLabel)
+  }
+
+  return (
+    <button
+      type="button"
+      title={isThisChapter ? 'Stop reading aloud' : 'Read this chapter aloud'}
+      aria-label={isThisChapter ? 'Stop reading aloud' : 'Read this chapter aloud'}
+      aria-pressed={isThisChapter}
+      onClick={toggle}
+      className={`flex h-9 w-9 shrink-0 items-center justify-center rounded transition-colors ${
+        isThisChapter
+          ? 'bg-gold-subtle text-gold'
+          : 'text-text-muted hover:bg-bg-elevated hover:text-text-primary'
+      }`}
+    >
+      <Volume2 className="h-4 w-4" />
+    </button>
   )
 }
 

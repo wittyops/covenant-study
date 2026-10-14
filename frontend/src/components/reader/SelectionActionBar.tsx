@@ -139,8 +139,11 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
   if (verse === null) return null
 
   return (
+    // bottom-14 sits this directly above NavBar (h-14) instead of
+    // overlapping it — NavBar is a normal flex sibling, not fixed, so it
+    // occupies real bottom-of-screen space that this fixed bar has to clear.
     <div
-      className="fixed inset-x-0 bottom-0 z-40 flex items-center justify-center gap-3 border-t
+      className="fixed inset-x-0 bottom-14 z-40 flex items-center justify-center gap-3 border-t
         border-bg-overlay bg-bg-elevated px-4 py-3 shadow-lg"
       role="toolbar"
       aria-label="Selected verse actions"

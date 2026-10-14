@@ -58,7 +58,7 @@ export function NotesPanel() {
 
       {/* Editor */}
       <textarea
-        className="min-h-[200px] w-full resize-y rounded-lg border border-bg-overlay bg-bg-elevated
+        className="readable-text min-h-[200px] w-full resize-y rounded-lg border border-bg-overlay bg-bg-elevated
           px-3 py-2 text-sm text-text-primary placeholder:text-text-muted
           focus:border-gold focus:outline-none focus:ring-1 focus:ring-gold"
         placeholder="Write your study notes here…"

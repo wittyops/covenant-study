@@ -61,6 +61,9 @@
   :root {
     --scrollbar-thumb: #3a2e0d;
     --scrollbar-track: #15151a;
+    /* Accessibility text-size multiplier, synced from useSettingsStore
+       (see App.tsx) — any element can opt in via .readable-text. */
+    --reading-font-scale: 1;
   }
 
   * {
@@ -79,6 +82,18 @@
   }
 
   .scripture-text { font-family: var(--font-scripture); }
+}
+
+/* Opt-in accessibility text scaling — scripture text and notes both use
+   this; base size is 1rem/1em so --reading-font-scale: 1 is a no-op.
+   Deliberately OUTSIDE any @layer: Tailwind's utilities layer (text-sm,
+   text-2xl, etc.) otherwise wins over anything declared inside @layer
+   base at equal specificity, regardless of source order, which would
+   silently defeat this on any element that also carries a Tailwind
+   text-size utility (e.g. the Notes textarea's text-sm). Unlayered rules
+   always beat layered ones. */
+.readable-text {
+  font-size: calc(1em * var(--reading-font-scale));
 }
 
 /* ── Component utilities ────────────────────────────────────────────────── */

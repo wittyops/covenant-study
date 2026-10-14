@@ -16,8 +16,6 @@
 import {
   Bookmark,
   BookOpen,
-  ChevronLeft,
-  ChevronRight,
   Clock,
   Columns2,
   Highlighter,
@@ -28,7 +26,7 @@ import {
   StickyNote,
   User as UserIcon,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useLayoutEffect, useState } from 'react'
 import { AuthGate } from '@/components/auth/AuthGate'
 import { AccountPanel } from '@/components/panels/AccountPanel'
 import { AdminPanel } from '@/components/panels/AdminPanel'
@@ -41,12 +39,14 @@ import { NotesPanel } from '@/components/panels/NotesPanel'
 import { BookPicker } from '@/components/reader/BookPicker'
 import { ChapterView } from '@/components/reader/ChapterView'
 import { ComparePassageView } from '@/components/reader/ComparePassageView'
+import { NavBar } from '@/components/reader/NavBar'
+import { SpeechPlayer } from '@/components/reader/SpeechPlayer'
 import { TranslationPicker } from '@/components/reader/TranslationPicker'
 import { Button } from '@/components/ui/button'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import type { PanelId } from '@/lib/types'
 import { useAuthStore } from '@/stores/auth'
-import { useReaderStore } from '@/stores/reader'
+import { useSettingsStore } from '@/stores/settings'
 import { useUiStore } from '@/stores/ui'
 
 export default function App() {
@@ -58,20 +58,23 @@ export default function App() {
 }
 
 function ReaderShell() {
-  const { chapter, setChapter } = useReaderStore()
   const { user, logout } = useAuthStore()
   const { toast, activePanel, togglePanel, compareActive } = useUiStore()
+  const { fontScale } = useSettingsStore()
   const [bookPickerOpen, setBookPickerOpen] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
 
-  // Look up chapter count from books query — for now cap nav at 150
-  // (TODO: pull from useQuery(['books']) and find the matching book)
-  function prevChapter() {
-    if (chapter > 1) setChapter(chapter - 1)
-  }
-  function nextChapter() {
-    setChapter(chapter + 1)
-  }
+  // Sync the persisted font-scale preference onto :root as a CSS custom
+  // property. Done here (once, at the shell level) rather than scattering
+  // inline styles through every component that wants to scale — any
+  // element can opt in later via the .readable-text class. useLayoutEffect
+  // (not useEffect) so this applies before the browser paints — otherwise
+  // a returning visitor briefly sees text at the wrong size for one frame
+  // before their saved preference kicks in, which undercuts the whole
+  // point of an accessibility setting.
+  useLayoutEffect(() => {
+    document.documentElement.style.setProperty('--reading-font-scale', String(fontScale))
+  }, [fontScale])
 
   async function handleLogout() {
     await logout()
@@ -92,19 +95,6 @@ function ReaderShell() {
           <BookOpen className="h-4 w-4 text-gold" />
           <span className="hidden sm:inline">Books</span>
         </Button>
-
-        {/* Chapter navigation */}
-        <div className="flex items-center gap-1">
-          <Button variant="ghost" size="icon" onClick={prevChapter} disabled={chapter <= 1}>
-            <ChevronLeft className="h-4 w-4" />
-          </Button>
-          <span className="min-w-[2.5rem] text-center text-sm font-semibold text-text-primary">
-            {chapter}
-          </span>
-          <Button variant="ghost" size="icon" onClick={nextChapter}>
-            <ChevronRight className="h-4 w-4" />
-          </Button>
-        </div>
 
         {/* Translation picker */}
         <TranslationPicker />
@@ -204,6 +194,9 @@ function ReaderShell() {
         </aside>
       </div>
 
+      {/* ── Bottom nav bar — book/chapter jump + text size ────────────── */}
+      <NavBar />
+
       {/* ── Tool panels ────────────────────────────────────────────── */}
       {/* Each panel slides in from the right as a Sheet.
           activePanel drives which content component is rendered inside. */}
@@ -211,6 +204,9 @@ function ReaderShell() {
 
       {/* Book picker sheet (left side) */}
       <BookPicker open={bookPickerOpen} onClose={() => setBookPickerOpen(false)} />
+
+      {/* Read-aloud mini-player — floats above NavBar while active */}
+      <SpeechPlayer />
 
       {/* Toast stack */}
       <ToastStack />
@@ -288,7 +284,9 @@ function ToastStack() {
   }
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">
+    // bottom-36 clears both NavBar (h-14) and the SpeechPlayer pill that
+    // floats just above it, so a toast never overlaps either.
+    <div className="fixed bottom-36 right-4 z-50 flex flex-col gap-2">
       {toasts.map((t) => (
         <button
           key={t.id}
