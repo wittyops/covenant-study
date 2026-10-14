@@ -23,12 +23,14 @@ import {
   Highlighter,
   LogOut,
   Map as MapIcon,
+  Settings,
   Shield,
   StickyNote,
   User as UserIcon,
 } from 'lucide-react'
 import { useState } from 'react'
 import { AuthGate } from '@/components/auth/AuthGate'
+import { AccountPanel } from '@/components/panels/AccountPanel'
 import { AdminPanel } from '@/components/panels/AdminPanel'
 import { BookmarksPanel } from '@/components/panels/BookmarksPanel'
 import { ComparePanel } from '@/components/panels/ComparePanel'
@@ -131,6 +133,17 @@ function ReaderShell() {
               <button
                 type="button"
                 className="flex w-full items-center gap-2 px-3 py-2 text-sm text-text-secondary hover:bg-bg-elevated hover:text-text-primary"
+                onClick={() => {
+                  setUserMenuOpen(false)
+                  togglePanel('account')
+                }}
+              >
+                <Settings className="h-3.5 w-3.5" />
+                Account Settings
+              </button>
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 px-3 py-2 text-sm text-text-secondary hover:bg-bg-elevated hover:text-text-primary"
                 onClick={handleLogout}
               >
                 <LogOut className="h-3.5 w-3.5" />
@@ -214,6 +227,7 @@ const PANEL_META: Record<string, string> = {
   map: 'Bible Map',
   compare: 'Compare Translations',
   admin: 'Administration',
+  account: 'Account Settings',
 }
 
 // Renders the correct panel content inside the Sheet
@@ -225,6 +239,7 @@ function PanelContent({ id }: { id: PanelId }) {
   if (id === 'map') return <MapsPanel />
   if (id === 'compare') return <ComparePanel />
   if (id === 'admin') return <AdminPanel />
+  if (id === 'account') return <AccountPanel />
   return null
 }
 

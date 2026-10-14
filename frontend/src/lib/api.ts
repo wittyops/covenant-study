@@ -29,6 +29,18 @@ import type {
 
 // ─── Core fetch wrapper ────────────────────────────────────────────────────
 
+// Every request through this app — login, chapter text, highlights, every
+// panel — funnels through here. Without a bound, a hung backend, a dropped
+// VPN session, or a proxy that accepts a connection and never answers all
+// produce the same symptom: the browser's fetch() just never settles, and
+// whatever UI was waiting on it (a spinner, a skeleton) sits there forever
+// with no error, no retry, and nothing for the user to act on. There is no
+// universal browser-level fetch timeout to fall back on — some network
+// failure modes genuinely never time out on their own. So every request
+// gets an explicit ceiling here, once, instead of trusting each call site
+// to remember to add one.
+const REQUEST_TIMEOUT_MS = 15_000
+
 async function apiFetch<T>(
   path: string,
   opts: RequestInit & { token?: string | null } = {},
@@ -39,7 +51,24 @@ async function apiFetch<T>(
   headers.set('Content-Type', 'application/json')
   if (token) headers.set('Authorization', `Bearer ${token}`)
 
-  const res = await fetch(path, { ...fetchOpts, headers })
+  let res: Response
+  try {
+    res = await fetch(path, {
+      ...fetchOpts,
+      headers,
+      signal: fetchOpts.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    })
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'TimeoutError') {
+      throw new Error('Request timed out — check your connection and try again.')
+    }
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      throw new Error('Request was cancelled.')
+    }
+    // Network failure (offline, DNS, TLS, connection refused) — fetch's own
+    // TypeError carries no useful message for the user.
+    throw new Error('Could not reach the server — check your connection and try again.')
+  }
 
   if (!res.ok) {
     let message = `${res.status} ${res.statusText}`
@@ -78,6 +107,21 @@ export const auth = {
 
   me(token: string) {
     return apiFetch<User>('/api/auth/me', { token })
+  },
+
+  updateMe(
+    updates: { displayName?: string; currentPassword?: string; newPassword?: string },
+    token: string,
+  ) {
+    return apiFetch<User>('/api/auth/me', {
+      method: 'PUT',
+      body: JSON.stringify({
+        display_name: updates.displayName,
+        current_password: updates.currentPassword,
+        new_password: updates.newPassword,
+      }),
+      token,
+    })
   },
 }
 
@@ -256,5 +300,19 @@ export const admin = {
       body: JSON.stringify({ password }),
       token,
     })
+  },
+  updateUser(
+    uid: number,
+    updates: { displayName?: string; role?: 'user' | 'admin' },
+    token: string,
+  ) {
+    return apiFetch<User>(`/api/admin/users/${uid}`, {
+      method: 'PUT',
+      body: JSON.stringify({ display_name: updates.displayName, role: updates.role }),
+      token,
+    })
+  },
+  deleteUser(uid: number, token: string) {
+    return apiFetch<void>(`/api/admin/users/${uid}`, { method: 'DELETE', token })
   },
 }

@@ -27,6 +27,10 @@ interface AuthState {
   logout(): Promise<void>
   restore(): Promise<void>
   clearError(): void
+  /** Replace the local user object — used after a self-service profile update
+   *  (PUT /api/auth/me) so the header/menu reflect a new display name without
+   *  a full re-login. */
+  setUser(user: User): void
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -86,6 +90,10 @@ export const useAuthStore = create<AuthState>()(
 
       clearError() {
         set({ error: null })
+      },
+
+      setUser(user) {
+        set({ user })
       },
     }),
     {

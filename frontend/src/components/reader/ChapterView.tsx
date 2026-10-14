@@ -17,7 +17,7 @@
  * --highlight-color CSS variable that index.css picks up via color-mix().
  */
 import { useQuery } from '@tanstack/react-query'
-import { useCallback, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { bible, highlights as highlightsApi } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth'
 import { useReaderStore } from '@/stores/reader'
@@ -121,9 +121,19 @@ export function ChapterView() {
     return [lo, hi] as const
   }, [selectedVerse, selectionEnd])
 
+  // Side effect must live in an effect, not the render body: calling toast()
+  // directly while rendering updates useUiStore's `toasts` array, and since
+  // this component reads from useUiStore() without a selector, that update
+  // re-renders ChapterView itself — which would call toast() again on every
+  // single render for as long as isError stays true, pegging the JS thread
+  // in an infinite synchronous loop. The effect only re-fires when isError
+  // itself flips, not on every render.
+  useEffect(() => {
+    if (isError) toast('Failed to load chapter', 'error')
+  }, [isError, toast])
+
   if (isLoading) return <ChapterSkeleton />
   if (isError) {
-    toast('Failed to load chapter', 'error')
     return (
       <div className="flex flex-col items-center justify-center gap-4 py-20 text-text-muted">
         <p>

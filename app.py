@@ -17,10 +17,11 @@ Everything else lives in separate modules:
 """
 import os
 import secrets
+import sqlite3
 import time
 
 import bcrypt
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -80,10 +81,28 @@ async def index(_request: Request) -> FileResponse:
     return FileResponse("/app/static/dist/index.html", headers=_SPA_HEADERS)
 
 
-@app.get("/{full_path:path}", response_class=HTMLResponse)
-async def spa_fallback(_request: Request, full_path: str) -> FileResponse:
-    """Catch-all SPA fallback — API routes registered before this handler take priority."""
-    _ = full_path
+@app.get("/{full_path:path}")
+async def spa_fallback(_request: Request, full_path: str):
+    """Catch-all SPA fallback — API routes registered before this handler take priority.
+
+    This app has no real client-side deep-link routes (navigation is all
+    in-app state, the URL never changes), so there's no legitimate request
+    this needs to serve the app shell for. Left wide open, it quietly
+    turned every automated vulnerability scanner probe — /.env, /.git/config,
+    /.aws/credentials, /wp-login.php, dozens of variants — into a 200 OK,
+    which discloses nothing real (they get the HTML shell, not a secret)
+    but still looks like "this exists" to a scanner and invites more of the
+    same traffic. A path with a dot-prefixed segment (.env, .git, .aws, ...)
+    or a common server-side-app extension (.php, .json, .yml, ...) is never
+    a legitimate path in this SPA, so those get a genuine 404 instead; any
+    actual navigation attempt still gets the app shell.
+    """
+    segments = full_path.split("/")
+    looks_like_a_probe = any(seg.startswith(".") for seg in segments) or full_path.endswith(
+        (".php", ".json", ".yml", ".yaml", ".env", ".bak", ".sql", ".asp", ".aspx")
+    )
+    if looks_like_a_probe:
+        raise HTTPException(404)
     return FileResponse("/app/static/dist/index.html", headers=_SPA_HEADERS)
 
 
@@ -103,7 +122,9 @@ def init_users_db() -> None:
                 password_hash TEXT    NOT NULL,
                 display_name  TEXT,
                 role          TEXT    NOT NULL DEFAULT 'user',
-                created_at    INTEGER NOT NULL
+                created_at    INTEGER NOT NULL,
+                totp_secret   TEXT,
+                mfa_enabled   INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS user_sessions (
@@ -181,6 +202,23 @@ def init_users_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_plan_progress_user ON reading_plan_progress(user_id);
         """)
+
+        # Migration for pre-existing deployments: CREATE TABLE IF NOT EXISTS above
+        # is a no-op once the users table already has rows (admin/rbuntyn in
+        # production), so new columns on an existing install need an explicit
+        # ALTER TABLE. SQLite has no "ADD COLUMN IF NOT EXISTS" on older
+        # versions, so the standard portable idiom is: try it, swallow the
+        # "duplicate column" error on every run after the first.
+        for column_sql in (
+            "ALTER TABLE users ADD COLUMN totp_secret TEXT",
+            "ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                conn.execute(column_sql)
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e):
+                    raise
+        conn.commit()
 
         # Seed an admin account on the very first boot when the users table is empty.
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:

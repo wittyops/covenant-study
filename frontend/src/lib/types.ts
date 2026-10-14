@@ -116,6 +116,7 @@ export type PanelId =
   | 'sessions'
   | 'plans'
   | 'admin'
+  | 'account'
   | 'map'
   | 'compare'
   | null

@@ -30,6 +30,31 @@ class AdminCreateUserBody(BaseModel):
     role: str = Field("user", pattern=r"^(user|admin)$")
 
 
+class AdminUpdateUserBody(BaseModel):
+    """Admin edit of another user's profile — display name and/or role.
+
+    Username and password are deliberately not editable here: username is
+    the account's stable identity, and password changes go through the
+    dedicated reset-password endpoint so that flow stays auditable as its
+    own action rather than folded into a generic PATCH-everything body.
+    """
+    display_name: Optional[str] = None
+    role: Optional[str] = Field(None, pattern=r"^(user|admin)$")
+
+
+class UpdateMeBody(BaseModel):
+    """Self-service profile update — the authenticated user's own account.
+
+    A password change requires current_password so a stolen/leaked session
+    token alone isn't enough to lock the real owner out of their own
+    account; display_name has no such requirement since it carries no
+    access implications.
+    """
+    display_name: Optional[str] = None
+    current_password: Optional[str] = None
+    new_password: Optional[str] = Field(None, min_length=8)
+
+
 class SessionCreateBody(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     state_json: str

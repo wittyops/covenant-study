@@ -1,19 +1,21 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { KeyRound, Loader2, Plus, ShieldCheck, User, X } from 'lucide-react'
+import { KeyRound, Loader2, Pencil, Plus, ShieldCheck, Trash2, User, X } from 'lucide-react'
 import { useState } from 'react'
 import { admin } from '@/lib/api'
 import type { User as UserType } from '@/lib/types'
 import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
 
-type View = 'list' | 'create' | 'reset'
+type View = 'list' | 'create' | 'reset' | 'edit' | 'delete'
 
 export function AdminPanel() {
-  const { token } = useAuthStore()
+  const { user: me, token } = useAuthStore()
   const { toast } = useUiStore()
   const qc = useQueryClient()
   const [view, setView] = useState<View>('list')
   const [resetTarget, setResetTarget] = useState<UserType | null>(null)
+  const [editTarget, setEditTarget] = useState<UserType | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<UserType | null>(null)
 
   // Create form state
   const [createForm, setCreateForm] = useState({
@@ -27,6 +29,9 @@ export function AdminPanel() {
   // Reset form state
   const [newPassword, setNewPassword] = useState('')
   const [showResetPw, setShowResetPw] = useState(false)
+
+  // Edit form state
+  const [editForm, setEditForm] = useState({ displayName: '', role: 'user' as 'user' | 'admin' })
 
   const { data: users = [], isLoading } = useQuery({
     queryKey: ['admin-users'],
@@ -69,6 +74,47 @@ export function AdminPanel() {
     setNewPassword('')
     setShowResetPw(false)
     setView('reset')
+  }
+
+  const updateMutation = useMutation({
+    mutationFn: ({
+      uid,
+      displayName,
+      role,
+    }: {
+      uid: number
+      displayName: string
+      role: 'user' | 'admin'
+    }) => admin.updateUser(uid, { displayName, role }, token!),
+    onSuccess: () => {
+      toast('User updated', 'success')
+      qc.invalidateQueries({ queryKey: ['admin-users'] })
+      setView('list')
+      setEditTarget(null)
+    },
+    onError: (e: Error) => toast(e.message, 'error'),
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (uid: number) => admin.deleteUser(uid, token!),
+    onSuccess: () => {
+      toast('User deleted', 'success')
+      qc.invalidateQueries({ queryKey: ['admin-users'] })
+      setView('list')
+      setDeleteTarget(null)
+    },
+    onError: (e: Error) => toast(e.message, 'error'),
+  })
+
+  function openEdit(u: UserType) {
+    setEditTarget(u)
+    setEditForm({ displayName: u.display_name ?? '', role: u.role })
+    setView('edit')
+  }
+
+  function openDelete(u: UserType) {
+    setDeleteTarget(u)
+    setView('delete')
   }
 
   if (isLoading) {
@@ -260,6 +306,136 @@ export function AdminPanel() {
     )
   }
 
+  // ── Edit user form ────────────────────────────────────────────────────────
+  if (view === 'edit' && editTarget) {
+    const isSelf = editTarget.id === me?.id
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-semibold uppercase tracking-wider text-text-muted">
+            Edit User
+          </span>
+          <button
+            type="button"
+            onClick={() => setView('list')}
+            className="text-text-muted hover:text-text-primary transition-colors"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <p className="text-sm text-text-secondary">
+          Editing <span className="font-medium text-text-primary">@{editTarget.username}</span>
+        </p>
+
+        <div>
+          <label htmlFor="eu-display" className="block text-xs text-text-muted mb-1">
+            Display Name
+          </label>
+          <input
+            id="eu-display"
+            type="text"
+            value={editForm.displayName}
+            onChange={(e) => setEditForm((f) => ({ ...f, displayName: e.target.value }))}
+            className="w-full rounded-lg border border-bg-overlay bg-bg-elevated px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-gold"
+          />
+        </div>
+
+        <div>
+          <label htmlFor="eu-role" className="block text-xs text-text-muted mb-1">
+            Role
+          </label>
+          <select
+            id="eu-role"
+            value={editForm.role}
+            disabled={isSelf}
+            onChange={(e) =>
+              setEditForm((f) => ({ ...f, role: e.target.value as 'user' | 'admin' }))
+            }
+            className="w-full rounded-lg border border-bg-overlay bg-bg-elevated px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-gold disabled:opacity-50"
+          >
+            <option value="user">User</option>
+            <option value="admin">Admin</option>
+          </select>
+          {isSelf && (
+            <p className="mt-1 text-xs text-text-muted">You can't change your own role here.</p>
+          )}
+        </div>
+
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() =>
+              updateMutation.mutate({
+                uid: editTarget.id,
+                displayName: editForm.displayName.trim(),
+                role: editForm.role,
+              })
+            }
+            disabled={updateMutation.isPending}
+            className="flex-1 flex items-center justify-center gap-1.5 rounded-lg bg-gold text-bg-base text-xs font-semibold py-2 disabled:opacity-50 hover:bg-gold-dark transition-colors"
+          >
+            {updateMutation.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            Save Changes
+          </button>
+          <button
+            type="button"
+            onClick={() => setView('list')}
+            className="px-3 rounded-lg border border-bg-overlay text-xs text-text-muted hover:text-text-primary transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Delete confirmation ───────────────────────────────────────────────────
+  if (view === 'delete' && deleteTarget) {
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-semibold uppercase tracking-wider text-red-400">
+            Delete User
+          </span>
+          <button
+            type="button"
+            onClick={() => setView('list')}
+            className="text-text-muted hover:text-text-primary transition-colors"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <p className="text-sm text-text-secondary">
+          Permanently delete{' '}
+          <span className="font-medium text-text-primary">@{deleteTarget.username}</span>? Their
+          notes, highlights, bookmarks, and reading history are deleted with them. This cannot be
+          undone.
+        </p>
+
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => deleteMutation.mutate(deleteTarget.id)}
+            disabled={deleteMutation.isPending}
+            className="flex-1 flex items-center justify-center gap-1.5 rounded-lg bg-red-700 text-white text-xs font-semibold py-2 disabled:opacity-50 hover:bg-red-600 transition-colors"
+          >
+            {deleteMutation.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            Delete Permanently
+          </button>
+          <button
+            type="button"
+            onClick={() => setView('list')}
+            className="px-3 rounded-lg border border-bg-overlay text-xs text-text-muted hover:text-text-primary transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   // ── User list ─────────────────────────────────────────────────────────────
   return (
     <div className="flex flex-col gap-4">
@@ -292,12 +468,30 @@ export function AdminPanel() {
             </div>
             <button
               type="button"
+              title="Edit user"
+              onClick={() => openEdit(u)}
+              className="text-text-muted hover:text-gold transition-colors shrink-0 p-1"
+            >
+              <Pencil className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
               title="Reset password"
               onClick={() => openReset(u)}
               className="text-text-muted hover:text-gold transition-colors shrink-0 p-1"
             >
               <KeyRound className="h-3.5 w-3.5" />
             </button>
+            {u.id !== me?.id && (
+              <button
+                type="button"
+                title="Delete user"
+                onClick={() => openDelete(u)}
+                className="text-text-muted hover:text-red-400 transition-colors shrink-0 p-1"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            )}
           </li>
         ))}
       </ul>
