@@ -459,9 +459,19 @@ export function AdminPanel() {
           <li key={u.id} className="flex items-center gap-3 rounded-lg px-3 py-2.5 bg-bg-elevated">
             <User className="h-4 w-4 text-text-muted shrink-0" />
             <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium text-text-primary truncate">
-                {u.display_name || u.username}
-              </p>
+              <div className="flex items-center gap-1.5">
+                <p className="text-sm font-medium text-text-primary truncate">
+                  {u.display_name || u.username}
+                </p>
+                {u.mfa_enabled && (
+                  <ShieldCheck
+                    className="h-3 w-3 text-gold shrink-0"
+                    aria-label="Two-factor authentication enabled"
+                  >
+                    <title>Two-factor authentication enabled</title>
+                  </ShieldCheck>
+                )}
+              </div>
               <p className="text-xs text-text-muted">
                 @{u.username} · {u.role}
               </p>

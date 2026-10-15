@@ -63,6 +63,7 @@ export function ComparePassageView() {
         <div className="space-y-3 py-4">
           {Array.from({ length: 10 }, (_, i) => (
             <div
+              // biome-ignore lint/suspicious/noArrayIndexKey: no underlying array exists at all — i is pure index-generation, the only identity there is.
               key={i}
               className="loading-shimmer h-5 rounded"
               style={{ width: `${60 + (i % 5) * 8}%` }}

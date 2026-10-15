@@ -105,6 +105,50 @@ def enforce_auth_rate_limit(request: Request) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PENDING MFA LOGIN TOKENS
+# ---------------------------------------------------------------------------
+
+# Short-lived, in-memory, separate from real session tokens on purpose: a
+# pending-MFA token proves only "this caller already supplied the correct
+# password a moment ago," not "this caller is authenticated" — it must never
+# be accepted by get_current_user/require_user, and it must expire quickly
+# since it's effectively a half-completed login sitting unattended. Lost on
+# restart, same tradeoff as the rate limiter above: acceptable, since the
+# user just re-enters their password.
+_PENDING_MFA_TTL_SECONDS = 300  # 5 minutes
+_pending_mfa: dict[str, tuple[int, float]] = {}  # token -> (user_id, expires_at)
+_pending_mfa_lock = threading.Lock()
+
+
+def create_pending_mfa_token(user_id: int) -> str:
+    token = secrets.token_hex(32)
+    with _pending_mfa_lock:
+        _pending_mfa[token] = (user_id, time.monotonic() + _PENDING_MFA_TTL_SECONDS)
+    return token
+
+
+def resolve_pending_mfa_token(token: str) -> Optional[int]:
+    """Return the user_id for a still-valid pending token, WITHOUT consuming
+    it — a wrong TOTP code shouldn't burn the attempt, since the rate
+    limiter (applied to this same endpoint) already bounds retries."""
+    with _pending_mfa_lock:
+        entry = _pending_mfa.get(token)
+        if entry is None:
+            return None
+        user_id, expires_at = entry
+        if time.monotonic() > expires_at:
+            del _pending_mfa[token]
+            return None
+        return user_id
+
+
+def consume_pending_mfa_token(token: str) -> None:
+    """Call once login actually succeeds, so the token can't be replayed."""
+    with _pending_mfa_lock:
+        _pending_mfa.pop(token, None)
+
+
+# ---------------------------------------------------------------------------
 # TOKEN RESOLUTION
 # ---------------------------------------------------------------------------
 

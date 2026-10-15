@@ -55,6 +55,29 @@ class UpdateMeBody(BaseModel):
     new_password: Optional[str] = Field(None, min_length=8)
 
 
+class MfaVerifyLoginBody(BaseModel):
+    """Second step of login once the password has already been accepted for
+    an MFA-enabled account — pending_token identifies which login attempt
+    this code belongs to, since the account isn't known from the session
+    (there isn't one yet)."""
+    pending_token: str
+    code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class MfaConfirmBody(BaseModel):
+    """Confirms a just-generated TOTP secret during enrollment — proves the
+    user actually captured it (scanned the QR / saved the manual key) before
+    it's switched on, rather than enabling MFA against a secret nobody has."""
+    code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class MfaDisableBody(BaseModel):
+    """Disabling MFA requires the current password, same reasoning as a
+    password change: a stolen session token alone shouldn't be enough to
+    strip the account's second factor."""
+    password: str
+
+
 class SessionCreateBody(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     state_json: str

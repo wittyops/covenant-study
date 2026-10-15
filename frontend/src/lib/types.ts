@@ -6,6 +6,7 @@ export interface User {
   display_name: string | null
   role: 'user' | 'admin'
   created_at: number
+  mfa_enabled: boolean
 }
 
 export interface BookInfo {

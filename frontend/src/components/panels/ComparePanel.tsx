@@ -48,6 +48,7 @@ export function ComparePanel() {
       {isLoading ? (
         <div className="space-y-2 pt-1">
           {[80, 60, 90, 70].map((w, i) => (
+            // biome-ignore lint/suspicious/noArrayIndexKey: static literal array, never reordered/filtered/mutated — these are decorative shimmer widths, not real data, so index is a genuinely stable identity here.
             <div key={i} className="loading-shimmer h-8 rounded-lg" style={{ width: `${w}%` }} />
           ))}
         </div>

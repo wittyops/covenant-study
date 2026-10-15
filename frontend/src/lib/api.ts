@@ -88,10 +88,48 @@ async function apiFetch<T>(
 
 export const auth = {
   login(username: string, password: string) {
-    return apiFetch<{ token: string; user: User }>('/api/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ username, password }),
-    })
+    // Two possible shapes: a normal account gets a full session back; an
+    // MFA-enabled account gets a pending_token instead and must complete
+    // mfa.verifyLogin before a real session exists.
+    return apiFetch<{ mfa_required: true; pending_token: string } | { token: string; user: User }>(
+      '/api/auth/login',
+      {
+        method: 'POST',
+        body: JSON.stringify({ username, password }),
+      },
+    )
+  },
+
+  mfa: {
+    verifyLogin(pendingToken: string, code: string) {
+      return apiFetch<{ token: string; user: User }>('/api/auth/mfa/verify-login', {
+        method: 'POST',
+        body: JSON.stringify({ pending_token: pendingToken, code }),
+      })
+    },
+
+    enroll(token: string) {
+      return apiFetch<{ secret: string; otpauth_uri: string }>('/api/auth/mfa/enroll', {
+        method: 'POST',
+        token,
+      })
+    },
+
+    confirm(code: string, token: string) {
+      return apiFetch<{ status: string; mfa_enabled: boolean }>('/api/auth/mfa/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ code }),
+        token,
+      })
+    },
+
+    disable(password: string, token: string) {
+      return apiFetch<{ status: string; mfa_enabled: boolean }>('/api/auth/mfa/disable', {
+        method: 'POST',
+        body: JSON.stringify({ password }),
+        token,
+      })
+    },
   },
 
   register(username: string, password: string, displayName?: string) {

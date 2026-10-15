@@ -47,8 +47,15 @@ export function HistoryPanel() {
 
   return (
     <ul className="space-y-0.5">
-      {data.map((entry, i) => (
-        <li key={`${entry.ref}-${i}`}>
+      {data.map((entry) => (
+        // visited_at (a real timestamp from the backend) instead of array
+        // index — the same ref can legitimately appear more than once in
+        // this list (re-visiting a verse creates a new history row), so an
+        // index-based key was never actually stable: re-sorting or a new
+        // entry landing above existing ones would silently reassign each
+        // row's key to a different entry, which is exactly the bug class
+        // key stability exists to prevent.
+        <li key={`${entry.ref}-${entry.visited_at}`}>
           <button
             type="button"
             onClick={() => goTo(entry.ref)}

@@ -18,7 +18,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir fastapi uvicorn[standard] aiofiles jinja2 bcrypt lxml requests
+RUN pip install --no-cache-dir fastapi uvicorn[standard] aiofiles jinja2 bcrypt lxml requests pyotp
 
 # Download public domain Bible data at build time
 RUN apt-get update && apt-get install -y wget unzip sqlite3 && rm -rf /var/lib/apt/lists/*

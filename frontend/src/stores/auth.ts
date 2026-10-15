@@ -22,7 +22,17 @@ interface AuthState {
   displayName: string
 
   // ── Actions ───────────────────────────────────────────────────────────
-  login(username: string, password: string): Promise<void>
+  /** Returns {mfaRequired: true, pendingToken} when the account has MFA on
+   *  — the caller (LoginForm) is responsible for collecting a code next and
+   *  calling verifyMfaLogin. A normal account completes the session here
+   *  directly and returns {mfaRequired: false}. */
+  login(
+    username: string,
+    password: string,
+  ): Promise<{ mfaRequired: true; pendingToken: string } | { mfaRequired: false }>
+  /** Second step of an MFA login — completes the session once the pending
+   *  token + a valid TOTP code are both supplied. */
+  verifyMfaLogin(pendingToken: string, code: string): Promise<void>
   register(username: string, password: string, displayName?: string): Promise<void>
   logout(): Promise<void>
   restore(): Promise<void>
@@ -51,7 +61,24 @@ export const useAuthStore = create<AuthState>()(
       async login(username, password) {
         set({ loading: true, error: null })
         try {
-          const { token, user } = await authApi.login(username, password)
+          const result = await authApi.login(username, password)
+          if ('mfa_required' in result) {
+            // Don't touch token/user — the session doesn't exist yet.
+            set({ loading: false })
+            return { mfaRequired: true, pendingToken: result.pending_token }
+          }
+          set({ token: result.token, user: result.user, loading: false })
+          return { mfaRequired: false }
+        } catch (e) {
+          set({ loading: false, error: (e as Error).message })
+          throw e
+        }
+      },
+
+      async verifyMfaLogin(pendingToken, code) {
+        set({ loading: true, error: null })
+        try {
+          const { token, user } = await authApi.mfa.verifyLogin(pendingToken, code)
           set({ token, user, loading: false })
         } catch (e) {
           set({ loading: false, error: (e as Error).message })

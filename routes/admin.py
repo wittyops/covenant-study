@@ -19,10 +19,16 @@ async def admin_list_users(request: Request, authorization: Optional[str] = Head
     conn = get_users_db()
     try:
         rows = conn.execute(
-            "SELECT id, username, display_name, role FROM users ORDER BY id"
+            "SELECT id, username, display_name, role, mfa_enabled FROM users ORDER BY id"
         ).fetchall()
         return [
-            {"id": r[0], "username": r[1], "display_name": r[2] or "", "role": r[3] or "user"}
+            {
+                "id": r[0],
+                "username": r[1],
+                "display_name": r[2] or "",
+                "role": r[3] or "user",
+                "mfa_enabled": bool(r[4]),
+            }
             for r in rows
         ]
     finally:
