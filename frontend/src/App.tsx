@@ -40,6 +40,7 @@ import { BookPicker } from '@/components/reader/BookPicker'
 import { ChapterView } from '@/components/reader/ChapterView'
 import { ComparePassageView } from '@/components/reader/ComparePassageView'
 import { NavBar } from '@/components/reader/NavBar'
+import { SelectionActionBar } from '@/components/reader/SelectionActionBar'
 import { SpeechPlayer } from '@/components/reader/SpeechPlayer'
 import { TranslationPicker } from '@/components/reader/TranslationPicker'
 import { Button } from '@/components/ui/button'
@@ -155,8 +156,15 @@ function ReaderShell() {
           {compareActive ? <ComparePassageView /> : <ChapterView />}
         </main>
 
-        {/* Tool rail — vertical icon strip */}
-        <aside className="flex flex-col items-center gap-1 border-l border-bg-overlay bg-bg-surface px-2 py-4 shrink-0">
+        {/* Tool rail — vertical icon strip. overflow-y-auto: SelectionActionBar
+            can add up to ~9 extra buttons at the top when a verse is
+            selected, which can exceed a short mobile viewport's height. */}
+        <aside className="flex flex-col items-center gap-1 border-l border-bg-overlay bg-bg-surface px-2 py-4 shrink-0 overflow-y-auto">
+          {/* Verse-selection actions (highlight/bookmark/note/compare/clear) —
+              renders nothing when no verse is selected. Lives here, not as a
+              floating bar over the reading area, so it doesn't compete with
+              StrongsCard's mobile bottom sheet for the same screen space. */}
+          <SelectionActionBar />
           {TOOL_BUTTONS.map(({ id, icon: Icon, label }) => (
             <button
               key={id}

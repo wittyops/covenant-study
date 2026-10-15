@@ -91,6 +91,7 @@ export function StrongsCard({ number, onClose }: Props) {
       {isLoading && (
         <div className="space-y-2">
           {[40, 70, 55, 80].map((w, i) => (
+            // biome-ignore lint/suspicious/noArrayIndexKey: static literal array, never reordered/filtered/mutated — decorative shimmer widths, not real data.
             <div key={i} className="loading-shimmer h-4 rounded" style={{ width: `${w}%` }} />
           ))}
         </div>

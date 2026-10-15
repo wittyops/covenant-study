@@ -1,7 +1,17 @@
 /**
- * SelectionActionBar — floating bar for acting on a tap-number verse
- * selection (single verse or range). Appears whenever useReaderStore.verse
- * is set. Every action here calls an API that already exists and already
+ * SelectionActionBar — compact vertical action block for acting on a
+ * tap-number verse selection (single verse or range). Lives in the
+ * right-hand tool rail (rendered by App.tsx), not floated over the reading
+ * area — it used to be a fixed bottom bar, but that put it directly in the
+ * same screen real estate as StrongsCard's mobile bottom sheet: tapping any
+ * Strong's-tagged word sets the verse selection AND opens the Strong's card
+ * at once, so the two fought over the same strip on nearly every word tap.
+ * Moving this into the already-present right rail (there was room) gives
+ * each its own space instead of layering them. Appears whenever
+ * useReaderStore.verse is set; reads bookName/chapter from the store
+ * instead of props now that it's no longer nested inside ChapterView.
+ *
+ * Every action here calls an API that already exists and already
  * works (the panels use the same calls for listing/deleting) — this file
  * is the previously-missing piece that actually creates highlights and
  * bookmarks from the reading view.
@@ -41,16 +51,11 @@ const VERSE_COMPARE_TRANSLATIONS = ['KJV', 'ASV', 'YLT', 'Darby']
 // Same five colors HighlightsPanel already knows how to label.
 const HIGHLIGHT_COLORS = ['#ffe066', '#b8f0c8', '#a0c8ff', '#ffb3b3', '#d4b3ff']
 
-interface Props {
-  bookName: string
-  chapter: number
-}
-
-export function SelectionActionBar({ bookName, chapter }: Props) {
+export function SelectionActionBar() {
   const { token } = useAuthStore()
   const { toast, openPanel } = useUiStore()
   const qc = useQueryClient()
-  const { verse, selectionEnd, clearSelection } = useReaderStore()
+  const { bookName, chapter, verse, selectionEnd, clearSelection } = useReaderStore()
   const [compareOpen, setCompareOpen] = useState(false)
 
   // lo/hi collapse to the same value when nothing (or just one verse) is
@@ -138,21 +143,22 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
 
   if (verse === null) return null
 
+  const ref = isRange ? `${bookName} ${chapter}:${lo}-${hi}` : `${bookName} ${chapter}:${lo}`
+
   return (
-    // bottom-14 sits this directly above NavBar (h-14) instead of
-    // overlapping it — NavBar is a normal flex sibling, not fixed, so it
-    // occupies real bottom-of-screen space that this fixed bar has to clear.
+    // Vertical block, sized to match the rail it lives in (App.tsx's
+    // right-hand <aside>) — icon buttons stay h-9 w-9 like the persistent
+    // TOOL_BUTTONS below it for visual consistency; color swatches shrink
+    // to fit the narrow column. No `fixed` positioning — this is a normal
+    // flex child of the rail now, not an overlay.
     <div
-      className="fixed inset-x-0 bottom-14 z-40 flex items-center justify-center gap-3 border-t
-        border-bg-overlay bg-bg-elevated px-4 py-3 shadow-lg"
+      className="flex flex-col items-center gap-2 border-b border-bg-overlay pb-3 mb-1 w-full"
       role="toolbar"
       aria-label="Selected verse actions"
     >
-      <span className="text-xs text-text-muted mr-1">
-        {isRange ? `${bookName} ${chapter}:${lo}-${hi}` : `${bookName} ${chapter}:${lo}`}
-      </span>
-
-      <div className="flex items-center gap-1.5">
+      {/* Verse ref has no room to show as text in a ~56px column — carried as
+          a title tooltip on the clear button instead (see below). */}
+      <div className="flex flex-col items-center gap-1">
         {HIGHLIGHT_COLORS.map((color) => (
           <button
             key={color}
@@ -160,7 +166,7 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
             title="Highlight"
             disabled={applyHighlight.isPending}
             onClick={() => applyHighlight.mutate(color)}
-            className="h-6 w-6 rounded-full border border-bg-overlay transition-transform hover:scale-110 disabled:opacity-50"
+            className="h-5 w-5 rounded-full border border-bg-overlay transition-transform hover:scale-110 disabled:opacity-50"
             style={{ background: color }}
           />
         ))}
@@ -169,7 +175,7 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
           title="Remove highlight"
           disabled={removeHighlight.isPending}
           onClick={() => removeHighlight.mutate()}
-          className="text-text-muted hover:text-red-400 transition-colors disabled:opacity-50"
+          className="flex h-9 w-9 items-center justify-center text-text-muted hover:text-red-400 transition-colors disabled:opacity-50"
         >
           <Eraser className="h-4 w-4" />
         </button>
@@ -182,7 +188,7 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
         onClick={() =>
           bookmarkStatus?.bookmarked ? removeBookmark.mutate() : addBookmark.mutate()
         }
-        className={`transition-colors disabled:opacity-50 ${
+        className={`flex h-9 w-9 items-center justify-center transition-colors disabled:opacity-50 ${
           bookmarkStatus?.bookmarked ? 'text-gold' : 'text-text-muted hover:text-gold'
         }`}
       >
@@ -194,7 +200,7 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
         title={isRange ? 'Notes apply to a single verse' : 'Add note'}
         disabled={isRange}
         onClick={() => openPanel('notes')}
-        className="text-text-muted hover:text-gold transition-colors disabled:opacity-30"
+        className="flex h-9 w-9 items-center justify-center text-text-muted hover:text-gold transition-colors disabled:opacity-30"
       >
         <StickyNote className="h-4 w-4" />
       </button>
@@ -204,16 +210,16 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
         title={isRange ? 'Compare applies to a single verse' : 'Compare translations'}
         disabled={isRange}
         onClick={() => setCompareOpen(true)}
-        className="text-text-muted hover:text-gold transition-colors disabled:opacity-30"
+        className="flex h-9 w-9 items-center justify-center text-text-muted hover:text-gold transition-colors disabled:opacity-30"
       >
         <ArrowLeftRight className="h-4 w-4" />
       </button>
 
       <button
         type="button"
-        title="Clear selection"
+        title={`Clear selection (${ref})`}
         onClick={() => clearSelection()}
-        className="text-text-muted hover:text-text-primary transition-colors"
+        className="flex h-9 w-9 items-center justify-center text-text-muted hover:text-text-primary transition-colors"
       >
         <X className="h-4 w-4" />
       </button>
@@ -226,6 +232,7 @@ export function SelectionActionBar({ bookName, chapter }: Props) {
           {compareLoading ? (
             <div className="space-y-2 py-2">
               {[90, 75, 85].map((w, i) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: static literal array, never reordered/filtered/mutated — decorative shimmer widths, not real data.
                 <div key={i} className="loading-shimmer h-5 rounded" style={{ width: `${w}%` }} />
               ))}
             </div>

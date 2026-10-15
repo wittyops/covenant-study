@@ -19,6 +19,9 @@ import { persist } from 'zustand/middleware'
 interface ReaderState {
   // ── Persisted position ────────────────────────────────────────────────
   book: number // 1–66
+  bookName: string // display name, synced from ChapterView's chapter query —
+  // lets the relocated SelectionActionBar (now in the right-hand tool rail,
+  // not nested in ChapterView) read it without prop drilling.
   chapter: number // 1–150
   verse: number | null
   translation: string // translation key, e.g. 'KJV'
@@ -31,6 +34,7 @@ interface ReaderState {
 
   // ── Actions ───────────────────────────────────────────────────────────
   setBook(book: number): void
+  setBookName(name: string): void
   setChapter(chapter: number): void
   setVerse(verse: number | null): void
   selectVerseNumber(verse: number): void
@@ -44,6 +48,7 @@ export const useReaderStore = create<ReaderState>()(
   persist(
     (set, get) => ({
       book: 1,
+      bookName: '',
       chapter: 1,
       verse: null,
       selectionEnd: null,
@@ -52,6 +57,9 @@ export const useReaderStore = create<ReaderState>()(
 
       setBook(book) {
         set({ book, chapter: 1, verse: null, selectionEnd: null, activeStrongs: null })
+      },
+      setBookName(name) {
+        set({ bookName: name })
       },
       setChapter(chapter) {
         set({ chapter, verse: null, selectionEnd: null, activeStrongs: null })

@@ -24,7 +24,6 @@ import { useAuthStore } from '@/stores/auth'
 import { useReaderStore } from '@/stores/reader'
 import { speechSupported, useSpeechStore } from '@/stores/speech'
 import { useUiStore } from '@/stores/ui'
-import { SelectionActionBar } from './SelectionActionBar'
 import { StrongsCard } from './StrongsCard'
 
 export function ChapterView() {
@@ -109,7 +108,15 @@ export function ChapterView() {
       if (verseEl) setVerse(Number(verseEl.dataset.verse))
 
       const strongsEl = (e.target as Element).closest('[data-strongs]') as HTMLElement | null
-      if (strongsEl) openStrongs(strongsEl.dataset.strongs ?? null)
+      if (strongsEl) {
+        openStrongs(strongsEl.dataset.strongs ?? null)
+        // The Strong's card is a bottom sheet on mobile (up to 60vh tall) — if the
+        // tapped word is already near the bottom of the viewport, the sheet opens
+        // directly on top of it. scroll-mb-[65vh] on the word (below) tells the
+        // browser how much clearance to leave; 'nearest' means it only scrolls if
+        // the word would actually be covered, not unconditionally on every tap.
+        strongsEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+      }
     },
     [setVerse, selectVerseNumber, openStrongs],
   )
@@ -144,6 +151,14 @@ export function ChapterView() {
   useEffect(() => {
     return () => stopSpeech()
   }, [book, chapter, stopSpeech])
+
+  // Sync book_name into the store so SelectionActionBar (now living in the
+  // right-hand tool rail, not nested here) can read it without ChapterView
+  // having to pass it down as a prop.
+  const setBookName = useReaderStore((s) => s.setBookName)
+  useEffect(() => {
+    if (data?.book_name) setBookName(data.book_name)
+  }, [data?.book_name, setBookName])
 
   if (isLoading) return <ChapterSkeleton />
   if (isError) {
@@ -208,10 +223,18 @@ export function ChapterView() {
               >
                 {v.verse}
               </sup>
+              {/* words has no stable per-word id (TaggedWord is just
+                  {text, strongs, morph} — duplicate text/strongs within a
+                  verse is normal, e.g. repeated "the"), but the list itself
+                  is never reordered or filtered after fetch: it's rendered
+                  once per verse and replaced wholesale on the next
+                  chapter/translation query, never mutated in place. Index
+                  is a genuinely stable identity for that lifecycle. */}
               {words?.length
                 ? words.map((w, i) =>
                     w.strongs ? (
                       <span
+                        // biome-ignore lint/suspicious/noArrayIndexKey: see comment above — list is replace-wholesale, never reordered in place.
                         key={i}
                         className="word-tagged"
                         data-strongs={w.strongs}
@@ -220,6 +243,7 @@ export function ChapterView() {
                         {w.text}{' '}
                       </span>
                     ) : (
+                      // biome-ignore lint/suspicious/noArrayIndexKey: see comment above — list is replace-wholesale, never reordered in place.
                       <span key={i}>{w.text} </span>
                     ),
                   )
@@ -231,9 +255,6 @@ export function ChapterView() {
 
       {/* Strong's lexicon dialog — opens when a tagged word is clicked */}
       {activeStrongs && <StrongsCard number={activeStrongs} onClose={() => openStrongs(null)} />}
-
-      {/* Floating action bar — appears once a verse number is tapped */}
-      {data?.book_name && <SelectionActionBar bookName={data.book_name} chapter={chapter} />}
     </>
   )
 }
@@ -282,6 +303,7 @@ function ChapterSkeleton() {
       <div className="loading-shimmer h-8 w-48 rounded" />
       {Array.from({ length: 12 }, (_, i) => (
         <div
+          // biome-ignore lint/suspicious/noArrayIndexKey: no underlying array exists at all — i is pure index-generation, the only identity there is.
           key={i}
           className="loading-shimmer h-5 rounded"
           style={{ width: `${60 + (i % 5) * 8}%` }}
